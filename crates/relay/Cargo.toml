@@ -1,0 +1,21 @@
+[package]
+name = "alleycat"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+alleycat-protocol = { path = "../protocol" }
+anyhow.workspace = true
+clap.workspace = true
+futures.workspace = true
+hex.workspace = true
+pin-project-lite.workspace = true
+quinn.workspace = true
+rand.workspace = true
+rcgen.workspace = true
+rustls.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
