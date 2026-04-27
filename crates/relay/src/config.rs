@@ -13,6 +13,9 @@
 //!
 //! [host]
 //! overrides = []         # empty = host_detect::detect_candidates()
+//! # tailscale_bin = "/opt/tailscale/bin/tailscale"  # optional override
+//! #                                                  # for non-standard installs
+//! #                                                  # or sandboxed contexts
 //!
 //! [log]
 //! level = "info"         # passed to tracing EnvFilter
@@ -23,7 +26,7 @@
 //! `diff_requires_restart()` flags edits to bind / udp_port — Quinn's
 //! listening socket can't move underneath live sessions.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use alleycat_protocol::Target;
 use anyhow::{Context, anyhow};
@@ -69,6 +72,12 @@ pub struct AllowlistSection {
 #[serde(default)]
 pub struct HostSection {
     pub overrides: Vec<String>,
+    /// Optional explicit path to the `tailscale` binary. When set, the
+    /// daemon skips the per-OS auto-discovery list entirely and uses this
+    /// path. Useful for sandboxed launchd contexts that can't reach
+    /// `/Applications/Tailscale.app/...` and for non-standard installs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tailscale_bin: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]

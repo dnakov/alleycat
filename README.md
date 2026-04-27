@@ -2,34 +2,54 @@
 
 ![Alleycat logo](assets/alleycat-logo.png)
 
-Alleycat is a small QUIC tunnel for routable hosts.
+Small QUIC tunnel for routable hosts. A phone (or any client) reaches a TCP or Unix-socket target on your machine over a self-signed, fingerprint-pinned, token-authenticated QUIC connection.
 
-It has three crates:
+Three crates:
 
-- `crates/protocol`: shared wire types
-- `crates/client`: Rust client library
-- `crates/relay`: relay library plus the `alleycat` binary
+- `crates/protocol` — wire types shared by relay and client
+- `crates/client` — Rust client library
+- `crates/relay` — relay daemon and the `alleycat` binary
 
-## What It Does
+## Quick start (service mode)
 
-- Opens a long-lived QUIC connection to a remote relay
-- Authenticates with a per-launch token
-- Pins the relay certificate by SHA-256 fingerprint
-- Opens per-target streams to exact allowlisted TCP or Unix-socket destinations
-- Optionally exposes a local `127.0.0.1:<port>` forward for legacy consumers
-
-## Run The Relay
+Long-lived daemon, identity persisted across reboots so the QR you scan once stays valid. Works on macOS, Linux, and Windows; no admin needed.
 
 ```bash
-cargo run -p alleycat -- relay \
-  --bind 0.0.0.0 \
-  --udp-port 0 \
-  --ready-file /tmp/alleycat-ready.json \
-  --allow-tcp 127.0.0.1:8390 \
-  --allow-unix /tmp/codex-ipc/ipc-123.sock
+cargo install --path crates/relay     # or grab a binary from ./dist
+alleycat install                      # per-user autostart (launchd / systemd --user / Startup folder)
+alleycat allow add tcp 127.0.0.1:8390
+alleycat qr                           # prints QR + JSON for the phone
+alleycat status
 ```
 
-The relay writes a ready file like:
+| Command | What it does |
+|---|---|
+| `alleycat run` | Foreground daemon (what `install` autostarts) |
+| `alleycat install` / `uninstall` | Per-user autostart, idempotent |
+| `alleycat status [--json]` | Up? Port, fingerprint, allowlist, host candidates |
+| `alleycat qr [--image PATH]` | QR + JSON for the phone |
+| `alleycat rotate` | Mint fresh cert + token (drains existing sessions over 5 s) |
+| `alleycat allow add\|rm tcp HOST:PORT` / `unix PATH`, `alleycat allow list` | Live-edit allowlist |
+| `alleycat logs [-f]` | Tail the daemon log |
+| `alleycat stop` / `reload` | Exit cleanly / re-read `config.toml` |
+
+Config, state, and logs live under conventional per-OS paths (`~/Library/Application Support/...` on macOS, XDG dirs on Linux, `%APPDATA%`/`%LOCALAPPDATA%` on Windows). Edit the allowlist, host overrides, and log level via `alleycat reload` after editing the TOML.
+
+## One-shot mode (no daemon)
+
+For scripts and demos. Ephemeral identity per launch:
+
+```bash
+# pair: prints a QR, runs until Ctrl-C
+alleycat pair --allow-tcp 127.0.0.1:8390
+
+# relay: writes a ready file, runs until Ctrl-C
+alleycat relay --bind 0.0.0.0 --udp-port 0 \
+  --ready-file /tmp/alleycat-ready.json \
+  --allow-tcp 127.0.0.1:8390
+```
+
+Ready file shape (used by both legacy modes):
 
 ```json
 {
@@ -38,25 +58,17 @@ The relay writes a ready file like:
   "certFingerprint": "sha256-hex-without-prefix",
   "token": "random-hex-token",
   "pid": 12345,
-  "allowlist": [
-    { "kind": "tcp", "host": "127.0.0.1", "port": 8390 }
-  ]
+  "allowlist": [{ "kind": "tcp", "host": "127.0.0.1", "port": 8390 }]
 }
 ```
 
-Use `udpPort`, `certFingerprint`, `token`, and `protocolVersion` to connect.
-
-## Use The Client
-
-Add the client crate:
+## Use the Rust client
 
 ```toml
 [dependencies]
 alleycat-client = { path = "crates/client" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
-
-Connect and create a local forward:
 
 ```rust
 use alleycat_client::{ConnectParams, ForwardSpec, Session, Target, WIRE_PROTOCOL_VERSION};
@@ -69,38 +81,26 @@ let session = Session::connect(ConnectParams {
     protocol_version: WIRE_PROTOCOL_VERSION,
 }).await?;
 
-let forward = session
-    .ensure_forward(ForwardSpec {
-        local_port: 0,
-        target: Target::Tcp {
-            host: "127.0.0.1".into(),
-            port: 8390,
-        },
-    })
-    .await?;
+let forward = session.ensure_forward(ForwardSpec {
+    local_port: 0,
+    target: Target::Tcp { host: "127.0.0.1".into(), port: 8390 },
+}).await?;
 
 println!("local port: {}", forward.local_port());
 ```
 
-Open a raw stream instead:
+Raw stream instead of a local forward:
 
 ```rust
-let stream = session
-    .open_stream(Target::Unix {
-        path: "/tmp/codex-ipc/ipc-123.sock".into(),
-    })
-    .await?;
+let stream = session.open_stream(Target::Unix {
+    path: "/tmp/codex-ipc/ipc-123.sock".into(),
+}).await?;
 ```
 
-Shutdown:
-
-```rust
-forward.close().await;
-session.shutdown().await;
-```
+Shutdown: `forward.close().await; session.shutdown().await;`
 
 ## Notes
 
-- Allowlist checks are exact. If the relay was launched with `127.0.0.1:8390`, `localhost:8390` is rejected.
-- Unix targets only work on platforms that support Unix sockets.
-- The relay is intentionally narrow: no broker, NAT traversal, reverse mode, or UDP proxying.
+- Allowlist matches are exact strings — `127.0.0.1:8390` does not match `localhost:8390`.
+- Unix-socket targets work on macOS and Linux only.
+- Intentionally narrow: no broker, no NAT traversal, no reverse mode, no UDP proxying.

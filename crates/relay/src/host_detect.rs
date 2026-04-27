@@ -6,15 +6,34 @@
 //! Tailscale DNS name → Tailscale IPs → Bonjour `.local` → private LAN IPv4s.
 //! Loopback is added last as a safety net (only useful for the iOS simulator
 //! on the same Mac).
+//!
+//! Diagnostic logging: detection emits `tracing::info!` lines summarizing
+//! what was discovered and `tracing::debug!` lines explaining each failed
+//! tailscale-binary probe. This is deliberate — sandboxed launchd contexts
+//! can silently lose access to `/Applications/Tailscale.app/...` and the
+//! logs are how we tell the user "we looked here, it didn't work, supply
+//! `host.tailscale_bin` in config.toml". Set `RUST_LOG=alleycat=debug` to
+//! see the per-candidate probe output.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// Detect candidate hostnames/IPs the phone could dial to reach this relay.
+use tracing::{debug, info};
+
+/// Detect candidate hostnames/IPs the phone could dial to reach this relay,
+/// using the default per-OS tailscale binary search.
 ///
 /// Always returns at least one entry (`127.0.0.1` if everything else fails).
 /// De-duplicates while preserving the priority order.
 pub fn detect_candidates() -> Vec<String> {
+    detect_candidates_with(None)
+}
+
+/// Like [`detect_candidates`] but lets the caller supply an explicit
+/// tailscale binary (typically from `config.toml`'s `[host] tailscale_bin`).
+/// When `tailscale_bin` is `Some`, the per-OS auto-discovery list is
+/// skipped entirely so the user's override is the only path probed.
+pub fn detect_candidates_with(tailscale_bin: Option<&Path>) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let mut push = |s: Option<String>| {
         if let Some(s) = s {
@@ -26,20 +45,33 @@ pub fn detect_candidates() -> Vec<String> {
     };
 
     // 1+2: Tailscale tailnet DNS name + IPs (works cross-network).
-    if let Some((dns, ips)) = tailscale_self() {
+    if let Some((bin_used, dns, ips)) = tailscale_self(tailscale_bin) {
+        info!(
+            tailscale_bin = ?bin_used,
+            dns = ?dns,
+            ipv4_count = ips.len(),
+            "tailscale detected"
+        );
         push(dns);
         for ip in ips {
             push(Some(ip));
         }
+    } else {
+        debug!("tailscale detection produced no candidates");
     }
 
     // 3: macOS Bonjour `.local` (works on same LAN, iOS resolves natively).
-    push(bonjour_local_name());
+    let bonjour = bonjour_local_name();
+    push(bonjour.clone());
 
     // 4: Private LAN IPv4s from getifaddrs.
-    for ip in private_lan_ipv4s() {
+    let lan_ips = private_lan_ipv4s();
+    let lan_count = lan_ips.len();
+    for ip in lan_ips {
         push(Some(ip));
     }
+
+    info!(bonjour = ?bonjour, lan_count, "host_detect summary");
 
     if out.is_empty() {
         out.push("127.0.0.1".to_string());
@@ -47,16 +79,33 @@ pub fn detect_candidates() -> Vec<String> {
     out
 }
 
-fn tailscale_self() -> Option<(Option<String>, Vec<String>)> {
-    let bin = which_tailscale()?;
-    let output = Command::new(&bin)
-        .args(["status", "--json"])
-        .output()
-        .ok()?;
+/// Probe one tailscale binary at `bin` for `status --json`. Returns
+/// `(bin, Some(dns), ips)` on success. Emits `debug!` lines explaining
+/// every failure mode so a sandboxed daemon's log makes the cause visible.
+fn try_tailscale_at(bin: &Path) -> Option<(Option<String>, Vec<String>)> {
+    let output = match Command::new(bin).args(["status", "--json"]).output() {
+        Ok(o) => o,
+        Err(error) => {
+            debug!(?bin, %error, "tailscale spawn failed");
+            return None;
+        }
+    };
     if !output.status.success() {
+        debug!(
+            ?bin,
+            exit = ?output.status.code(),
+            stderr = %String::from_utf8_lossy(&output.stderr),
+            "tailscale exited nonzero"
+        );
         return None;
     }
-    let v: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
+    let v: serde_json::Value = match serde_json::from_slice(&output.stdout) {
+        Ok(v) => v,
+        Err(error) => {
+            debug!(?bin, %error, "tailscale JSON parse failed");
+            return None;
+        }
+    };
     let dns = v["Self"]["DNSName"]
         .as_str()
         .map(|s| s.trim_end_matches('.').to_string())
@@ -72,36 +121,110 @@ fn tailscale_self() -> Option<(Option<String>, Vec<String>)> {
         })
         .unwrap_or_default();
     if dns.is_none() && ips.is_empty() {
-        None
-    } else {
-        Some((dns, ips))
+        debug!(
+            ?bin,
+            "tailscale status had no Self.DNSName or IPs (logged out?)"
+        );
+        return None;
     }
+    Some((dns, ips))
 }
 
-fn which_tailscale() -> Option<PathBuf> {
-    if let Ok(p) = which::which("tailscale") {
-        return Some(p);
+/// Locate a working tailscale binary and return `(path, dns, ipv4s)`. Probes
+/// the candidates in order — explicit absolute paths first, then `which`
+/// fallback — and returns on the first one that produces a usable response.
+///
+/// The binaries-list-first ordering is deliberate: a stale shim earlier on
+/// `$PATH` (npm-style wrappers, brew shims for an uninstalled cask, etc.)
+/// can return success without actually talking to tailscaled. The canonical
+/// install paths are more reliable.
+fn tailscale_self(explicit_bin: Option<&Path>) -> Option<(PathBuf, Option<String>, Vec<String>)> {
+    if let Some(bin) = explicit_bin {
+        // User-supplied path. Don't fall back if it fails — the user wants
+        // determinism, and silently ignoring their config would mask the
+        // real problem.
+        if !bin.exists() {
+            debug!(?bin, "configured host.tailscale_bin does not exist");
+            return None;
+        }
+        let (dns, ips) = try_tailscale_at(bin)?;
+        return Some((bin.to_path_buf(), dns, ips));
     }
-    let candidates: Vec<&'static str> = vec![
-        #[cfg(target_os = "macos")]
-        "/Applications/Tailscale.app/Contents/MacOS/Tailscale",
-        #[cfg(target_os = "macos")]
-        "/usr/local/bin/tailscale",
-        #[cfg(target_os = "macos")]
-        "/opt/homebrew/bin/tailscale",
-        #[cfg(target_os = "linux")]
-        "/usr/bin/tailscale",
-        #[cfg(target_os = "linux")]
-        "/usr/local/bin/tailscale",
-        #[cfg(target_os = "windows")]
-        r"C:\Program Files\Tailscale\tailscale.exe",
-        #[cfg(target_os = "windows")]
-        r"C:\Program Files (x86)\Tailscale\tailscale.exe",
-    ];
-    candidates
+
+    let candidates = which_tailscale_candidates();
+    if candidates.is_empty() {
+        debug!("no tailscale candidate paths to probe");
+        return None;
+    }
+    for c in &candidates {
+        if let Some((dns, ips)) = try_tailscale_at(c) {
+            return Some((c.clone(), dns, ips));
+        }
+    }
+    debug!(
+        probed = candidates.len(),
+        "no tailscale candidate succeeded"
+    );
+    None
+}
+
+/// All candidate tailscale binary paths to probe, in priority order.
+/// Absolute paths from canonical installs first; `which::which` fallback
+/// last so a stale PATH shim doesn't preempt the real binary.
+fn which_tailscale_candidates() -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = default_tailscale_paths()
         .into_iter()
-        .map(PathBuf::from)
-        .find(|p| p.exists())
+        .filter(|p| p.exists())
+        .collect();
+    if let Ok(p) = which::which("tailscale")
+        && !out.iter().any(|existing| existing == &p)
+    {
+        out.push(p);
+    }
+    out
+}
+
+/// Per-OS canonical install paths to probe. Pure data — split out so tests
+/// don't need a real tailscale install. Always returns absolute paths;
+/// callers filter by existence.
+fn default_tailscale_paths() -> Vec<PathBuf> {
+    let mut v: Vec<PathBuf> = Vec::new();
+
+    #[cfg(target_os = "macos")]
+    {
+        v.push(PathBuf::from(
+            "/Applications/Tailscale.app/Contents/MacOS/Tailscale",
+        ));
+        v.push(PathBuf::from("/usr/local/bin/tailscale"));
+        v.push(PathBuf::from("/opt/homebrew/bin/tailscale"));
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        v.push(PathBuf::from("/usr/bin/tailscale"));
+        v.push(PathBuf::from("/usr/local/bin/tailscale"));
+        v.push(PathBuf::from("/usr/sbin/tailscale"));
+        v.push(PathBuf::from("/snap/bin/tailscale"));
+        v.push(PathBuf::from("/var/lib/snapd/snap/bin/tailscale"));
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        v.push(PathBuf::from(r"C:\Program Files\Tailscale\tailscale.exe"));
+        v.push(PathBuf::from(
+            r"C:\Program Files (x86)\Tailscale\tailscale.exe",
+        ));
+        // Honor the redirected env vars too — some sysprep'd images set
+        // ProgramFiles to a non-default drive.
+        if let Ok(pf) = std::env::var("ProgramFiles") {
+            v.push(PathBuf::from(pf).join(r"Tailscale\tailscale.exe"));
+        }
+        if let Ok(pf86) = std::env::var("ProgramFiles(x86)") {
+            v.push(PathBuf::from(pf86).join(r"Tailscale\tailscale.exe"));
+        }
+    }
+
+    v
 }
 
 fn bonjour_local_name() -> Option<String> {
@@ -283,5 +406,110 @@ mod tests {
         // avahi is actually running on the test host is environment-specific;
         // we do not assert a value, only that the function does not panic.
         let _ = linux_avahi_running();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn default_tailscale_paths_macos_includes_canonical_install() {
+        let paths = default_tailscale_paths();
+        let strs: Vec<String> = paths.iter().map(|p| p.display().to_string()).collect();
+        assert!(
+            strs.iter()
+                .any(|s| s.contains("/Applications/Tailscale.app"))
+        );
+        assert!(strs.iter().any(|s| s == "/usr/local/bin/tailscale"));
+        assert!(strs.iter().any(|s| s == "/opt/homebrew/bin/tailscale"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn default_tailscale_paths_linux_includes_snap_and_sbin() {
+        let paths = default_tailscale_paths();
+        let strs: Vec<String> = paths.iter().map(|p| p.display().to_string()).collect();
+        assert!(strs.iter().any(|s| s == "/usr/bin/tailscale"));
+        assert!(strs.iter().any(|s| s == "/usr/local/bin/tailscale"));
+        assert!(strs.iter().any(|s| s == "/usr/sbin/tailscale"));
+        assert!(strs.iter().any(|s| s == "/snap/bin/tailscale"));
+        assert!(
+            strs.iter()
+                .any(|s| s == "/var/lib/snapd/snap/bin/tailscale")
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn which_tailscale_falls_through_when_path_empty() {
+        // Wipe PATH so `which::which` cannot find anything; the function
+        // should still scan the canonical install list and degrade
+        // gracefully when none exist on the test host.
+        // SAFETY: tests in this module do not concurrently mutate PATH;
+        // CI typically does not have tailscale installed under
+        // /snap/bin etc., so this exercises the empty-result path.
+        let saved = std::env::var_os("PATH");
+        unsafe { std::env::set_var("PATH", "") };
+        let candidates = which_tailscale_candidates();
+        // If a canonical install happens to exist on the runner we get
+        // a non-empty list; otherwise empty. Either is fine — the contract
+        // is that the function does not panic and never returns a path
+        // that doesn't exist on disk.
+        for c in &candidates {
+            assert!(c.exists(), "candidate {c:?} should exist on disk");
+        }
+        match saved {
+            Some(v) => unsafe { std::env::set_var("PATH", v) },
+            None => unsafe { std::env::remove_var("PATH") },
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn default_tailscale_paths_windows_includes_program_files() {
+        let saved_pf = std::env::var_os("ProgramFiles");
+        let saved_pf86 = std::env::var_os("ProgramFiles(x86)");
+        unsafe { std::env::set_var("ProgramFiles", r"D:\Apps") };
+        unsafe { std::env::set_var("ProgramFiles(x86)", r"D:\Apps86") };
+        let paths = default_tailscale_paths();
+        let strs: Vec<String> = paths.iter().map(|p| p.display().to_string()).collect();
+        assert!(
+            strs.iter()
+                .any(|s| s.contains(r"Program Files\Tailscale\tailscale.exe"))
+        );
+        assert!(
+            strs.iter()
+                .any(|s| s.contains(r"D:\Apps\Tailscale\tailscale.exe"))
+        );
+        assert!(
+            strs.iter()
+                .any(|s| s.contains(r"D:\Apps86\Tailscale\tailscale.exe"))
+        );
+        match saved_pf {
+            Some(v) => unsafe { std::env::set_var("ProgramFiles", v) },
+            None => unsafe { std::env::remove_var("ProgramFiles") },
+        }
+        match saved_pf86 {
+            Some(v) => unsafe { std::env::set_var("ProgramFiles(x86)", v) },
+            None => unsafe { std::env::remove_var("ProgramFiles(x86)") },
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn which_tailscale_falls_through_when_path_empty() {
+        let saved = std::env::var_os("PATH");
+        unsafe { std::env::set_var("PATH", "") };
+        let candidates = which_tailscale_candidates();
+        for c in &candidates {
+            assert!(c.exists(), "candidate {c:?} should exist on disk");
+        }
+        match saved {
+            Some(v) => unsafe { std::env::set_var("PATH", v) },
+            None => unsafe { std::env::remove_var("PATH") },
+        }
+    }
+
+    #[test]
+    fn explicit_bin_missing_returns_none() {
+        let bogus = std::path::PathBuf::from("/this/path/should/not/exist/tailscale-9d3f1ab");
+        assert!(tailscale_self(Some(&bogus)).is_none());
     }
 }

@@ -2,7 +2,7 @@
 //! `~/Library/LaunchAgents/` and bootstraps it into `gui/$UID`. No admin.
 
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use anyhow::{Context, anyhow};
 
@@ -17,12 +17,15 @@ pub(super) fn install() -> anyhow::Result<()> {
     write_plist(&plist_path, &exe, &log_path)?;
 
     let uid = current_uid();
-    // bootout is a no-op the first time; ignore failure so re-install is idempotent.
+    // bootout is a no-op the first time; silence its "no such process" stderr
+    // and ignore failure so re-install stays idempotent.
     let _ = Command::new("launchctl")
         .args([
             "bootout",
             &format!("gui/{uid}/{label}", label = service_label()),
         ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .status();
 
     let bootstrap = Command::new("launchctl")
@@ -67,6 +70,8 @@ pub(super) fn uninstall() -> anyhow::Result<()> {
             "bootout",
             &format!("gui/{uid}/{label}", label = service_label()),
         ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .status();
     if plist_path.exists() {
         std::fs::remove_file(&plist_path)

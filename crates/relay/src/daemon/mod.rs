@@ -75,7 +75,7 @@ pub async fn run() -> anyhow::Result<()> {
     info!(port = bound_port, "relay bound");
 
     let host_candidates = if cfg.host.overrides.is_empty() {
-        host_detect::detect_candidates()
+        host_detect::detect_candidates_with(cfg.host.tailscale_bin.as_deref())
     } else {
         cfg.host.overrides.clone()
     };
@@ -278,7 +278,7 @@ async fn handle_reload(daemon: &DaemonState) -> Response {
     }
     let targets = config::parse_targets(&new_cfg);
     let host_candidates = if new_cfg.host.overrides.is_empty() {
-        host_detect::detect_candidates()
+        host_detect::detect_candidates_with(new_cfg.host.tailscale_bin.as_deref())
     } else {
         new_cfg.host.overrides.clone()
     };
