@@ -1,0 +1,33 @@
+[package]
+name = "alleycat"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "alleycat"
+path = "src/main.rs"
+
+[dependencies]
+alleycat-bridge-core = { path = "../bridge-core" }
+alleycat-opencode-bridge = { path = "../opencode-bridge" }
+alleycat-pi-bridge = { path = "../pi-bridge" }
+anyhow.workspace = true
+clap.workspace = true
+directories.workspace = true
+fd-lock.workspace = true
+hex.workspace = true
+iroh.workspace = true
+qrcodegen = "1"
+rand.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tokio.workspace = true
+toml.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+which.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

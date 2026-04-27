@@ -1,8 +1,9 @@
 [workspace]
 members = [
-    "crates/protocol",
-    "crates/client",
-    "crates/relay",
+    "crates/alleycat",
+    "crates/bridge-core",
+    "crates/pi-bridge",
+    "crates/opencode-bridge",
 ]
 resolver = "3"
 
@@ -14,12 +15,14 @@ version = "0.1.0"
 [workspace.dependencies]
 anyhow = "1"
 arc-swap = "1"
+async-trait = "0.1"
 clap = { version = "4.5", features = ["derive"] }
 directories = "5"
 fd-lock = "4"
 futures = "0.3"
 hex = "0.4"
 hostname = "0.4"
+iroh = "0.98.1"
 libc = "0.2"
 pin-project-lite = "0.2"
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
@@ -31,9 +34,18 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 thiserror = "2"
-tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
 toml = "0.8"
 tracing = "0.1"
 tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 which = "6"
+base64 = "0.22"
+chrono = { version = "0.4", default-features = false, features = ["serde", "clock"] }
+tokio-util = { version = "0.7", features = ["codec", "io"] }
+uuid = { version = "1", features = ["serde", "v7"] }
+pretty_assertions = "1"
+tempfile = "3"
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "gzip"] }
+tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
+url = "2"

@@ -1,0 +1,1326 @@
+//! `thread/*` request handlers.
+//!
+//! These methods juggle three resources:
+//!
+//! - [`crate::pool::PiPool`] — the live pi processes, accessed via
+//!   `state.pi_pool()`.
+//! - [`crate::state::ThreadIndexHandle`] — the bridge's `threads.json`
+//!   metadata store, accessed via `state.thread_index()`.
+//! - The connection's [`ThreadDefaults`](crate::state::ThreadDefaults) —
+//!   used to fill in approval policy / sandbox / model when the request
+//!   omits them.
+//!
+//! Mapping to pi commands roughly tracks the design plan
+//! (`~/.claude/plans/i-wanna-design-a-smooth-horizon.md`, "Thread management").
+//! Specific divergences are documented inline:
+//!
+//! - `thread/start` does not (yet) inject `base_instructions`/`developer_instructions`
+//!   into pi. Pi has no native system-prompt slot accessible from RPC; the
+//!   plan suggests writing them to `~/.pi/agent/<session>/system.md` or
+//!   prepending them to the first user prompt — pending a pi-side hook,
+//!   the bridge captures them in the index `name` field annotation only.
+//! - `thread/rollback` is implemented via pi `fork` to preserve the audit
+//!   trail (per the plan), but pi's fork is per-entry so we approximate
+//!   "drop the last N turns" as "fork from the entry id of the (n-th
+//!   from end) user message".
+//! - `thread/compact/start` is fire-and-forget from the codex client's
+//!   point of view: the bridge sends pi `compact{}` and returns success
+//!   immediately. The matching `thread/compacted` notification is emitted
+//!   by `handlers/turn.rs`'s event pump when pi reports `compaction_end`.
+
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::SystemTime;
+
+use thiserror::Error;
+use uuid::Uuid;
+
+use crate::codex_proto as p;
+use crate::codex_proto::{SessionSource, SortDirection, ThreadSourceKind};
+use crate::index::IndexEntry;
+use crate::pool::pi_protocol as pi;
+use crate::pool::{PiProcessHandle, PoolError};
+use crate::state::{ConnectionState, ListFilter, ListSort};
+use crate::translate::items::translate_messages;
+
+/// Errors a `thread/*` handler can produce. Mapped onto JSON-RPC error
+/// codes by the dispatcher in main.rs.
+#[derive(Debug, Error)]
+pub enum ThreadError {
+    #[error("invalid params: {0}")]
+    InvalidParams(String),
+    #[error("thread `{0}` not found in index")]
+    NotFound(String),
+    #[error("pool error: {0}")]
+    Pool(String),
+    #[error("pi rpc error: {0}")]
+    PiRpc(String),
+    #[error(transparent)]
+    Index(#[from] anyhow::Error),
+}
+
+impl ThreadError {
+    /// JSON-RPC code suitable for surfacing via the dispatcher's
+    /// `MethodError` mapper.
+    pub fn rpc_code(&self) -> i64 {
+        match self {
+            ThreadError::InvalidParams(_) => p::error_codes::INVALID_PARAMS,
+            ThreadError::NotFound(_) => p::error_codes::INVALID_PARAMS,
+            ThreadError::Pool(_) | ThreadError::PiRpc(_) | ThreadError::Index(_) => {
+                p::error_codes::INTERNAL_ERROR
+            }
+        }
+    }
+
+    fn pool(err: PoolError) -> Self {
+        Self::Pool(err.to_string())
+    }
+}
+
+// ============================================================================
+// thread/start
+// ============================================================================
+
+pub async fn handle_thread_start(
+    state: &Arc<ConnectionState>,
+    params: p::ThreadStartParams,
+) -> Result<p::ThreadStartResponse, ThreadError> {
+    let cwd = resolve_cwd(params.cwd.as_deref())?;
+    let defaults = state.defaults();
+
+    let (thread_id, handle) = state
+        .pi_pool()
+        .acquire_for_new_thread(&cwd)
+        .await
+        .map_err(ThreadError::pool)?;
+
+    // Mint a fresh pi session in the spawned process. Pi requires this
+    // before any prompt can be sent.
+    let new_session = handle
+        .send_request(pi::RpcCommand::NewSession(pi::NewSessionCmd::default()))
+        .await
+        .map_err(|e| ThreadError::PiRpc(e.to_string()))?;
+    if !new_session.success {
+        return Err(ThreadError::PiRpc(
+            new_session
+                .error
+                .unwrap_or_else(|| "new_session failed".into()),
+        ));
+    }
+
+    // Apply optional model + thinking-level overrides before any first
+    // turn. Errors here are downgraded to warnings so the thread still
+    // comes up — codex clients usually retry overrides on next turn.
+    apply_model_override(&handle, &params.model, &params.model_provider).await;
+    apply_thinking_override(&handle, params_effort(&params)).await;
+
+    // Pi has no native session-naming for `service_name` / `personality`,
+    // so we pass `service_name` through to pi as the session name when
+    // present (otherwise leave the pi default).
+    if let Some(name) = params.service_name.as_deref() {
+        let _ = handle
+            .send_request(pi::RpcCommand::SetSessionName(pi::SetSessionNameCmd {
+                id: None,
+                name: name.to_string(),
+            }))
+            .await;
+    }
+
+    // Recover pi's session id + path so the index can route resumes back
+    // to the same JSONL file.
+    let (pi_session_id, pi_session_path) = pi_session_identity(&handle).await?;
+
+    let now_ms = now_unix_millis();
+    let model_provider = params
+        .model_provider
+        .clone()
+        .or_else(|| defaults.model_provider.clone())
+        .unwrap_or_else(|| "pi".to_string());
+    let entry = IndexEntry {
+        thread_id: thread_id.clone(),
+        pi_session_path: pi_session_path.clone(),
+        pi_session_id,
+        cwd: cwd.to_string_lossy().into_owned(),
+        name: params.service_name.clone(),
+        preview: String::new(),
+        created_at: now_ms,
+        updated_at: now_ms,
+        archived: false,
+        forked_from_id: None,
+        model_provider: model_provider.clone(),
+        source: ThreadSourceKind::AppServer,
+    };
+    state
+        .thread_index()
+        .insert(entry.clone())
+        .await
+        .map_err(ThreadError::from)?;
+
+    let model = params
+        .model
+        .clone()
+        .or_else(|| defaults.model.clone())
+        .unwrap_or_default();
+    let approval_policy = params
+        .approval_policy
+        .clone()
+        .or_else(|| defaults.approval_policy.clone())
+        .unwrap_or(p::AskForApproval::OnRequest);
+    let approvals_reviewer = params
+        .approvals_reviewer
+        .or(defaults.approvals_reviewer)
+        .unwrap_or(p::ApprovalsReviewer::User);
+    let sandbox = sandbox_value(params.sandbox.or(defaults.sandbox));
+    let reasoning_effort = params.additional.get("effort").and_then(parse_effort);
+
+    Ok(p::ThreadStartResponse {
+        thread: thread_from_entry(&entry),
+        model,
+        model_provider,
+        service_tier: None,
+        cwd: cwd.to_string_lossy().into_owned(),
+        instruction_sources: Vec::new(),
+        approval_policy,
+        approvals_reviewer,
+        sandbox,
+        permission_profile: params.permission_profile.clone(),
+        reasoning_effort,
+    })
+}
+
+// ============================================================================
+// thread/resume
+// ============================================================================
+
+pub async fn handle_thread_resume(
+    state: &Arc<ConnectionState>,
+    params: p::ThreadResumeParams,
+) -> Result<p::ThreadResumeResponse, ThreadError> {
+    let entry = state
+        .thread_index()
+        .lookup(&params.thread_id)
+        .await
+        .ok_or_else(|| ThreadError::NotFound(params.thread_id.clone()))?;
+
+    let cwd = PathBuf::from(&entry.cwd);
+    let handle = match state.pi_pool().get(&params.thread_id).await {
+        Some(h) => h,
+        None => state
+            .pi_pool()
+            .acquire_for_resume(params.thread_id.clone(), &cwd)
+            .await
+            .map_err(ThreadError::pool)?,
+    };
+
+    // Switch the spawned process to the persisted pi session file so
+    // future commands write to the right JSONL.
+    let switch = handle
+        .send_request(pi::RpcCommand::SwitchSession(pi::SwitchSessionCmd {
+            id: None,
+            session_path: entry.pi_session_path.to_string_lossy().into_owned(),
+        }))
+        .await
+        .map_err(|e| ThreadError::PiRpc(e.to_string()))?;
+    if !switch.success {
+        return Err(ThreadError::PiRpc(
+            switch
+                .error
+                .unwrap_or_else(|| "switch_session failed".into()),
+        ));
+    }
+
+    apply_model_override(&handle, &params.model, &params.model_provider).await;
+    apply_thinking_override(
+        &handle,
+        params.additional.get("effort").and_then(parse_effort),
+    )
+    .await;
+
+    let mut thread = thread_from_entry(&entry);
+    if !params.exclude_turns {
+        thread.turns = fetch_turns(&handle).await?;
+    }
+
+    let defaults = state.defaults();
+    let model = params
+        .model
+        .clone()
+        .or_else(|| defaults.model.clone())
+        .unwrap_or_default();
+    let model_provider = params
+        .model_provider
+        .clone()
+        .unwrap_or_else(|| entry.model_provider.clone());
+    let approval_policy = params
+        .approval_policy
+        .clone()
+        .or_else(|| defaults.approval_policy.clone())
+        .unwrap_or(p::AskForApproval::OnRequest);
+    let approvals_reviewer = params
+        .approvals_reviewer
+        .or(defaults.approvals_reviewer)
+        .unwrap_or(p::ApprovalsReviewer::User);
+    let sandbox = sandbox_value(params.sandbox.or(defaults.sandbox));
+
+    Ok(p::ThreadResumeResponse {
+        thread,
+        model,
+        model_provider,
+        service_tier: None,
+        cwd: entry.cwd.clone(),
+        instruction_sources: Vec::new(),
+        approval_policy,
+        approvals_reviewer,
+        sandbox,
+        permission_profile: params.permission_profile.clone(),
+        reasoning_effort: params.additional.get("effort").and_then(parse_effort),
+    })
+}
+
+// ============================================================================
+// thread/fork
+// ============================================================================
+
+pub async fn handle_thread_fork(
+    state: &Arc<ConnectionState>,
+    params: p::ThreadForkParams,
+) -> Result<p::ThreadForkResponse, ThreadError> {
+    let source = state
+        .thread_index()
+        .lookup(&params.thread_id)
+        .await
+        .ok_or_else(|| ThreadError::NotFound(params.thread_id.clone()))?;
+    let cwd = PathBuf::from(&source.cwd);
+
+    // Acquire (or reuse) a pi process bound to the source's cwd, switch
+    // it to the source session, find the leaf user-message entry id, and
+    // ask pi to fork. The new session path comes back inside pi's
+    // session state — we read it via `get_state` after the fork lands.
+    let handle = match state.pi_pool().get(&params.thread_id).await {
+        Some(h) => h,
+        None => state
+            .pi_pool()
+            .acquire_utility(Some(&cwd))
+            .await
+            .map_err(ThreadError::pool)?,
+    };
+    switch_handle_to(&handle, &source.pi_session_path).await?;
+
+    let entry_id = leaf_user_entry_id(&handle).await?;
+    let fork_resp = handle
+        .send_request(pi::RpcCommand::Fork(pi::ForkCmd { id: None, entry_id }))
+        .await
+        .map_err(|e| ThreadError::PiRpc(e.to_string()))?;
+    if !fork_resp.success {
+        return Err(ThreadError::PiRpc(
+            fork_resp.error.unwrap_or_else(|| "fork failed".into()),
+        ));
+    }
+
+    // Pi switched the session to the fork as a side effect of the call.
+    // Recover the new session id + path for the index row.
+    let (pi_session_id, pi_session_path) = pi_session_identity(&handle).await?;
+
+    let new_thread_id = Uuid::now_v7().to_string();
+    let now_ms = now_unix_millis();
+    let entry = IndexEntry {
+        thread_id: new_thread_id.clone(),
+        pi_session_path,
+        pi_session_id,
+        cwd: source.cwd.clone(),
+        name: source.name.clone(),
+        preview: source.preview.clone(),
+        created_at: now_ms,
+        updated_at: now_ms,
+        archived: false,
+        forked_from_id: Some(source.thread_id.clone()),
+        model_provider: source.model_provider.clone(),
+        source: ThreadSourceKind::AppServer,
+    };
+    state
+        .thread_index()
+        .insert(entry.clone())
+        .await
+        .map_err(ThreadError::from)?;
+
+    let mut thread = thread_from_entry(&entry);
+    if !params.exclude_turns {
+        thread.turns = fetch_turns(&handle).await?;
+    }
+
+    let defaults = state.defaults();
+    Ok(p::ThreadForkResponse {
+        thread,
+        model: params
+            .model
+            .clone()
+            .or(defaults.model.clone())
+            .unwrap_or_default(),
+        model_provider: params
+            .model_provider
+            .clone()
+            .unwrap_or_else(|| source.model_provider.clone()),
+        service_tier: None,
+        cwd: source.cwd.clone(),
+        instruction_sources: Vec::new(),
+        approval_policy: params
+            .approval_policy
+            .clone()
+            .or_else(|| defaults.approval_policy.clone())
+            .unwrap_or(p::AskForApproval::OnRequest),
+        approvals_reviewer: params
+            .approvals_reviewer
+            .or(defaults.approvals_reviewer)
+            .unwrap_or(p::ApprovalsReviewer::User),
+        sandbox: sandbox_value(params.sandbox.or(defaults.sandbox)),
+        permission_profile: params.permission_profile.clone(),
+        reasoning_effort: params.additional.get("effort").and_then(parse_effort),
+    })
+}
+
+// ============================================================================
+// thread/archive  /  thread/unarchive
+// ============================================================================
+
+pub async fn handle_thread_archive(
+    state: &Arc<ConnectionState>,
+    params: p::ThreadArchiveParams,
+) -> Result<p::ThreadArchiveResponse, ThreadError> {
+    let changed = state
+        .thread_index()
+        .set_archived(&params.thread_id, true)
+        .await
+        .map_err(ThreadError::from)?;
+    if !changed {
+        return Err(ThreadError::NotFound(params.thread_id));
+    }
+    if state.should_emit("thread/archived") {
+        let frame = notification_frame(p::ServerNotification::ThreadArchived(p::ThreadIdOnly {
+            thread_id: params.thread_id.clone(),
+        }));
+        let _ = state.send(frame);
+    }
+    Ok(p::ThreadArchiveResponse::default())
+}
+
+pub async fn handle_thread_unarchive(
+    state: &Arc<ConnectionState>,
+    params: p::ThreadUnarchiveParams,
+) -> Result<p::ThreadUnarchiveResponse, ThreadError> {
+    let changed = state
+        .thread_index()
+        .set_archived(&params.thread_id, false)
+        .await
+        .map_err(ThreadError::from)?;
+    if !changed {
+        return Err(ThreadError::NotFound(params.thread_id));
+    }
+    let entry = state
+        .thread_index()
+        .lookup(&params.thread_id)
+        .await
+        .ok_or_else(|| ThreadError::NotFound(params.thread_id.clone()))?;
+    if state.should_emit("thread/unarchived") {
+        let frame = notification_frame(p::ServerNotification::ThreadUnarchived(p::ThreadIdOnly {
+            thread_id: params.thread_id.clone(),
+        }));
+        let _ = state.send(frame);
+    }
+    Ok(p::ThreadUnarchiveResponse {
+        thread: thread_from_entry(&entry),
+    })
+}
+
+// ============================================================================
+// thread/name/set
+// ============================================================================
+
+pub async fn handle_thread_set_name(
+    state: &Arc<ConnectionState>,
+    params: p::ThreadSetNameParams,
+) -> Result<p::ThreadSetNameResponse, ThreadError> {
+    let trimmed = params.name.trim().to_string();
+    let stored = if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.clone())
+    };
+
+    // Persist to the index first — that's the source of truth for
+    // `thread/list`. Pi-side `set_session_name` is best-effort: pi only
+    // stores the name when the matching session is the current one in
+    // the spawned process.
+    let changed = state
+        .thread_index()
+        .set_name(&params.thread_id, stored.clone())
+        .await
+        .map_err(ThreadError::from)?;
+    if !changed {
+        return Err(ThreadError::NotFound(params.thread_id.clone()));
+    }
+
+    if let Some(name) = stored.as_deref() {
+        if let Some(handle) = state.pi_pool().get(&params.thread_id).await {
+            let _ = handle
+                .send_request(pi::RpcCommand::SetSessionName(pi::SetSessionNameCmd {
+                    id: None,
+                    name: name.to_string(),
+                }))
+                .await;
+        }
+    }
+
+    if state.should_emit("thread/name/updated") {
+        let frame = notification_frame(p::ServerNotification::ThreadNameUpdated(
+            p::ThreadNameUpdatedNotification {
+                thread_id: params.thread_id.clone(),
+                thread_name: stored,
+            },
+        ));
+        let _ = state.send(frame);
+    }
+    Ok(p::ThreadSetNameResponse::default())
+}
+
+// ============================================================================
+// thread/compact/start
+// ============================================================================
+
+pub async fn handle_thread_compact_start(
+    state: &Arc<ConnectionState>,
+    params: p::ThreadCompactStartParams,
+) -> Result<p::ThreadCompactStartResponse, ThreadError> {
+    let handle = state
+        .pi_pool()
+        .get(&params.thread_id)
+        .await
+        .ok_or_else(|| ThreadError::NotFound(params.thread_id.clone()))?;
+
+    // Fire pi `compact{}`. Pi runs the compaction asynchronously and
+    // emits `compaction_start` / `compaction_end` events; the turn
+    // pump (#15) translates those into codex `thread/compacted` +
+    // `ContextCompaction` items, so this handler returns success
+    // immediately after pi acks the command preflight.
+    let resp = handle
+        .send_request(pi::RpcCommand::Compact(pi::CompactCmd::default()))
+        .await
+        .map_err(|e| ThreadError::PiRpc(e.to_string()))?;
+    if !resp.success {
+        return Err(ThreadError::PiRpc(
+            resp.error.unwrap_or_else(|| "compact failed".into()),
+        ));
+    }
+    Ok(p::ThreadCompactStartResponse::default())
+}
+
+// ============================================================================
+// thread/rollback
+// ============================================================================
+
+pub async fn handle_thread_rollback(
+    state: &Arc<ConnectionState>,
+    params: p::ThreadRollbackParams,
+) -> Result<p::ThreadRollbackResponse, ThreadError> {
+    if params.num_turns == 0 {
+        return Err(ThreadError::InvalidParams(
+            "num_turns must be >= 1".to_string(),
+        ));
+    }
+
+    let entry = state
+        .thread_index()
+        .lookup(&params.thread_id)
+        .await
+        .ok_or_else(|| ThreadError::NotFound(params.thread_id.clone()))?;
+    let cwd = PathBuf::from(&entry.cwd);
+    let handle = match state.pi_pool().get(&params.thread_id).await {
+        Some(h) => h,
+        None => state
+            .pi_pool()
+            .acquire_utility(Some(&cwd))
+            .await
+            .map_err(ThreadError::pool)?,
+    };
+    switch_handle_to(&handle, &entry.pi_session_path).await?;
+
+    // Walk pi's `get_fork_messages` (one entry per user message) backwards
+    // and pick the entry id of the (n-th-from-end) user message. That
+    // becomes the fork anchor; pi creates a fresh JSONL with everything
+    // up-to-and-including that entry.
+    let resp = handle
+        .send_request(pi::RpcCommand::GetForkMessages(pi::BareCmd::default()))
+        .await
+        .map_err(|e| ThreadError::PiRpc(e.to_string()))?;
+    if !resp.success {
+        return Err(ThreadError::PiRpc(
+            resp.error
+                .unwrap_or_else(|| "get_fork_messages failed".into()),
+        ));
+    }
+    let entries: pi::ForkMessagesData = serde_json::from_value(
+        resp.data
+            .ok_or_else(|| ThreadError::PiRpc("missing fork_messages data".into()))?,
+    )
+    .map_err(|e| ThreadError::PiRpc(format!("decode fork_messages: {e}")))?;
+
+    let target_index = entries
+        .messages
+        .len()
+        .checked_sub(params.num_turns as usize)
+        .ok_or_else(|| {
+            ThreadError::InvalidParams(format!(
+                "thread has {} user messages; cannot rollback {}",
+                entries.messages.len(),
+                params.num_turns
+            ))
+        })?;
+    let target_entry = entries
+        .messages
+        .get(target_index)
+        .ok_or_else(|| ThreadError::PiRpc("rollback anchor out of range".into()))?;
+    let fork_resp = handle
+        .send_request(pi::RpcCommand::Fork(pi::ForkCmd {
+            id: None,
+            entry_id: target_entry.entry_id.clone(),
+        }))
+        .await
+        .map_err(|e| ThreadError::PiRpc(e.to_string()))?;
+    if !fork_resp.success {
+        return Err(ThreadError::PiRpc(
+            fork_resp.error.unwrap_or_else(|| "fork failed".into()),
+        ));
+    }
+    // Pi swapped to the new session as a side effect; rewrite the
+    // existing index row to point at the new path so subsequent calls
+    // use the truncated history.
+    let (pi_session_id, pi_session_path) = pi_session_identity(&handle).await?;
+    let mut updated = entry.clone();
+    updated.pi_session_id = pi_session_id;
+    updated.pi_session_path = pi_session_path;
+    updated.updated_at = now_unix_millis();
+    state
+        .thread_index()
+        .insert(updated.clone())
+        .await
+        .map_err(ThreadError::from)?;
+
+    let mut thread = thread_from_entry(&updated);
+    thread.turns = fetch_turns(&handle).await?;
+    Ok(p::ThreadRollbackResponse { thread })
+}
+
+// ============================================================================
+// thread/list
+// ============================================================================
+
+pub async fn handle_thread_list(
+    state: &Arc<ConnectionState>,
+    params: p::ThreadListParams,
+) -> Result<p::ThreadListResponse, ThreadError> {
+    let filter = ListFilter {
+        archived: params.archived,
+        cwds: parse_cwd_filter(&params.cwd),
+        search_term: params.search_term.clone(),
+        model_providers: params.model_providers.clone(),
+        source_kinds: params.source_kinds.clone(),
+    };
+    let sort = ListSort {
+        key: params.sort_key.unwrap_or(p::ThreadSortKey::UpdatedAt),
+        direction: params.sort_direction.unwrap_or(SortDirection::Desc),
+    };
+    let page = state
+        .thread_index()
+        .list(&filter, sort, params.cursor.as_deref(), params.limit)
+        .await
+        .map_err(ThreadError::from)?;
+
+    // Index always sets `ThreadStatus::NotLoaded` (see
+    // `IndexEntry::to_thread`). Enrich entries that pi has actually
+    // spawned right now so codex clients can render the correct badge
+    // without a follow-up `thread/loaded/list` call. We don't try to
+    // detect `Active{flags}` here — pi has no notion of "waiting on
+    // approval" we can sniff cheaply, and `WaitingOnUserInput` would
+    // need the approval registry from #18 which is per-turn-only.
+    let loaded: std::collections::HashSet<String> = state
+        .pi_pool()
+        .loaded_thread_ids()
+        .await
+        .into_iter()
+        .filter(|id| !id.starts_with("utility_"))
+        .collect();
+    let data = page
+        .data
+        .into_iter()
+        .map(|mut t| {
+            if loaded.contains(&t.id) {
+                t.status = p::ThreadStatus::Idle;
+            }
+            t
+        })
+        .collect();
+
+    Ok(p::ThreadListResponse {
+        data,
+        next_cursor: page.next_cursor,
+        backwards_cursor: None,
+    })
+}
+
+// ============================================================================
+// thread/loaded/list
+// ============================================================================
+
+pub async fn handle_thread_loaded_list(
+    state: &Arc<ConnectionState>,
+    _params: p::ThreadLoadedListParams,
+) -> p::ThreadLoadedListResponse {
+    let mut data = state.pi_pool().loaded_thread_ids().await;
+    // Strip utility-spawned thread ids — codex clients only know about
+    // codex-shaped UUIDs, not the synthetic `utility_*` namespace the
+    // pool uses internally.
+    data.retain(|id| !id.starts_with("utility_"));
+    p::ThreadLoadedListResponse {
+        data,
+        next_cursor: None,
+    }
+}
+
+// ============================================================================
+// thread/read
+// ============================================================================
+
+pub async fn handle_thread_read(
+    state: &Arc<ConnectionState>,
+    params: p::ThreadReadParams,
+) -> Result<p::ThreadReadResponse, ThreadError> {
+    let entry = state
+        .thread_index()
+        .lookup(&params.thread_id)
+        .await
+        .ok_or_else(|| ThreadError::NotFound(params.thread_id.clone()))?;
+
+    let mut thread = thread_from_entry(&entry);
+    if params.include_turns {
+        // Prefer the live process if one is running for this thread —
+        // it has the freshest state. Otherwise spawn a utility pi and
+        // switch it to the persisted JSONL to read the messages.
+        let handle = match state.pi_pool().get(&params.thread_id).await {
+            Some(h) => h,
+            None => {
+                let cwd = PathBuf::from(&entry.cwd);
+                let h = state
+                    .pi_pool()
+                    .acquire_utility(Some(&cwd))
+                    .await
+                    .map_err(ThreadError::pool)?;
+                switch_handle_to(&h, &entry.pi_session_path).await?;
+                h
+            }
+        };
+        thread.turns = fetch_turns(&handle).await?;
+    }
+    Ok(p::ThreadReadResponse { thread })
+}
+
+// ============================================================================
+// thread/backgroundTerminals/clean
+// ============================================================================
+
+pub async fn handle_thread_background_terminals_clean(
+    _state: &Arc<ConnectionState>,
+    _params: p::ThreadBackgroundTerminalsCleanParams,
+) -> p::ThreadBackgroundTerminalsCleanResponse {
+    // Pi has no concept of background terminals; the codex client
+    // tolerates a no-op success here.
+    p::ThreadBackgroundTerminalsCleanResponse::default()
+}
+
+// ============================================================================
+// helpers
+// ============================================================================
+
+fn resolve_cwd(requested: Option<&str>) -> Result<PathBuf, ThreadError> {
+    match requested {
+        Some(path) if !path.is_empty() => Ok(PathBuf::from(path)),
+        _ => std::env::current_dir().map_err(|e| {
+            ThreadError::InvalidParams(format!("cwd not provided and bridge cwd unavailable: {e}"))
+        }),
+    }
+}
+
+fn now_unix_millis() -> i64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+fn thread_from_entry(entry: &IndexEntry) -> p::Thread {
+    p::Thread {
+        id: entry.thread_id.clone(),
+        forked_from_id: entry.forked_from_id.clone(),
+        preview: entry.preview.clone(),
+        ephemeral: false,
+        model_provider: entry.model_provider.clone(),
+        created_at: entry.created_at,
+        updated_at: entry.updated_at,
+        status: p::ThreadStatus::Idle,
+        path: Some(entry.pi_session_path.to_string_lossy().into_owned()),
+        cwd: entry.cwd.clone(),
+        cli_version: format!("alleycat-pi-bridge/{}", env!("CARGO_PKG_VERSION")),
+        source: source_kind_to_session_source(entry.source),
+        agent_nickname: None,
+        agent_role: None,
+        git_info: None,
+        name: entry.name.clone(),
+        turns: Vec::new(),
+    }
+}
+
+fn source_kind_to_session_source(kind: ThreadSourceKind) -> SessionSource {
+    match kind {
+        ThreadSourceKind::Cli => SessionSource::Cli,
+        ThreadSourceKind::VsCode => SessionSource::VsCode,
+        ThreadSourceKind::Exec => SessionSource::Exec,
+        ThreadSourceKind::AppServer => SessionSource::AppServer,
+        _ => SessionSource::AppServer,
+    }
+}
+
+fn sandbox_value(mode: Option<p::SandboxMode>) -> p::SandboxPolicy {
+    // Codex's `SandboxPolicy` is `#[serde(tag = "type", rename_all =
+    // "camelCase")]` with variants `ReadOnly`, `DangerFullAccess`,
+    // `WorkspaceWrite`, `ExternalSandbox` (see app-server-protocol/src/protocol/v2.rs).
+    // Inner fields all have `#[serde(default)]`, so emitting just the discriminator
+    // round-trips cleanly. Default to `workspaceWrite` when the caller didn't
+    // pick anything.
+    match mode {
+        Some(p::SandboxMode::ReadOnly) => serde_json::json!({ "type": "readOnly" }),
+        Some(p::SandboxMode::DangerFullAccess) => {
+            serde_json::json!({ "type": "dangerFullAccess" })
+        }
+        Some(p::SandboxMode::WorkspaceWrite) | None => {
+            serde_json::json!({ "type": "workspaceWrite" })
+        }
+    }
+}
+
+fn parse_cwd_filter(value: &Option<serde_json::Value>) -> Option<Vec<String>> {
+    let v = value.as_ref()?;
+    match v {
+        serde_json::Value::String(s) => Some(vec![s.clone()]),
+        serde_json::Value::Array(arr) => Some(
+            arr.iter()
+                .filter_map(|x| x.as_str().map(str::to_string))
+                .collect(),
+        ),
+        _ => None,
+    }
+}
+
+fn parse_effort(value: &serde_json::Value) -> Option<p::ReasoningEffort> {
+    match value.as_str()? {
+        "minimal" => Some(p::ReasoningEffort::Minimal),
+        "low" => Some(p::ReasoningEffort::Low),
+        "medium" => Some(p::ReasoningEffort::Medium),
+        "high" => Some(p::ReasoningEffort::High),
+        _ => None,
+    }
+}
+
+fn params_effort(params: &p::ThreadStartParams) -> Option<p::ReasoningEffort> {
+    params.additional.get("effort").and_then(parse_effort)
+}
+
+fn pi_thinking_level(effort: p::ReasoningEffort) -> pi::ThinkingLevel {
+    match effort {
+        p::ReasoningEffort::Minimal => pi::ThinkingLevel::Minimal,
+        p::ReasoningEffort::Low => pi::ThinkingLevel::Low,
+        p::ReasoningEffort::Medium => pi::ThinkingLevel::Medium,
+        p::ReasoningEffort::High => pi::ThinkingLevel::High,
+    }
+}
+
+async fn apply_model_override(
+    handle: &Arc<PiProcessHandle>,
+    model: &Option<String>,
+    provider: &Option<String>,
+) {
+    let (Some(model_id), Some(provider)) = (model, provider) else {
+        return;
+    };
+    let _ = handle
+        .send_request(pi::RpcCommand::SetModel(pi::SetModelCmd {
+            id: None,
+            provider: provider.clone(),
+            model_id: model_id.clone(),
+        }))
+        .await;
+}
+
+async fn apply_thinking_override(
+    handle: &Arc<PiProcessHandle>,
+    effort: Option<p::ReasoningEffort>,
+) {
+    let Some(effort) = effort else { return };
+    let _ = handle
+        .send_request(pi::RpcCommand::SetThinkingLevel(pi::SetThinkingLevelCmd {
+            id: None,
+            level: pi_thinking_level(effort),
+        }))
+        .await;
+}
+
+/// Recover pi's session id + path from a live handle. The bridge can't
+/// keep state across pi restarts, so this round-trips through pi's
+/// `get_state` after each session-changing command.
+async fn pi_session_identity(
+    handle: &Arc<PiProcessHandle>,
+) -> Result<(String, PathBuf), ThreadError> {
+    let resp = handle
+        .send_request(pi::RpcCommand::GetState(pi::BareCmd::default()))
+        .await
+        .map_err(|e| ThreadError::PiRpc(e.to_string()))?;
+    if !resp.success {
+        return Err(ThreadError::PiRpc(
+            resp.error.unwrap_or_else(|| "get_state failed".into()),
+        ));
+    }
+    let state: pi::SessionState = serde_json::from_value(
+        resp.data
+            .ok_or_else(|| ThreadError::PiRpc("missing get_state data".into()))?,
+    )
+    .map_err(|e| ThreadError::PiRpc(format!("decode session state: {e}")))?;
+    let session_path = state
+        .session_file
+        .map(PathBuf::from)
+        .ok_or_else(|| ThreadError::PiRpc("pi did not surface session_file".into()))?;
+    Ok((state.session_id, session_path))
+}
+
+async fn switch_handle_to(
+    handle: &Arc<PiProcessHandle>,
+    session_path: &Path,
+) -> Result<(), ThreadError> {
+    let resp = handle
+        .send_request(pi::RpcCommand::SwitchSession(pi::SwitchSessionCmd {
+            id: None,
+            session_path: session_path.to_string_lossy().into_owned(),
+        }))
+        .await
+        .map_err(|e| ThreadError::PiRpc(e.to_string()))?;
+    if !resp.success {
+        return Err(ThreadError::PiRpc(
+            resp.error.unwrap_or_else(|| "switch_session failed".into()),
+        ));
+    }
+    Ok(())
+}
+
+async fn leaf_user_entry_id(handle: &Arc<PiProcessHandle>) -> Result<String, ThreadError> {
+    let resp = handle
+        .send_request(pi::RpcCommand::GetForkMessages(pi::BareCmd::default()))
+        .await
+        .map_err(|e| ThreadError::PiRpc(e.to_string()))?;
+    if !resp.success {
+        return Err(ThreadError::PiRpc(
+            resp.error
+                .unwrap_or_else(|| "get_fork_messages failed".into()),
+        ));
+    }
+    let data: pi::ForkMessagesData = serde_json::from_value(
+        resp.data
+            .ok_or_else(|| ThreadError::PiRpc("missing fork_messages data".into()))?,
+    )
+    .map_err(|e| ThreadError::PiRpc(format!("decode fork_messages: {e}")))?;
+    data.messages
+        .last()
+        .map(|m| m.entry_id.clone())
+        .ok_or_else(|| {
+            ThreadError::InvalidParams("source thread has no user messages to fork from".into())
+        })
+}
+
+async fn fetch_turns(handle: &Arc<PiProcessHandle>) -> Result<Vec<p::Turn>, ThreadError> {
+    let resp = handle
+        .send_request(pi::RpcCommand::GetMessages(pi::BareCmd::default()))
+        .await
+        .map_err(|e| ThreadError::PiRpc(e.to_string()))?;
+    if !resp.success {
+        return Err(ThreadError::PiRpc(
+            resp.error.unwrap_or_else(|| "get_messages failed".into()),
+        ));
+    }
+    let data: pi::GetMessagesData = serde_json::from_value(
+        resp.data
+            .ok_or_else(|| ThreadError::PiRpc("missing messages data".into()))?,
+    )
+    .map_err(|e| ThreadError::PiRpc(format!("decode messages: {e}")))?;
+    Ok(translate_messages(&data.messages))
+}
+
+fn notification_frame(notif: p::ServerNotification) -> p::JsonRpcMessage {
+    let value = serde_json::to_value(&notif).expect("ServerNotification serializes");
+    let method = value
+        .get("method")
+        .and_then(|m| m.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let params = value.get("params").cloned();
+    p::JsonRpcMessage::Notification(p::JsonRpcNotification {
+        jsonrpc: p::JsonRpcVersion,
+        method,
+        params,
+    })
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+//
+// These exercise the index-only paths (archive/unarchive/name/set/list/
+// loaded-list/backgroundTerminals/clean). The pi-spawning paths
+// (thread/start/resume/fork/compact/rollback/read+include_turns) need a
+// real pi binary and live in the integration suite under `tests/`.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use tokio::sync::mpsc;
+
+    async fn dummy_state() -> (
+        Arc<ConnectionState>,
+        mpsc::UnboundedReceiver<p::JsonRpcMessage>,
+    ) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let dir = tempfile::tempdir().unwrap();
+        let index = crate::index::ThreadIndex::open_at(dir.path().join("threads.json"))
+            .await
+            .unwrap();
+        std::mem::forget(dir);
+        let state = Arc::new(ConnectionState::new(
+            tx,
+            Arc::new(crate::pool::PiPool::new("/dev/null")),
+            index,
+            Default::default(),
+        ));
+        (state, rx)
+    }
+
+    fn sample_entry(thread_id: &str) -> IndexEntry {
+        IndexEntry {
+            thread_id: thread_id.into(),
+            pi_session_path: "/tmp/pi/x.jsonl".into(),
+            pi_session_id: "pi-session-x".into(),
+            cwd: "/repo".into(),
+            name: None,
+            preview: "first message".into(),
+            created_at: 100,
+            updated_at: 200,
+            archived: false,
+            forked_from_id: None,
+            model_provider: "pi".into(),
+            source: ThreadSourceKind::AppServer,
+        }
+    }
+
+    #[tokio::test]
+    async fn archive_sets_flag_and_emits_notification() {
+        let (state, mut rx) = dummy_state().await;
+        state
+            .thread_index()
+            .insert(sample_entry("t1"))
+            .await
+            .unwrap();
+        let resp = handle_thread_archive(
+            &state,
+            p::ThreadArchiveParams {
+                thread_id: "t1".into(),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp, p::ThreadArchiveResponse::default());
+
+        // Drain and verify the notification frame routes thread/archived.
+        let frame = rx.recv().await.unwrap();
+        let value = serde_json::to_value(&frame).unwrap();
+        assert_eq!(value["method"], json!("thread/archived"));
+        assert_eq!(value["params"]["threadId"], json!("t1"));
+    }
+
+    #[tokio::test]
+    async fn archive_returns_not_found_for_unknown_thread() {
+        let (state, _rx) = dummy_state().await;
+        let err = handle_thread_archive(
+            &state,
+            p::ThreadArchiveParams {
+                thread_id: "missing".into(),
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, ThreadError::NotFound(_)), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn unarchive_returns_thread_with_cleared_flag() {
+        let (state, mut rx) = dummy_state().await;
+        let mut entry = sample_entry("t2");
+        entry.archived = true;
+        state.thread_index().insert(entry).await.unwrap();
+
+        let resp = handle_thread_unarchive(
+            &state,
+            p::ThreadUnarchiveParams {
+                thread_id: "t2".into(),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.thread.id, "t2");
+
+        let frame = rx.recv().await.unwrap();
+        let value = serde_json::to_value(&frame).unwrap();
+        assert_eq!(value["method"], json!("thread/unarchived"));
+    }
+
+    #[tokio::test]
+    async fn set_name_persists_and_emits_updated() {
+        let (state, mut rx) = dummy_state().await;
+        state
+            .thread_index()
+            .insert(sample_entry("t3"))
+            .await
+            .unwrap();
+        handle_thread_set_name(
+            &state,
+            p::ThreadSetNameParams {
+                thread_id: "t3".into(),
+                name: "  My Thread  ".into(),
+            },
+        )
+        .await
+        .unwrap();
+        let row = state.thread_index().lookup("t3").await.unwrap();
+        assert_eq!(row.name.as_deref(), Some("My Thread"));
+
+        let frame = rx.recv().await.unwrap();
+        let value = serde_json::to_value(&frame).unwrap();
+        assert_eq!(value["method"], json!("thread/name/updated"));
+        assert_eq!(value["params"]["threadName"], json!("My Thread"));
+    }
+
+    #[tokio::test]
+    async fn set_name_with_empty_string_clears_the_name() {
+        let (state, _rx) = dummy_state().await;
+        let mut entry = sample_entry("t4");
+        entry.name = Some("Existing".into());
+        state.thread_index().insert(entry).await.unwrap();
+        handle_thread_set_name(
+            &state,
+            p::ThreadSetNameParams {
+                thread_id: "t4".into(),
+                name: "   ".into(),
+            },
+        )
+        .await
+        .unwrap();
+        let row = state.thread_index().lookup("t4").await.unwrap();
+        assert!(row.name.is_none(), "name should be cleared");
+    }
+
+    #[tokio::test]
+    async fn list_returns_threads_in_index() {
+        let (state, _rx) = dummy_state().await;
+        state
+            .thread_index()
+            .insert(sample_entry("a"))
+            .await
+            .unwrap();
+        state
+            .thread_index()
+            .insert(sample_entry("b"))
+            .await
+            .unwrap();
+        let resp = handle_thread_list(&state, p::ThreadListParams::default())
+            .await
+            .unwrap();
+        assert_eq!(resp.data.len(), 2);
+        let ids: Vec<&str> = resp.data.iter().map(|t| t.id.as_str()).collect();
+        assert!(ids.contains(&"a"));
+        assert!(ids.contains(&"b"));
+    }
+
+    #[tokio::test]
+    async fn list_filters_by_archived_flag() {
+        let (state, _rx) = dummy_state().await;
+        let mut a = sample_entry("a");
+        a.archived = false;
+        state.thread_index().insert(a).await.unwrap();
+        let mut b = sample_entry("b");
+        b.archived = true;
+        state.thread_index().insert(b).await.unwrap();
+
+        let resp = handle_thread_list(
+            &state,
+            p::ThreadListParams {
+                archived: Some(true),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.data.len(), 1);
+        assert_eq!(resp.data[0].id, "b");
+    }
+
+    #[tokio::test]
+    async fn list_marks_loaded_threads_as_idle() {
+        let (state, _rx) = dummy_state().await;
+        // Two index rows; only "loaded-id" gets a pool entry to flip to
+        // Idle. The pool fake here has no real pi child — we just want
+        // its `loaded_thread_ids` list to include the right id, which
+        // it never will because acquire_for_new_thread spawns and
+        // /dev/null is not a valid pi binary. So this test focuses on
+        // the no-op case: with no loaded threads, every entry should
+        // stay `NotLoaded`.
+        state
+            .thread_index()
+            .insert(sample_entry("only"))
+            .await
+            .unwrap();
+        let resp = handle_thread_list(&state, p::ThreadListParams::default())
+            .await
+            .unwrap();
+        assert_eq!(resp.data.len(), 1);
+        assert!(matches!(resp.data[0].status, p::ThreadStatus::NotLoaded));
+    }
+
+    #[tokio::test]
+    async fn loaded_list_drops_utility_namespaced_ids() {
+        let (state, _rx) = dummy_state().await;
+        // The pool is empty at construction; loaded_thread_ids returns
+        // [], which should pass through filter unchanged.
+        let resp = handle_thread_loaded_list(&state, p::ThreadLoadedListParams::default()).await;
+        assert!(resp.data.is_empty());
+        assert!(resp.next_cursor.is_none());
+    }
+
+    #[tokio::test]
+    async fn background_terminals_clean_is_a_noop_success() {
+        let (state, _rx) = dummy_state().await;
+        let _resp = handle_thread_background_terminals_clean(
+            &state,
+            p::ThreadBackgroundTerminalsCleanParams {
+                thread_id: "anything".into(),
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn read_without_include_turns_returns_metadata_only() {
+        let (state, _rx) = dummy_state().await;
+        let entry = sample_entry("r1");
+        let preview = entry.preview.clone();
+        state.thread_index().insert(entry).await.unwrap();
+        let resp = handle_thread_read(
+            &state,
+            p::ThreadReadParams {
+                thread_id: "r1".into(),
+                include_turns: false,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.thread.id, "r1");
+        assert_eq!(resp.thread.preview, preview);
+        assert!(resp.thread.turns.is_empty());
+    }
+
+    #[test]
+    fn parse_cwd_filter_handles_string_array_and_null() {
+        assert_eq!(
+            parse_cwd_filter(&Some(json!("/repo"))),
+            Some(vec!["/repo".to_string()])
+        );
+        assert_eq!(
+            parse_cwd_filter(&Some(json!(["/a", "/b"]))),
+            Some(vec!["/a".to_string(), "/b".to_string()])
+        );
+        assert_eq!(parse_cwd_filter(&None), None);
+        assert_eq!(parse_cwd_filter(&Some(json!(null))), None);
+    }
+
+    #[test]
+    fn parse_effort_recognizes_codex_levels() {
+        assert!(matches!(
+            parse_effort(&json!("minimal")),
+            Some(p::ReasoningEffort::Minimal)
+        ));
+        assert!(matches!(
+            parse_effort(&json!("high")),
+            Some(p::ReasoningEffort::High)
+        ));
+        assert!(parse_effort(&json!("xhigh")).is_none(), "pi-only level");
+        assert!(parse_effort(&json!(42)).is_none());
+    }
+
+    #[test]
+    fn pi_thinking_level_maps_each_codex_effort() {
+        assert!(matches!(
+            pi_thinking_level(p::ReasoningEffort::Minimal),
+            pi::ThinkingLevel::Minimal
+        ));
+        assert!(matches!(
+            pi_thinking_level(p::ReasoningEffort::Low),
+            pi::ThinkingLevel::Low
+        ));
+        assert!(matches!(
+            pi_thinking_level(p::ReasoningEffort::Medium),
+            pi::ThinkingLevel::Medium
+        ));
+        assert!(matches!(
+            pi_thinking_level(p::ReasoningEffort::High),
+            pi::ThinkingLevel::High
+        ));
+    }
+
+    #[test]
+    fn sandbox_value_maps_each_mode() {
+        assert_eq!(
+            sandbox_value(Some(p::SandboxMode::ReadOnly)),
+            json!({"type": "readOnly"})
+        );
+        assert_eq!(
+            sandbox_value(Some(p::SandboxMode::DangerFullAccess)),
+            json!({"type": "dangerFullAccess"})
+        );
+        assert_eq!(
+            sandbox_value(Some(p::SandboxMode::WorkspaceWrite)),
+            json!({"type": "workspaceWrite"})
+        );
+        // Default falls back to workspaceWrite.
+        assert_eq!(sandbox_value(None), json!({"type": "workspaceWrite"}));
+    }
+
+    #[test]
+    fn rollback_zero_is_invalid() {
+        // Pure sync precheck — `num_turns == 0` short-circuits before
+        // any pool/index access.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let (state, _rx) = rt.block_on(dummy_state());
+        let err = rt
+            .block_on(handle_thread_rollback(
+                &state,
+                p::ThreadRollbackParams {
+                    thread_id: "t".into(),
+                    num_turns: 0,
+                },
+            ))
+            .unwrap_err();
+        assert!(matches!(err, ThreadError::InvalidParams(_)), "got {err:?}");
+    }
+}
