@@ -157,9 +157,9 @@ impl Session {
                 }
             }
         }
-        Err(SessionError::Transport(
-            last_error.unwrap_or_else(|| anyhow::anyhow!("failed to open relay stream")),
-        ))
+        Err(SessionError::Transport(last_error.unwrap_or_else(|| {
+            anyhow::anyhow!("failed to open relay stream")
+        })))
     }
 
     pub async fn ensure_forward(&self, spec: ForwardSpec) -> Result<ForwardHandle, SessionError> {
@@ -319,12 +319,14 @@ fn build_client_config(params: &ConnectParams) -> Result<quinn::ClientConfig, Se
         .with_custom_certificate_verifier(verifier)
         .with_no_client_auth();
     Ok(quinn::ClientConfig::new(Arc::new(
-        quinn::crypto::rustls::QuicClientConfig::try_from(crypto)
-            .map_err(anyhow::Error::new)?,
+        quinn::crypto::rustls::QuicClientConfig::try_from(crypto).map_err(anyhow::Error::new)?,
     )))
 }
 
-async fn connect_once(endpoint: &Endpoint, params: &ConnectParams) -> Result<Connection, SessionError> {
+async fn connect_once(
+    endpoint: &Endpoint,
+    params: &ConnectParams,
+) -> Result<Connection, SessionError> {
     let addr = lookup_host((params.host.as_str(), params.port))
         .await
         .map_err(anyhow::Error::new)?
