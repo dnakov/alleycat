@@ -57,7 +57,7 @@ pub fn tool_part_to_item(part: &Value) -> Option<Value> {
         return Some(json!({
             "type": "fileChange",
             "id": id,
-            "changes": [],
+            "changes": synthesize_file_changes(tool, &state, &input),
             "status": status,
         }));
     }
@@ -232,6 +232,100 @@ pub fn tool_part_side_notifications(
     )]
 }
 
+/// Build a `FileUpdateChange[]` payload for opencode `write` / `edit` /
+/// `patch` / `apply_patch` tool parts. Returns the raw JSON-array shape
+/// the wire expects (camelCase fields, `kind: {type: "add"|"update"}`).
+///
+/// Opencode's `edit` tool already includes a fully-formed unified diff at
+/// `state.metadata.diff` — we lift it directly when present. `write`
+/// only carries `{path, content}` so we synthesize an additions-only
+/// hunk. `patch` / `apply_patch` are pass-through if they carry a diff.
+fn synthesize_file_changes(tool: &str, state: &Value, input: &Value) -> Value {
+    let path = input
+        .get("filePath")
+        .or_else(|| input.get("path"))
+        .or_else(|| input.get("file_path"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    if path.is_empty() {
+        return json!([]);
+    }
+    match tool {
+        "write" => {
+            let content = input.get("content").and_then(Value::as_str).unwrap_or("");
+            json!([{
+                "path": path,
+                "kind": {"type": "add"},
+                "diff": unified_addition(content),
+            }])
+        }
+        "edit" => {
+            // Prefer the canonical metadata.diff (a full unified diff
+            // opencode synthesizes itself). Fall back to a hand-rolled
+            // hunk built from oldString/newString.
+            let diff = state
+                .pointer("/metadata/diff")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .unwrap_or_else(|| {
+                    let old = input.get("oldString").and_then(Value::as_str).unwrap_or("");
+                    let new = input.get("newString").and_then(Value::as_str).unwrap_or("");
+                    unified_hunk(old, new)
+                });
+            json!([{
+                "path": path,
+                "kind": {"type": "update"},
+                "diff": diff,
+            }])
+        }
+        "patch" | "apply_patch" => {
+            let diff = state
+                .pointer("/metadata/diff")
+                .and_then(Value::as_str)
+                .or_else(|| input.get("patch").and_then(Value::as_str))
+                .or_else(|| input.get("diff").and_then(Value::as_str))
+                .unwrap_or("")
+                .to_string();
+            json!([{
+                "path": path,
+                "kind": {"type": "update"},
+                "diff": diff,
+            }])
+        }
+        _ => json!([]),
+    }
+}
+
+fn unified_hunk(old: &str, new: &str) -> String {
+    let old_count = old.lines().count().max(1);
+    let new_count = new.lines().count().max(1);
+    let mut out = format!("@@ -1,{old_count} +1,{new_count} @@\n");
+    for line in old.lines() {
+        out.push('-');
+        out.push_str(line);
+        out.push('\n');
+    }
+    for line in new.lines() {
+        out.push('+');
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
+}
+
+fn unified_addition(content: &str) -> String {
+    let lines: Vec<&str> = content.lines().collect();
+    let count = lines.len().max(1);
+    let mut out = format!("@@ -0,0 +1,{count} @@\n");
+    for line in &lines {
+        out.push('+');
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
+}
+
 fn cap_output(text: String) -> String {
     if text.len() <= EXPLORATION_OUTPUT_CAP {
         return text;
@@ -301,9 +395,81 @@ mod tests {
     #[test]
     fn write_and_edit_remain_filechange() {
         for t in ["write", "edit", "patch", "apply_patch"] {
-            let item = tool_part_to_item(&part(t, json!({}), None)).unwrap();
+            // Provide minimal args so synthesize_file_changes returns a
+            // populated entry rather than the empty-path fallback.
+            let item = tool_part_to_item(&part(t, json!({"path": "/x"}), None)).unwrap();
             assert_eq!(item["type"], "fileChange", "{t}");
         }
+    }
+
+    #[test]
+    fn write_filechange_carries_addition_diff() {
+        let item = tool_part_to_item(&part(
+            "write",
+            json!({"path": "/tmp/new.txt", "content": "alpha\nbeta\n"}),
+            None,
+        ))
+        .unwrap();
+        let changes = item["changes"].as_array().unwrap();
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0]["path"], "/tmp/new.txt");
+        assert_eq!(changes[0]["kind"]["type"], "add");
+        let diff = changes[0]["diff"].as_str().unwrap();
+        assert!(diff.starts_with("@@ -0,0 +1,2 @@"));
+        assert!(diff.contains("+alpha"));
+        assert!(diff.contains("+beta"));
+    }
+
+    #[test]
+    fn edit_filechange_uses_metadata_diff_when_present() {
+        // Real opencode edit results carry a fully-formed unified diff in
+        // state.metadata.diff. The bridge must lift it through verbatim.
+        let canonical_diff = "Index: /x\n===================================================================\n--- /x\n+++ /x\n@@ -1 +1 @@\n-foo\n+bar\n";
+        let part_value = json!({
+            "callID": "call-edit",
+            "tool": "edit",
+            "state": {
+                "status": "completed",
+                "input": {"filePath": "/x", "oldString": "foo", "newString": "bar"},
+                "metadata": {"diff": canonical_diff}
+            }
+        });
+        let item = tool_part_to_item(&part_value).unwrap();
+        let changes = item["changes"].as_array().unwrap();
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0]["path"], "/x");
+        assert_eq!(changes[0]["kind"]["type"], "update");
+        assert_eq!(changes[0]["diff"], canonical_diff);
+    }
+
+    #[test]
+    fn edit_filechange_falls_back_to_synthesized_hunk() {
+        // When metadata.diff is absent we hand-roll a hunk from
+        // oldString/newString.
+        let part_value = json!({
+            "callID": "call-edit2",
+            "tool": "edit",
+            "state": {
+                "status": "completed",
+                "input": {"filePath": "/x", "oldString": "foo", "newString": "bar"}
+            }
+        });
+        let item = tool_part_to_item(&part_value).unwrap();
+        let changes = item["changes"].as_array().unwrap();
+        let diff = changes[0]["diff"].as_str().unwrap();
+        assert!(diff.contains("-foo"));
+        assert!(diff.contains("+bar"));
+    }
+
+    #[test]
+    fn filechange_with_no_path_returns_empty_changes() {
+        // Some opencode tool variants don't include filePath/path in
+        // input (eg patch parts without explicit path). Fall through to
+        // empty changes rather than synthesizing a bogus path="" entry.
+        let item =
+            tool_part_to_item(&part("write", json!({"content": "x"}), None)).unwrap();
+        assert_eq!(item["type"], "fileChange");
+        assert_eq!(item["changes"].as_array().unwrap().len(), 0);
     }
 
     #[test]

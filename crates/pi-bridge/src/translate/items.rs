@@ -206,7 +206,10 @@ fn tool_call_to_item(
         },
         CodexToolKind::FileChange => ThreadItem::FileChange {
             id,
-            changes: Vec::new(),
+            changes: crate::translate::events::synthesize_file_changes(
+                &call.name,
+                &call.arguments,
+            ),
             status: match result {
                 None => PatchApplyStatus::InProgress,
                 Some(_) if is_error => PatchApplyStatus::Failed,

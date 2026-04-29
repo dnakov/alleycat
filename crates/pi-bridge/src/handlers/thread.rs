@@ -1473,8 +1473,14 @@ mod tests {
             parse_effort(&json!("high")),
             Some(p::ReasoningEffort::High)
         ));
-        assert!(parse_effort(&json!("xhigh")).is_none(), "pi-only level");
+        // `xhigh` started as a pi-only thinking level but codex added it to
+        // ReasoningEffort, so we now accept it here too.
+        assert!(matches!(
+            parse_effort(&json!("xhigh")),
+            Some(p::ReasoningEffort::XHigh)
+        ));
         assert!(parse_effort(&json!(42)).is_none());
+        assert!(parse_effort(&json!("nonsense")).is_none());
     }
 
     #[test]

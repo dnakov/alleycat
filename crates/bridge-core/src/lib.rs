@@ -2,6 +2,7 @@ pub mod envelope;
 pub mod framing;
 pub mod launcher;
 pub mod notify;
+pub mod pool;
 pub mod server;
 pub mod session;
 pub mod state;

@@ -116,124 +116,110 @@ pub fn parse_jsonl(text: &str) -> Vec<OnDiskRecord> {
 
 /// Group by `message.id` (assistant) / `uuid` (user) and fold into Turns.
 pub fn records_to_turns(records: &[OnDiskRecord]) -> Vec<Turn> {
-    let mut turns: Vec<Turn> = Vec::new();
-    let mut current_items: Vec<ThreadItem> = Vec::new();
-    let mut current_started_at: Option<i64> = None;
-    let mut current_completed_at: Option<i64> = None;
-    // Merge bookkeeping for assistant content blocks split across multiple
-    // JSONL lines with the same `message.id`.
-    let mut assistant_chunks: HashMap<String, MergedAssistant> = HashMap::new();
-    let mut assistant_order: Vec<String> = Vec::new();
-    // tool_use_id → indices into the items vector to support folding the
-    // tool_result back into the matching item.
-    let mut tool_call_index: HashMap<String, usize> = HashMap::new();
-
-    fn flush_assistants(
-        items: &mut Vec<ThreadItem>,
-        completed_at: &mut Option<i64>,
-        assistants: &mut HashMap<String, MergedAssistant>,
-        order: &mut Vec<String>,
-        tool_call_index: &mut HashMap<String, usize>,
-    ) {
-        for id in order.drain(..) {
-            let Some(merged) = assistants.remove(&id) else {
-                continue;
-            };
-            *completed_at = (*completed_at).max(Some(merged.timestamp));
-            for item in merged.into_items(tool_call_index, items.len()) {
-                items.push(item);
-            }
-        }
-    }
-
+    let mut builder = TurnBuilder::default();
     for record in records {
         match record.classify() {
             ClassifiedRecord::User { ts, content } => {
-                // Flush any in-flight assistants under the prior turn.
-                flush_assistants(
-                    &mut current_items,
-                    &mut current_completed_at,
-                    &mut assistant_chunks,
-                    &mut assistant_order,
-                    &mut tool_call_index,
-                );
-                // Tool-result inside a user content array doesn't open a new
-                // turn — fold it into the matching tool call instead.
-                if let Some(folded) = fold_tool_results_into_calls(
-                    &content,
-                    &record.tool_use_result,
-                    &mut current_items,
-                    &tool_call_index,
-                ) {
-                    if folded {
-                        // Tool-result-only user record: don't anchor a turn.
-                        current_completed_at = Some(ts);
-                        continue;
-                    }
+                builder.flush_assistants();
+                if let Some(true) =
+                    builder.try_fold_tool_results(&content, &record.tool_use_result)
+                {
+                    builder.current_completed_at = Some(ts);
+                    continue;
                 }
-                // Genuine user message: close the previous turn and open a new one.
-                push_turn(
-                    &mut turns,
-                    &mut current_items,
-                    &mut current_started_at,
-                    &mut current_completed_at,
-                );
-                tool_call_index.clear();
-                current_started_at = Some(ts);
-                current_completed_at = Some(ts);
-                current_items.push(user_message_to_item(&content, ts, turns.len()));
+                builder.push_turn();
+                builder.tool_call_index.clear();
+                builder.current_started_at = Some(ts);
+                builder.current_completed_at = Some(ts);
+                let turn_index = builder.turns.len();
+                builder
+                    .current_items
+                    .push(user_message_to_item(&content, ts, turn_index));
             }
             ClassifiedRecord::AssistantBlocks { id, ts, blocks } => {
-                let entry = assistant_chunks
-                    .entry(id.clone())
-                    .or_insert_with(|| MergedAssistant {
-                        message_id: id.clone(),
-                        timestamp: ts,
-                        blocks: Vec::new(),
-                    });
-                if !assistant_order.contains(&id) {
-                    assistant_order.push(id);
-                }
-                entry.timestamp = entry.timestamp.max(ts);
-                entry.blocks.extend(blocks);
+                builder.append_assistant_blocks(id, ts, blocks);
             }
             ClassifiedRecord::Skip => {}
         }
     }
-    flush_assistants(
-        &mut current_items,
-        &mut current_completed_at,
-        &mut assistant_chunks,
-        &mut assistant_order,
-        &mut tool_call_index,
-    );
-    push_turn(
-        &mut turns,
-        &mut current_items,
-        &mut current_started_at,
-        &mut current_completed_at,
-    );
-    turns
+    builder.finish()
 }
 
-fn push_turn(
-    turns: &mut Vec<Turn>,
-    items: &mut Vec<ThreadItem>,
-    started_at: &mut Option<i64>,
-    completed_at: &mut Option<i64>,
-) {
-    if items.is_empty() {
-        return;
+/// Owns the cross-record state for [`records_to_turns`]. Replaces the previous
+/// 5-mutable-reference function-threading shape with a single self-borrow.
+#[derive(Default)]
+struct TurnBuilder {
+    turns: Vec<Turn>,
+    current_items: Vec<ThreadItem>,
+    current_started_at: Option<i64>,
+    current_completed_at: Option<i64>,
+    assistant_chunks: HashMap<String, MergedAssistant>,
+    assistant_order: Vec<String>,
+    tool_call_index: HashMap<String, usize>,
+}
+
+impl TurnBuilder {
+    fn flush_assistants(&mut self) {
+        for id in self.assistant_order.drain(..) {
+            let Some(merged) = self.assistant_chunks.remove(&id) else {
+                continue;
+            };
+            self.current_completed_at = self.current_completed_at.max(Some(merged.timestamp));
+            for item in merged.into_items(&mut self.tool_call_index, self.current_items.len()) {
+                self.current_items.push(item);
+            }
+        }
     }
-    turns.push(Turn {
-        id: format!("turn_{}", turns.len()),
-        items: std::mem::take(items),
-        status: TurnStatus::Completed,
-        error: None,
-        started_at: started_at.take(),
-        completed_at: completed_at.take(),
-        duration_ms: None,
-    });
+
+    fn try_fold_tool_results(
+        &mut self,
+        content: &Value,
+        tool_use_result: &Option<Value>,
+    ) -> Option<bool> {
+        fold_tool_results_into_calls(
+            content,
+            tool_use_result,
+            &mut self.current_items,
+            &self.tool_call_index,
+        )
+    }
+
+    fn append_assistant_blocks(&mut self, id: String, ts: i64, blocks: Vec<Value>) {
+        let entry = self
+            .assistant_chunks
+            .entry(id.clone())
+            .or_insert_with(|| MergedAssistant {
+                message_id: id.clone(),
+                timestamp: ts,
+                blocks: Vec::new(),
+            });
+        if !self.assistant_order.contains(&id) {
+            self.assistant_order.push(id);
+        }
+        entry.timestamp = entry.timestamp.max(ts);
+        entry.blocks.extend(blocks);
+    }
+
+    fn push_turn(&mut self) {
+        if self.current_items.is_empty() {
+            return;
+        }
+        self.turns.push(Turn {
+            id: format!("turn_{}", self.turns.len()),
+            items: std::mem::take(&mut self.current_items),
+            status: TurnStatus::Completed,
+            error: None,
+            started_at: self.current_started_at.take(),
+            completed_at: self.current_completed_at.take(),
+            duration_ms: None,
+        });
+    }
+
+    fn finish(mut self) -> Vec<Turn> {
+        self.flush_assistants();
+        self.push_turn();
+        self.turns
+    }
 }
 
 fn user_message_to_item(content: &Value, ts: i64, turn_index: usize) -> ThreadItem {
@@ -593,7 +579,7 @@ fn tool_call_to_item(
         },
         CodexToolKind::FileChange => ThreadItem::FileChange {
             id,
-            changes: Vec::new(),
+            changes: crate::translate::events::synthesize_file_changes(tool_name, &args),
             status: PatchApplyStatus::InProgress,
         },
         CodexToolKind::Mcp { server, tool } => ThreadItem::McpToolCall {

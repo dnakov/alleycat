@@ -334,6 +334,12 @@ impl PiProcessHandle {
     }
 }
 
+impl alleycat_bridge_core::pool::PoolMember for PiProcessHandle {
+    async fn shutdown(&self) {
+        PiProcessHandle::shutdown(self).await
+    }
+}
+
 /// Patch the `id` field on whatever variant of [`RpcCommand`] we were given.
 /// Centralized here so the table doesn't have to be repeated in every caller.
 fn set_command_id(command: &mut RpcCommand, id: String) {

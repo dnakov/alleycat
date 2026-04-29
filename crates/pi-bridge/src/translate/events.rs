@@ -24,8 +24,8 @@ use uuid::Uuid;
 
 use crate::codex_proto::common::{TurnError, TurnStatus};
 use crate::codex_proto::items::{
-    CommandExecutionStatus, DynamicToolCallStatus, McpToolCallError, McpToolCallResult,
-    McpToolCallStatus, PatchApplyStatus, ThreadItem,
+    CommandExecutionStatus, DynamicToolCallStatus, FileUpdateChange, McpToolCallError,
+    McpToolCallResult, McpToolCallStatus, PatchApplyStatus, PatchChangeKind, ThreadItem,
 };
 use crate::codex_proto::notifications::{
     AgentMessageDeltaNotification, CommandExecutionOutputDeltaNotification,
@@ -407,7 +407,7 @@ impl EventTranslatorState {
             },
             CodexToolKind::FileChange => ThreadItem::FileChange {
                 id: tool_call_id.to_string(),
-                changes: Vec::new(),
+                changes: synthesize_file_changes(tool_name, args),
                 status: PatchApplyStatus::InProgress,
             },
             CodexToolKind::Mcp { server, tool } => ThreadItem::McpToolCall {
@@ -474,7 +474,7 @@ impl EventTranslatorState {
             }
             CodexToolKind::FileChange => ThreadItem::FileChange {
                 id: open.item_id.clone(),
-                changes: Vec::new(),
+                changes: synthesize_file_changes(&open.tool_name, &open.args),
                 status: if is_error {
                     PatchApplyStatus::Failed
                 } else {
@@ -676,6 +676,112 @@ fn extract_bash_output(result: &Value) -> Option<String> {
 /// Cap aggregated_output at 256 KiB on a UTF-8 boundary. Multi-megabyte
 /// `read` bodies otherwise inflate every notification round-trip.
 const EXPLORATION_OUTPUT_CAP: usize = 256 * 1024;
+
+/// Build `FileUpdateChange` entries from pi's `write` / `edit` /
+/// `apply_patch` arguments. Mirrors the claude-side helper but matches
+/// pi's snake_case keys (`path`, `oldText`/`newText`) instead of
+/// claude's `file_path` / `old_string`. Returns empty Vec when args are
+/// missing or unparseable.
+pub(crate) fn synthesize_file_changes(tool_name: &str, args: &Value) -> Vec<FileUpdateChange> {
+    match tool_name {
+        "write" => {
+            let path = args
+                .get("path")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            if path.is_empty() {
+                return Vec::new();
+            }
+            let content = args.get("content").and_then(Value::as_str).unwrap_or("");
+            vec![FileUpdateChange {
+                path,
+                kind: PatchChangeKind::Add,
+                diff: unified_addition(content),
+            }]
+        }
+        "edit" => {
+            let path = args
+                .get("path")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            if path.is_empty() {
+                return Vec::new();
+            }
+            let edits = args
+                .get("edits")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            if edits.is_empty() {
+                return Vec::new();
+            }
+            let mut diff = String::new();
+            for edit in &edits {
+                let old = edit.get("oldText").and_then(Value::as_str).unwrap_or("");
+                let new = edit.get("newText").and_then(Value::as_str).unwrap_or("");
+                diff.push_str(&unified_hunk(old, new));
+            }
+            vec![FileUpdateChange {
+                path,
+                kind: PatchChangeKind::Update { move_path: None },
+                diff,
+            }]
+        }
+        "apply_patch" => {
+            // pi's `apply_patch` ships a unified-diff body in `args.patch`.
+            // Pass it through as a single Update entry; the path lives
+            // inside the diff body itself, but FileUpdateChange.path is
+            // required, so we use an empty string when we can't extract
+            // a single path. Best-effort.
+            let patch = args.get("patch").and_then(Value::as_str).unwrap_or("");
+            if patch.is_empty() {
+                return Vec::new();
+            }
+            let path = args
+                .get("path")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            vec![FileUpdateChange {
+                path,
+                kind: PatchChangeKind::Update { move_path: None },
+                diff: patch.to_string(),
+            }]
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn unified_hunk(old: &str, new: &str) -> String {
+    let old_count = old.lines().count().max(1);
+    let new_count = new.lines().count().max(1);
+    let mut out = format!("@@ -1,{old_count} +1,{new_count} @@\n");
+    for line in old.lines() {
+        out.push('-');
+        out.push_str(line);
+        out.push('\n');
+    }
+    for line in new.lines() {
+        out.push('+');
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
+}
+
+fn unified_addition(content: &str) -> String {
+    let lines: Vec<&str> = content.lines().collect();
+    let count = lines.len().max(1);
+    let mut out = format!("@@ -0,0 +1,{count} @@\n");
+    for line in &lines {
+        out.push('+');
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
+}
 
 fn cap_aggregated_output(mut text: String) -> String {
     if text.len() <= EXPLORATION_OUTPUT_CAP {
@@ -1163,6 +1269,74 @@ mod tests {
             ServerNotification::ItemStarted(n) => {
                 assert!(matches!(n.item, ThreadItem::FileChange { .. }))
             }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn write_tool_emits_filechange_with_addition_diff() {
+        let mut s = state();
+        s.translate(PiEvent::ToolExecutionStart {
+            tool_call_id: "tc_w".into(),
+            tool_name: "write".into(),
+            args: json!({"path": "/tmp/x", "content": "line1\nline2\n"}),
+        });
+        let ended = s.translate(PiEvent::ToolExecutionEnd {
+            tool_call_id: "tc_w".into(),
+            tool_name: "write".into(),
+            result: json!("ok"),
+            is_error: false,
+        });
+        match &ended[0] {
+            ServerNotification::ItemCompleted(n) => match &n.item {
+                ThreadItem::FileChange { changes, .. } => {
+                    assert_eq!(changes.len(), 1);
+                    assert_eq!(changes[0].path, "/tmp/x");
+                    assert!(matches!(
+                        changes[0].kind,
+                        crate::codex_proto::items::PatchChangeKind::Add
+                    ));
+                    assert!(changes[0].diff.starts_with("@@ -0,0 +1,2 @@"));
+                    assert!(changes[0].diff.contains("+line1"));
+                    assert!(changes[0].diff.contains("+line2"));
+                }
+                other => panic!("expected FileChange, got {other:?}"),
+            },
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn edit_tool_emits_filechange_with_hunks_from_edits_array() {
+        let mut s = state();
+        s.translate(PiEvent::ToolExecutionStart {
+            tool_call_id: "tc_e".into(),
+            tool_name: "edit".into(),
+            args: json!({
+                "path": "/tmp/x",
+                "edits": [{"oldText": "foo\n", "newText": "bar\n"}]
+            }),
+        });
+        let ended = s.translate(PiEvent::ToolExecutionEnd {
+            tool_call_id: "tc_e".into(),
+            tool_name: "edit".into(),
+            result: json!("1 replacement"),
+            is_error: false,
+        });
+        match &ended[0] {
+            ServerNotification::ItemCompleted(n) => match &n.item {
+                ThreadItem::FileChange { changes, .. } => {
+                    assert_eq!(changes.len(), 1);
+                    assert_eq!(changes[0].path, "/tmp/x");
+                    assert!(matches!(
+                        changes[0].kind,
+                        crate::codex_proto::items::PatchChangeKind::Update { .. }
+                    ));
+                    assert!(changes[0].diff.contains("-foo"));
+                    assert!(changes[0].diff.contains("+bar"));
+                }
+                other => panic!("expected FileChange, got {other:?}"),
+            },
             other => panic!("unexpected {other:?}"),
         }
     }

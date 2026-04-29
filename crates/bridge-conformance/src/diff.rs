@@ -597,9 +597,9 @@ pub fn compare(reference: &Transcript, target: &Transcript) -> ConformanceReport
         keys.extend(ref_fp.keys());
         keys.extend(tgt_fp.keys());
         for key in keys {
-            let (method, kind) = key.clone();
-            let r = ref_fp.get(&key.clone()).cloned().unwrap_or_default();
-            let t = tgt_fp.get(&key.clone()).cloned().unwrap_or_default();
+            let (method, kind) = key;
+            let r = ref_fp.get(key).cloned().unwrap_or_default();
+            let t = tgt_fp.get(key).cloned().unwrap_or_default();
             if r.is_empty() && t.is_empty() {
                 continue;
             }
@@ -638,7 +638,7 @@ pub fn compare(reference: &Transcript, target: &Transcript) -> ConformanceReport
                 report.findings.push(Finding::KeyDifference {
                     step: step.to_string(),
                     method: method.clone(),
-                    kind,
+                    kind: *kind,
                     missing,
                     extra,
                 });

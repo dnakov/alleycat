@@ -37,12 +37,12 @@ use alleycat_codex_proto::{
     AgentMessageDeltaNotification, CollabAgentState, CollabAgentStatus, CollabAgentTool,
     CollabAgentToolCallStatus, CommandExecutionOutputDeltaNotification, CommandExecutionStatus,
     DynamicToolCallArgumentsDeltaNotification, DynamicToolCallStatus, ErrorNotification,
-    FileChangePatchUpdatedNotification, ItemCompletedNotification, ItemStartedNotification,
-    McpToolCallError, McpToolCallProgressNotification, McpToolCallResult, McpToolCallStatus,
-    PatchApplyStatus, ReasoningTextDeltaNotification, ServerNotification, ThreadItem,
-    ThreadTokenUsage, ThreadTokenUsageUpdatedNotification, TokenUsageBreakdown,
-    ToolRequestUserInputOption, ToolRequestUserInputQuestion, TurnError, TurnPlanStep,
-    TurnPlanStepStatus, TurnPlanUpdatedNotification, TurnStatus, WarningNotification,
+    FileChangePatchUpdatedNotification, FileUpdateChange, ItemCompletedNotification,
+    ItemStartedNotification, McpToolCallError, McpToolCallProgressNotification, McpToolCallResult,
+    McpToolCallStatus, PatchApplyStatus, PatchChangeKind, ReasoningTextDeltaNotification,
+    ServerNotification, ThreadItem, ThreadTokenUsage, ThreadTokenUsageUpdatedNotification,
+    TokenUsageBreakdown, ToolRequestUserInputOption, ToolRequestUserInputQuestion, TurnError,
+    TurnPlanStep, TurnPlanStepStatus, TurnPlanUpdatedNotification, TurnStatus, WarningNotification,
 };
 
 use crate::pool::claude_protocol::{
@@ -707,10 +707,13 @@ impl EventTranslatorState {
                 } else {
                     PatchApplyStatus::Completed
                 };
+                let parsed_args: Value =
+                    serde_json::from_str(&call.input_buf).unwrap_or(Value::Null);
+                let changes = synthesize_file_changes(&call.tool_name, &parsed_args);
                 vec![self.item_completed_with(
                     ThreadItem::FileChange {
                         id: call.item_id.clone(),
-                        changes: Vec::new(),
+                        changes,
                         status,
                     },
                     parent_for_call,
@@ -1303,6 +1306,140 @@ fn parse_ask_user_questions(input_buf: &str) -> Vec<ToolRequestUserInputQuestion
         .collect()
 }
 
+/// Build a `Vec<FileUpdateChange>` from a claude file-mutating tool's
+/// arguments. Emits one entry per file edited, with a hand-rolled
+/// unified-diff hunk in the `diff` field. Returns empty when args are
+/// missing or unparseable — callers fall back to `changes: vec![]` and
+/// the file-change card renders blank, which is what current behavior
+/// already does.
+///
+/// Hunk synthesis is deliberately naive: we don't have line numbers from
+/// the model's `old_string` / `new_string`, so we emit
+/// `@@ -1,N +1,M @@` with the entire old as `-` and entire new as `+`.
+/// Renderers that detect added/removed lines via the `+` / `-` prefix
+/// (litter, codex's tui) work fine; renderers that need accurate line
+/// numbers can still fall back to a "modified" pill.
+pub(crate) fn synthesize_file_changes(tool_name: &str, args: &Value) -> Vec<FileUpdateChange> {
+    match tool_name {
+        "Write" => {
+            let path = args
+                .get("file_path")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let content = args
+                .get("content")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            if path.is_empty() {
+                return Vec::new();
+            }
+            vec![FileUpdateChange {
+                path,
+                kind: PatchChangeKind::Add,
+                diff: unified_addition(content),
+            }]
+        }
+        "Edit" => {
+            let path = args
+                .get("file_path")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let old = args.get("old_string").and_then(Value::as_str).unwrap_or("");
+            let new = args.get("new_string").and_then(Value::as_str).unwrap_or("");
+            if path.is_empty() {
+                return Vec::new();
+            }
+            vec![FileUpdateChange {
+                path,
+                kind: PatchChangeKind::Update { move_path: None },
+                diff: unified_hunk(old, new),
+            }]
+        }
+        "MultiEdit" => {
+            let path = args
+                .get("file_path")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let edits = args
+                .get("edits")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            if path.is_empty() || edits.is_empty() {
+                return Vec::new();
+            }
+            let mut diff = String::new();
+            for edit in &edits {
+                let old = edit.get("old_string").and_then(Value::as_str).unwrap_or("");
+                let new = edit.get("new_string").and_then(Value::as_str).unwrap_or("");
+                diff.push_str(&unified_hunk(old, new));
+            }
+            vec![FileUpdateChange {
+                path,
+                kind: PatchChangeKind::Update { move_path: None },
+                diff,
+            }]
+        }
+        "NotebookEdit" => {
+            let path = args
+                .get("notebook_path")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let new_source = args
+                .get("new_source")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            if path.is_empty() {
+                return Vec::new();
+            }
+            vec![FileUpdateChange {
+                path,
+                kind: PatchChangeKind::Update { move_path: None },
+                diff: unified_addition(new_source),
+            }]
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// Build a `@@ -1,N +1,M @@` hunk for an in-place edit. `old` and `new`
+/// can each contain multiple lines. Trailing-newline-less inputs still
+/// render correctly — `str::lines()` strips the trailing empty line.
+fn unified_hunk(old: &str, new: &str) -> String {
+    let old_count = old.lines().count().max(1);
+    let new_count = new.lines().count().max(1);
+    let mut out = format!("@@ -1,{old_count} +1,{new_count} @@\n");
+    for line in old.lines() {
+        out.push('-');
+        out.push_str(line);
+        out.push('\n');
+    }
+    for line in new.lines() {
+        out.push('+');
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
+}
+
+/// Build a `@@ -0,0 +1,N @@` hunk for a fresh-file write — every line
+/// of the new content is a `+` addition.
+fn unified_addition(content: &str) -> String {
+    let lines: Vec<&str> = content.lines().collect();
+    let count = lines.len().max(1);
+    let mut out = format!("@@ -0,0 +1,{count} @@\n");
+    for line in &lines {
+        out.push('+');
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
+}
+
 /// Pull `arguments.plan` out of an ExitPlanMode tool's accumulated input
 /// buffer. Returns an empty string if the JSON isn't yet parseable or the
 /// `plan` field is missing/non-string.
@@ -1713,7 +1850,7 @@ fn tool_started_item(
         },
         CodexToolKind::FileChange => ThreadItem::FileChange {
             id: item_id.to_string(),
-            changes: Vec::new(),
+            changes: synthesize_file_changes(tool_name, args),
             status: PatchApplyStatus::InProgress,
         },
         CodexToolKind::Mcp { server, tool } => ThreadItem::McpToolCall {
@@ -2601,6 +2738,98 @@ mod tests {
             n,
             ServerNotification::ItemCompleted(c) if matches!(&c.item, ThreadItem::WebSearch { .. })
         )));
+    }
+
+    #[test]
+    fn write_tool_emits_filechange_with_addition_diff() {
+        let mut s = state();
+        let out = run_tool_lifecycle(
+            &mut s,
+            "toolu_w",
+            "Write",
+            r#"{"file_path":"/tmp/new.txt","content":"alpha\nbeta\n"}"#,
+            "wrote 12 bytes",
+            false,
+        );
+        let completed = out
+            .iter()
+            .find_map(|n| match n {
+                ServerNotification::ItemCompleted(c) => Some(c),
+                _ => None,
+            })
+            .expect("Write ItemCompleted");
+        match &completed.item {
+            ThreadItem::FileChange { changes, status, .. } => {
+                assert!(matches!(status, PatchApplyStatus::Completed));
+                assert_eq!(changes.len(), 1);
+                assert_eq!(changes[0].path, "/tmp/new.txt");
+                assert!(matches!(changes[0].kind, PatchChangeKind::Add));
+                assert!(changes[0].diff.starts_with("@@ -0,0 +1,2 @@"));
+                assert!(changes[0].diff.contains("+alpha"));
+                assert!(changes[0].diff.contains("+beta"));
+            }
+            other => panic!("expected FileChange, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn edit_tool_emits_filechange_with_hunk_diff() {
+        let mut s = state();
+        let out = run_tool_lifecycle(
+            &mut s,
+            "toolu_e",
+            "Edit",
+            r#"{"file_path":"/tmp/x.txt","old_string":"foo","new_string":"bar"}"#,
+            "1 replacement",
+            false,
+        );
+        let completed = out
+            .iter()
+            .find_map(|n| match n {
+                ServerNotification::ItemCompleted(c) => Some(c),
+                _ => None,
+            })
+            .expect("Edit ItemCompleted");
+        match &completed.item {
+            ThreadItem::FileChange { changes, .. } => {
+                assert_eq!(changes.len(), 1);
+                assert_eq!(changes[0].path, "/tmp/x.txt");
+                assert!(matches!(changes[0].kind, PatchChangeKind::Update { .. }));
+                assert!(changes[0].diff.contains("-foo"));
+                assert!(changes[0].diff.contains("+bar"));
+            }
+            other => panic!("expected FileChange, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn multi_edit_tool_concatenates_hunks() {
+        let mut s = state();
+        let out = run_tool_lifecycle(
+            &mut s,
+            "toolu_me",
+            "MultiEdit",
+            r#"{"file_path":"/x","edits":[{"old_string":"a","new_string":"b"},{"old_string":"c","new_string":"d"}]}"#,
+            "2 replacements",
+            false,
+        );
+        let completed = out
+            .iter()
+            .find_map(|n| match n {
+                ServerNotification::ItemCompleted(c) => Some(c),
+                _ => None,
+            })
+            .unwrap();
+        match &completed.item {
+            ThreadItem::FileChange { changes, .. } => {
+                assert_eq!(changes.len(), 1);
+                assert!(changes[0].diff.contains("-a"));
+                assert!(changes[0].diff.contains("+b"));
+                assert!(changes[0].diff.contains("-c"));
+                assert!(changes[0].diff.contains("+d"));
+            }
+            other => panic!("expected FileChange, got {other:?}"),
+        }
     }
 
     #[test]

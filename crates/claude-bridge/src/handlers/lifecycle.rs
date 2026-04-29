@@ -153,6 +153,6 @@ fn platform_os() -> &'static str {
     } else if cfg!(target_os = "windows") {
         "windows"
     } else {
-        "other"
+        std::env::consts::OS
     }
 }

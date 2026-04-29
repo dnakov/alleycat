@@ -604,6 +604,12 @@ impl ClaudeProcessHandle {
     }
 }
 
+impl alleycat_bridge_core::pool::PoolMember for ClaudeProcessHandle {
+    async fn shutdown(&self) {
+        ClaudeProcessHandle::shutdown(self).await
+    }
+}
+
 async fn writer_task(mut stdin: ChildStdin, mut rx: mpsc::UnboundedReceiver<String>) {
     while let Some(mut line) = rx.recv().await {
         line.push('\n');

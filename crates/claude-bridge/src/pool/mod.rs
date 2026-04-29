@@ -6,120 +6,34 @@
 //! - **One claude process per codex thread.** Claude binds an implicit
 //!   per-process session via `--session-id`, so even when two codex threads
 //!   share a `cwd`, each gets its own claude child.
-//! - **Idle reaping.** A thread with no in-flight turn for [`Self::idle_ttl`]
-//!   is reaped: stdin is closed (claude exits cleanly, JSONL persists in
-//!   `~/.claude/projects/<encoded-cwd>/<session_id>/`).
-//! - **Bounded.** [`Self::max_processes`] caps concurrency; LRU-evicts the
-//!   least-recently-active idle thread when a new acquire would exceed the
-//!   cap. Active threads (turn in progress) are never evicted — over-cap
-//!   acquires fail with [`PoolError::Capacity`] in that case.
+//! - **Idle reaping.** A thread with no in-flight turn for the configured
+//!   idle TTL is reaped: stdin is closed (claude exits cleanly, JSONL
+//!   persists in `~/.claude/projects/<encoded-cwd>/<session_id>/`).
+//! - **Bounded.** A capacity cap LRU-evicts the least-recently-active idle
+//!   thread when a new acquire would exceed it. Active threads (turn in
+//!   progress) are never evicted — over-cap acquires fail with
+//!   [`PoolError::Capacity`] in that case.
 //!
-//! The pool exposes only structural operations (spawn, attach to thread,
-//! lookup, release, evict). Sending claude lines is the caller's job via the
-//! returned [`Arc<ClaudeProcessHandle>`].
+//! The bookkeeping lives in [`alleycat_bridge_core::pool::ProcessPool`]; this
+//! module wraps it with claude-specific spawn config so callers don't have
+//! to re-implement the eviction / capacity loop.
 
 pub mod claude_protocol;
 pub mod process;
 
-use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
+use alleycat_bridge_core::pool::ProcessPool;
+pub use alleycat_bridge_core::pool::{
+    DEFAULT_IDLE_TTL, DEFAULT_MAX_PROCESSES, PoolError, ThreadId,
+};
 use alleycat_bridge_core::{LocalLauncher, ProcessLauncher};
-use thiserror::Error;
-use tokio::sync::Mutex;
 use uuid::Uuid;
 
 pub use claude_protocol::*;
-pub use process::{
-    ClaudeProcessError, ClaudeProcessHandle, ClaudeSpawnConfig, DEFAULT_INIT_TIMEOUT,
-};
-
-/// Codex thread identifier as it appears on the wire (UUID-shaped string).
-pub type ThreadId = String;
-
-/// Bounded pool default — 16 concurrent claude processes. Mirrors pi-bridge's
-/// cap; generous enough for typical workflows, low enough that a runaway
-/// client can't exhaust system resources.
-pub const DEFAULT_MAX_PROCESSES: usize = 16;
-
-/// Idle reap interval default — 10 minutes. After this long without an
-/// `acquire`, `mark_active`, or in-flight turn marker, the claude child is
-/// shut down. Resume rehydrates from the persisted JSONL session via
-/// `--resume`.
-pub const DEFAULT_IDLE_TTL: Duration = Duration::from_secs(10 * 60);
-
-#[derive(Debug, Error)]
-pub enum PoolError {
-    #[error("pool is at capacity ({0} processes); no idle thread to evict")]
-    Capacity(usize),
-
-    #[error("thread {0} already exists in the pool")]
-    DuplicateThread(ThreadId),
-
-    #[error(transparent)]
-    Spawn(#[from] anyhow::Error),
-}
-
-/// Per-thread bookkeeping the pool keeps alongside each
-/// [`ClaudeProcessHandle`].
-#[derive(Debug)]
-struct PoolEntry {
-    handle: Arc<ClaudeProcessHandle>,
-    cwd: PathBuf,
-    last_active: Instant,
-    /// True while a turn is being driven through this thread. The reaper
-    /// never evicts threads with `active=true` regardless of TTL.
-    active: bool,
-}
-
-#[derive(Debug)]
-struct PoolInner {
-    processes: HashMap<ThreadId, PoolEntry>,
-    by_cwd: HashMap<PathBuf, HashSet<ThreadId>>,
-    max_processes: usize,
-    idle_ttl: Duration,
-}
-
-impl PoolInner {
-    fn insert(&mut self, thread_id: ThreadId, entry: PoolEntry) {
-        self.by_cwd
-            .entry(entry.cwd.clone())
-            .or_default()
-            .insert(thread_id.clone());
-        self.processes.insert(thread_id, entry);
-    }
-
-    fn remove(&mut self, thread_id: &str) -> Option<PoolEntry> {
-        let entry = self.processes.remove(thread_id)?;
-        if let Some(set) = self.by_cwd.get_mut(&entry.cwd) {
-            set.remove(thread_id);
-            if set.is_empty() {
-                self.by_cwd.remove(&entry.cwd);
-            }
-        }
-        Some(entry)
-    }
-
-    /// Pick the least-recently-active *idle* thread for eviction. Returns
-    /// `None` when every thread currently has a turn in flight.
-    fn pick_lru_idle(&self) -> Option<ThreadId> {
-        self.processes
-            .iter()
-            .filter(|(_, e)| !e.active)
-            .min_by_key(|(_, e)| e.last_active)
-            .map(|(id, _)| id.clone())
-    }
-
-    fn collect_expired(&self, now: Instant) -> Vec<ThreadId> {
-        self.processes
-            .iter()
-            .filter(|(_, e)| !e.active && now.duration_since(e.last_active) >= self.idle_ttl)
-            .map(|(id, _)| id.clone())
-            .collect()
-    }
-}
+pub use process::{ClaudeProcessError, ClaudeProcessHandle, ClaudeSpawnConfig, DEFAULT_INIT_TIMEOUT};
 
 /// Pool-wide spawn policy. New fields go here so the per-thread
 /// `acquire_*` signatures stay flat.
@@ -146,7 +60,7 @@ impl Default for PoolPolicy {
 /// Thread-safe pool of claude processes.
 #[derive(Clone)]
 pub struct ClaudePool {
-    inner: Arc<Mutex<PoolInner>>,
+    inner: ProcessPool<ClaudeProcessHandle>,
     claude_bin: PathBuf,
     policy: PoolPolicy,
     launcher: Arc<dyn ProcessLauncher>,
@@ -212,12 +126,7 @@ impl ClaudePool {
         idle_ttl: Duration,
     ) -> Self {
         Self {
-            inner: Arc::new(Mutex::new(PoolInner {
-                processes: HashMap::new(),
-                by_cwd: HashMap::new(),
-                max_processes: max_processes.max(1),
-                idle_ttl,
-            })),
+            inner: ProcessPool::new(max_processes, idle_ttl),
             claude_bin: claude_bin.into(),
             policy,
             launcher,
@@ -268,12 +177,6 @@ impl ClaudePool {
         model: Option<String>,
         append_system_prompt: Option<String>,
     ) -> Result<Arc<ClaudeProcessHandle>, PoolError> {
-        {
-            let inner = self.inner.lock().await;
-            if inner.processes.contains_key(&thread_id) {
-                return Err(PoolError::DuplicateThread(thread_id));
-            }
-        }
         self.spawn_with_capacity_check(thread_id, cwd.as_ref(), true, model, append_system_prompt)
             .await
     }
@@ -288,33 +191,9 @@ impl ClaudePool {
         &self,
         cwd: Option<&Path>,
     ) -> Result<Arc<ClaudeProcessHandle>, PoolError> {
-        // (1) cwd-scoped reuse.
-        if let Some(target) = cwd {
-            let reused = {
-                let mut inner = self.inner.lock().await;
-                inner
-                    .by_cwd
-                    .get(target)
-                    .and_then(|set| set.iter().next().cloned())
-                    .and_then(|id| inner.processes.get_mut(&id).map(|e| e.handle.clone()))
-            };
-            if let Some(handle) = reused {
-                return Ok(handle);
-            }
-        }
-        // (2) cwd-agnostic reuse: any LRU thread-bound process.
-        let reused_any = {
-            let inner = self.inner.lock().await;
-            inner
-                .processes
-                .iter()
-                .min_by_key(|(_, e)| e.last_active)
-                .map(|(_, e)| e.handle.clone())
-        };
-        if let Some(handle) = reused_any {
+        if let Some(handle) = self.inner.try_reuse_for_utility(cwd).await {
             return Ok(handle);
         }
-        // (3) fresh spawn under a synthetic id.
         let cwd = cwd
             .map(Path::to_path_buf)
             .or_else(|| std::env::current_dir().ok())
@@ -327,90 +206,53 @@ impl ClaudePool {
     /// Look up the claude process that owns `thread_id`, refreshing its
     /// last-active timestamp so the reaper won't pick it up immediately.
     pub async fn get(&self, thread_id: &str) -> Option<Arc<ClaudeProcessHandle>> {
-        let mut inner = self.inner.lock().await;
-        let entry = inner.processes.get_mut(thread_id)?;
-        entry.last_active = Instant::now();
-        Some(entry.handle.clone())
+        self.inner.get(thread_id).await
     }
 
     /// Mark a thread as currently driving a turn (or any other long-running
     /// operation). Active threads are not eligible for LRU eviction or idle
     /// reaping until [`Self::mark_idle`] is called.
     pub async fn mark_active(&self, thread_id: &str) {
-        let mut inner = self.inner.lock().await;
-        if let Some(entry) = inner.processes.get_mut(thread_id) {
-            entry.active = true;
-            entry.last_active = Instant::now();
-        }
+        self.inner.mark_active(thread_id).await
     }
 
     /// Inverse of [`Self::mark_active`]; refreshes `last_active`.
     pub async fn mark_idle(&self, thread_id: &str) {
-        let mut inner = self.inner.lock().await;
-        if let Some(entry) = inner.processes.get_mut(thread_id) {
-            entry.active = false;
-            entry.last_active = Instant::now();
-        }
+        self.inner.mark_idle(thread_id).await
     }
 
     /// Explicitly release a thread's claude process (e.g. user closed the
     /// thread). Sends EOF on stdin and reaps the child. No-op if the
     /// thread isn't in the pool.
     pub async fn release(&self, thread_id: &str) {
-        let entry = {
-            let mut inner = self.inner.lock().await;
-            inner.remove(thread_id)
-        };
-        if let Some(entry) = entry {
-            entry.handle.shutdown().await;
-        }
+        self.inner.release(thread_id).await
     }
 
     /// All thread ids currently tracked by the pool.
     pub async fn loaded_thread_ids(&self) -> Vec<ThreadId> {
-        self.inner.lock().await.processes.keys().cloned().collect()
+        self.inner.loaded_thread_ids().await
     }
 
     /// Thread ids running in the given `cwd`.
     pub async fn threads_for_cwd(&self, cwd: impl AsRef<Path>) -> Vec<ThreadId> {
-        let cwd = cwd.as_ref();
-        self.inner
-            .lock()
-            .await
-            .by_cwd
-            .get(cwd)
-            .map(|s| s.iter().cloned().collect())
-            .unwrap_or_default()
+        self.inner.threads_for_cwd(cwd.as_ref()).await
     }
 
     /// Count of live claude processes (== number of tracked threads).
     pub async fn len(&self) -> usize {
-        self.inner.lock().await.processes.len()
+        self.inner.len().await
     }
 
     /// Returns true when the pool has no live processes.
     pub async fn is_empty(&self) -> bool {
-        self.inner.lock().await.processes.is_empty()
+        self.inner.is_empty().await
     }
 
     /// Sweep idle threads whose `last_active` is older than `idle_ttl`.
     /// Returns the thread ids that were reaped. Callers may run this on a
     /// timer; it's also called opportunistically before each new acquire.
     pub async fn reap_idle(&self) -> Vec<ThreadId> {
-        let now = Instant::now();
-        let expired: Vec<ThreadId> = {
-            let inner = self.inner.lock().await;
-            inner.collect_expired(now)
-        };
-        let mut reaped = Vec::with_capacity(expired.len());
-        for id in expired {
-            let entry = self.inner.lock().await.remove(&id);
-            if let Some(entry) = entry {
-                entry.handle.shutdown().await;
-                reaped.push(id);
-            }
-        }
-        reaped
+        self.inner.reap_idle().await
     }
 
     /// Spawn `claude -p ...` for the given thread/cwd/config. Performs
@@ -425,36 +267,7 @@ impl ClaudePool {
         model: Option<String>,
         append_system_prompt: Option<String>,
     ) -> Result<Arc<ClaudeProcessHandle>, PoolError> {
-        // Best-effort reap before checking the cap.
-        self.reap_idle().await;
-
-        // Capacity check + LRU eviction loop. We re-check after each
-        // eviction in case multiple acquires raced.
-        loop {
-            let evict = {
-                let inner = self.inner.lock().await;
-                if inner.processes.len() < inner.max_processes {
-                    None
-                } else {
-                    inner.pick_lru_idle()
-                }
-            };
-            match evict {
-                Some(victim) => {
-                    let entry = self.inner.lock().await.remove(&victim);
-                    if let Some(entry) = entry {
-                        entry.handle.shutdown().await;
-                    }
-                }
-                None => {
-                    let inner = self.inner.lock().await;
-                    if inner.processes.len() >= inner.max_processes {
-                        return Err(PoolError::Capacity(inner.max_processes));
-                    }
-                    break;
-                }
-            }
-        }
+        self.inner.ensure_capacity_for(&thread_id).await?;
 
         let config = ClaudeSpawnConfig {
             thread_id: thread_id.clone(),
@@ -469,22 +282,18 @@ impl ClaudePool {
             .await
             .map_err(PoolError::Spawn)?;
         let handle = Arc::new(handle);
-        let entry = PoolEntry {
-            handle: handle.clone(),
-            cwd: cwd.to_path_buf(),
-            last_active: Instant::now(),
-            active: false,
-        };
-        let mut inner = self.inner.lock().await;
-        if inner.processes.contains_key(&thread_id) {
-            // Race: another acquire raced us. Drop the new handle (Drop will
-            // shut it down).
-            drop(inner);
-            handle.shutdown().await;
-            return Err(PoolError::DuplicateThread(thread_id));
+        match self
+            .inner
+            .track_new(thread_id, cwd.to_path_buf(), handle.clone())
+            .await
+        {
+            Ok(()) => Ok(handle),
+            Err(err) => {
+                // Race: another acquire raced us. Drop the new handle.
+                handle.shutdown().await;
+                Err(err)
+            }
         }
-        inner.insert(thread_id, entry);
-        Ok(handle)
     }
 }
 
@@ -494,7 +303,7 @@ mod tests {
 
     fn fake_claude_pool(max: usize, ttl: Duration) -> ClaudePool {
         // Use a path that doesn't exist; we never call spawn in these tests
-        // — they exercise only the bookkeeping helpers via direct insert.
+        // — they exercise only the bookkeeping helpers via direct access.
         ClaudePool::with_launcher_and_limits(
             PathBuf::from("/usr/bin/false"),
             Arc::new(LocalLauncher) as Arc<dyn ProcessLauncher>,
@@ -504,171 +313,16 @@ mod tests {
         )
     }
 
-    fn dummy_entry(cwd: PathBuf, active: bool, age: Duration) -> PoolEntry {
+    async fn track_dummy(pool: &ClaudePool, id: &str, cwd: &str) -> Arc<ClaudeProcessHandle> {
         let (writer_tx, _writer_rx) = tokio::sync::mpsc::unbounded_channel();
         let (events_tx, _) = tokio::sync::broadcast::channel(1);
-        let handle = ClaudeProcessHandle::__test_dangling(writer_tx, events_tx, cwd.clone());
-        PoolEntry {
-            handle: Arc::new(handle),
-            cwd,
-            last_active: Instant::now() - age,
-            active,
-        }
-    }
-
-    #[tokio::test]
-    async fn lru_picks_oldest_idle() {
-        let pool = fake_claude_pool(3, Duration::from_secs(60));
-        let mut inner = pool.inner.lock().await;
-        inner.insert(
-            "t1".into(),
-            dummy_entry(PathBuf::from("/a"), false, Duration::from_secs(5)),
-        );
-        inner.insert(
-            "t2".into(),
-            dummy_entry(PathBuf::from("/b"), false, Duration::from_secs(20)),
-        );
-        inner.insert(
-            "t3".into(),
-            dummy_entry(PathBuf::from("/c"), true, Duration::from_secs(60)),
-        );
-        let victim = inner.pick_lru_idle().unwrap();
-        assert_eq!(victim, "t2", "active thread t3 must not be picked");
-    }
-
-    #[tokio::test]
-    async fn lru_returns_none_when_all_active() {
-        let pool = fake_claude_pool(3, Duration::from_secs(60));
-        let mut inner = pool.inner.lock().await;
-        inner.insert(
-            "t1".into(),
-            dummy_entry(PathBuf::from("/a"), true, Duration::ZERO),
-        );
-        inner.insert(
-            "t2".into(),
-            dummy_entry(PathBuf::from("/b"), true, Duration::ZERO),
-        );
-        assert!(inner.pick_lru_idle().is_none());
-    }
-
-    #[tokio::test]
-    async fn collect_expired_respects_active_flag_and_ttl() {
-        let pool = fake_claude_pool(8, Duration::from_secs(30));
-        let mut inner = pool.inner.lock().await;
-        inner.insert(
-            "young_idle".into(),
-            dummy_entry(PathBuf::from("/a"), false, Duration::from_secs(5)),
-        );
-        inner.insert(
-            "old_active".into(),
-            dummy_entry(PathBuf::from("/b"), true, Duration::from_secs(120)),
-        );
-        inner.insert(
-            "old_idle".into(),
-            dummy_entry(PathBuf::from("/c"), false, Duration::from_secs(120)),
-        );
-        let expired = inner.collect_expired(Instant::now());
-        assert_eq!(expired, vec!["old_idle".to_string()]);
-    }
-
-    #[tokio::test]
-    async fn by_cwd_index_tracks_inserts_and_removes() {
-        let pool = fake_claude_pool(8, Duration::from_secs(60));
-        {
-            let mut inner = pool.inner.lock().await;
-            inner.insert(
-                "t1".into(),
-                dummy_entry(PathBuf::from("/x"), false, Duration::ZERO),
-            );
-            inner.insert(
-                "t2".into(),
-                dummy_entry(PathBuf::from("/x"), false, Duration::ZERO),
-            );
-            inner.insert(
-                "t3".into(),
-                dummy_entry(PathBuf::from("/y"), false, Duration::ZERO),
-            );
-        }
-        let mut x = pool.threads_for_cwd("/x").await;
-        x.sort();
-        assert_eq!(x, vec!["t1".to_string(), "t2".to_string()]);
-        assert_eq!(pool.threads_for_cwd("/y").await, vec!["t3".to_string()]);
-
-        {
-            let mut inner = pool.inner.lock().await;
-            inner.remove("t1");
-        }
-        assert_eq!(pool.threads_for_cwd("/x").await, vec!["t2".to_string()]);
-
-        {
-            let mut inner = pool.inner.lock().await;
-            inner.remove("t2");
-        }
-        assert!(pool.threads_for_cwd("/x").await.is_empty());
-    }
-
-    #[tokio::test]
-    async fn mark_active_blocks_lru_pick() {
-        let pool = fake_claude_pool(8, Duration::from_secs(60));
-        {
-            let mut inner = pool.inner.lock().await;
-            inner.insert(
-                "t1".into(),
-                dummy_entry(PathBuf::from("/a"), false, Duration::from_secs(120)),
-            );
-        }
-        assert_eq!(
-            pool.inner.lock().await.pick_lru_idle().as_deref(),
-            Some("t1")
-        );
-        pool.mark_active("t1").await;
-        assert!(pool.inner.lock().await.pick_lru_idle().is_none());
-        pool.mark_idle("t1").await;
-        assert_eq!(
-            pool.inner.lock().await.pick_lru_idle().as_deref(),
-            Some("t1")
-        );
-    }
-
-    #[tokio::test]
-    async fn acquire_utility_reuses_cwd_match_when_present() {
-        let pool = fake_claude_pool(8, Duration::from_secs(60));
-        let target_handle = {
-            let mut inner = pool.inner.lock().await;
-            inner.insert(
-                "t1".into(),
-                dummy_entry(PathBuf::from("/repo"), false, Duration::from_secs(5)),
-            );
-            inner.insert(
-                "t2".into(),
-                dummy_entry(PathBuf::from("/other"), false, Duration::from_secs(1)),
-            );
-            inner.processes.get("t1").unwrap().handle.clone()
-        };
-        let handle = pool
-            .acquire_utility(Some(Path::new("/repo")))
+        let handle = ClaudeProcessHandle::__test_dangling(writer_tx, events_tx, PathBuf::from(cwd));
+        let handle = Arc::new(handle);
+        pool.inner
+            .track_new(id.into(), PathBuf::from(cwd), handle.clone())
             .await
-            .expect("utility");
-        assert!(Arc::ptr_eq(&handle, &target_handle));
-    }
-
-    #[tokio::test]
-    async fn acquire_utility_falls_back_to_lru_when_no_cwd_match() {
-        let pool = fake_claude_pool(8, Duration::from_secs(60));
-        let lru_handle = {
-            let mut inner = pool.inner.lock().await;
-            inner.insert(
-                "older".into(),
-                dummy_entry(PathBuf::from("/a"), false, Duration::from_secs(60)),
-            );
-            inner.insert(
-                "newer".into(),
-                dummy_entry(PathBuf::from("/b"), false, Duration::from_secs(1)),
-            );
-            inner.processes.get("older").unwrap().handle.clone()
-        };
-        let handle = pool.acquire_utility(None).await.expect("utility");
-        assert!(Arc::ptr_eq(&handle, &lru_handle));
+            .expect("track");
+        handle
     }
 
     #[tokio::test]
@@ -676,20 +330,50 @@ mod tests {
         let pool = fake_claude_pool(8, Duration::from_secs(60));
         assert_eq!(pool.len().await, 0);
         assert!(pool.is_empty().await);
-        {
-            let mut inner = pool.inner.lock().await;
-            inner.insert(
-                "alpha".into(),
-                dummy_entry(PathBuf::from("/a"), false, Duration::ZERO),
-            );
-            inner.insert(
-                "beta".into(),
-                dummy_entry(PathBuf::from("/b"), false, Duration::ZERO),
-            );
-        }
+        track_dummy(&pool, "alpha", "/a").await;
+        track_dummy(&pool, "beta", "/b").await;
         assert_eq!(pool.len().await, 2);
         let mut ids = pool.loaded_thread_ids().await;
         ids.sort();
         assert_eq!(ids, vec!["alpha".to_string(), "beta".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn threads_for_cwd_indexes_correctly() {
+        let pool = fake_claude_pool(8, Duration::from_secs(60));
+        track_dummy(&pool, "t1", "/x").await;
+        track_dummy(&pool, "t2", "/x").await;
+        track_dummy(&pool, "t3", "/y").await;
+        let mut x = pool.threads_for_cwd("/x").await;
+        x.sort();
+        assert_eq!(x, vec!["t1".to_string(), "t2".to_string()]);
+        assert_eq!(pool.threads_for_cwd("/y").await, vec!["t3".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn mark_active_blocks_lru_pick_via_ensure_capacity() {
+        let pool = fake_claude_pool(1, Duration::from_secs(60));
+        track_dummy(&pool, "only", "/a").await;
+        pool.mark_active("only").await;
+        let err = pool.inner.ensure_capacity_for("new").await.unwrap_err();
+        assert!(matches!(err, PoolError::Capacity(1)));
+        pool.mark_idle("only").await;
+        pool.inner.ensure_capacity_for("new").await.expect("ok");
+    }
+
+    #[tokio::test]
+    async fn acquire_utility_reuses_cwd_match_when_present() {
+        let pool = fake_claude_pool(8, Duration::from_secs(60));
+        let target_handle = track_dummy(&pool, "t1", "/repo").await;
+        track_dummy(&pool, "t2", "/other").await;
+        // Use try_reuse directly because acquire_utility would attempt a
+        // spawn fallback when no reuse is found, and these dummy handles
+        // can't actually be relaunched.
+        let handle = pool
+            .inner
+            .try_reuse_for_utility(Some(Path::new("/repo")))
+            .await
+            .expect("utility");
+        assert!(Arc::ptr_eq(&handle, &target_handle));
     }
 }
