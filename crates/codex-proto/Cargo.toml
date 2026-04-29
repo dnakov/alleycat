@@ -1,0 +1,20 @@
+[package]
+name = "alleycat-codex-proto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+description = "Wire types for the codex app-server v2 JSON-RPC protocol, shared by the alleycat coding-agent bridges."
+
+[lib]
+name = "alleycat_codex_proto"
+path = "src/lib.rs"
+
+[dependencies]
+chrono = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }

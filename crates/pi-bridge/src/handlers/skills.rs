@@ -271,18 +271,17 @@ mod tests {
     }
 
     async fn dummy_state() -> Arc<ConnectionState> {
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let dir = tempfile::tempdir().unwrap();
         let index = crate::index::ThreadIndex::open_at(dir.path().join("threads.json"))
             .await
             .unwrap();
         std::mem::forget(dir);
-        Arc::new(ConnectionState::new(
-            tx,
+        let (state, _rx) = ConnectionState::for_test(
             Arc::new(crate::pool::PiPool::new("/dev/null")),
             index,
             Default::default(),
-        ))
+        );
+        state
     }
 
     #[tokio::test]

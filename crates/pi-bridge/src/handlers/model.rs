@@ -244,18 +244,16 @@ mod tests {
         // tries to spawn `/dev/null --mode rpc` and fails. The handler
         // contract is to log + return an empty list, never propagate the
         // spawn error to the codex client.
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let dir = tempfile::tempdir().unwrap();
         let index = crate::index::ThreadIndex::open_at(dir.path().join("threads.json"))
             .await
             .unwrap();
         std::mem::forget(dir);
-        let state = Arc::new(ConnectionState::new(
-            tx,
+        let (state, _rx) = ConnectionState::for_test(
             Arc::new(crate::pool::PiPool::new("/dev/null")),
             index,
             Default::default(),
-        ));
+        );
         let resp = handle_model_list(&state, p::ModelListParams::default()).await;
         assert!(resp.data.is_empty());
         assert!(resp.next_cursor.is_none());

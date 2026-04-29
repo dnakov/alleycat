@@ -136,7 +136,15 @@ pub async fn list_all() -> Vec<PiSessionInfo> {
 pub async fn build_session_info(path: &Path) -> Option<PiSessionInfo> {
     let content = fs::read_to_string(path).await.ok()?;
     let metadata = fs::metadata(path).await.ok()?;
+    build_session_info_from_content(path, &content, metadata.modified().ok())
+}
 
+/// Parse one pi JSONL session file from already-loaded content.
+fn build_session_info_from_content(
+    path: &Path,
+    content: &str,
+    file_mtime: Option<std::time::SystemTime>,
+) -> Option<PiSessionInfo> {
     let mut entries: Vec<serde_json::Value> = Vec::new();
     for line in content.lines() {
         let trimmed = line.trim();
@@ -224,7 +232,7 @@ pub async fn build_session_info(path: &Path) -> Option<PiSessionInfo> {
         all_messages.push(text);
     }
 
-    let modified = session_modified_date(&entries, &created, metadata.modified().ok());
+    let modified = session_modified_date(&entries, &created, file_mtime);
 
     Some(PiSessionInfo {
         path: path.to_path_buf(),

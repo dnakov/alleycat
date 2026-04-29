@@ -73,10 +73,7 @@ pub type FakeState = Arc<Mutex<FakeServerState>>;
 /// halves, the SSE injector, the temp state dir, and the spawned server task.
 ///
 /// `client_label` is used as the codex `clientInfo.name`.
-pub async fn bring_up_bridge(
-    client_label: &str,
-    state: FakeState,
-) -> BridgeFixture {
+pub async fn bring_up_bridge(client_label: &str, state: FakeState) -> BridgeFixture {
     let injector: SseInjector = Arc::new(Mutex::new(None));
     let base_url = start_fake_opencode(Arc::clone(&state), Arc::clone(&injector));
     let state_dir = tempfile::TempDir::new().unwrap();

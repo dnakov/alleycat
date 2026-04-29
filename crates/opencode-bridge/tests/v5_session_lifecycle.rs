@@ -19,8 +19,7 @@ type SseInjector = Arc<Mutex<Option<TcpStream>>>;
 
 #[tokio::test]
 async fn session_updated_title_change_emits_thread_name_updated() {
-    let (mut read, mut write, sse_injector, _state_dir, server_task) =
-        bring_up_bridge().await;
+    let (mut read, mut write, sse_injector, _state_dir, server_task) = bring_up_bridge().await;
 
     // Bind a session via thread/start so the index has a known thread_id.
     let thread_id = start_thread(&mut read, &mut write, "/tmp/opencode-v5").await;
@@ -47,8 +46,7 @@ async fn session_updated_title_change_emits_thread_name_updated() {
 
 #[tokio::test]
 async fn session_updated_archive_transitions_emit_archive_notifications() {
-    let (mut read, mut write, sse_injector, _state_dir, server_task) =
-        bring_up_bridge().await;
+    let (mut read, mut write, sse_injector, _state_dir, server_task) = bring_up_bridge().await;
     let thread_id = start_thread(&mut read, &mut write, "/tmp/opencode-v5-arch").await;
 
     // Archive: time.archived is set to a number.
@@ -87,8 +85,7 @@ async fn session_updated_archive_transitions_emit_archive_notifications() {
 
 #[tokio::test]
 async fn session_diff_emits_turn_diff_updated_with_unified_text() {
-    let (mut read, mut write, sse_injector, _state_dir, server_task) =
-        bring_up_bridge().await;
+    let (mut read, mut write, sse_injector, _state_dir, server_task) = bring_up_bridge().await;
     let thread_id = start_thread(&mut read, &mut write, "/tmp/opencode-v5-diff").await;
 
     inject_sse(
@@ -233,10 +230,7 @@ async fn send_notification<W: tokio::io::AsyncWrite + Unpin>(
     writer.flush().await.unwrap();
 }
 
-async fn read_until_response<R: tokio::io::AsyncBufRead + Unpin>(
-    reader: &mut R,
-    id: i64,
-) -> Value {
+async fn read_until_response<R: tokio::io::AsyncBufRead + Unpin>(reader: &mut R, id: i64) -> Value {
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             let value: Value = read_json_line(reader).await.unwrap().unwrap();

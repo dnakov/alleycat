@@ -1,29 +1,43 @@
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, anyhow};
-use iroh::Endpoint;
-use iroh::endpoint::presets;
-use tokio::signal;
-use tracing::{debug, info, warn};
+use arc_swap::ArcSwap;
+use iroh::endpoint::QuicTransportConfig;
+use iroh::endpoint::{IdleTimeout, presets};
+use iroh::{Endpoint, SecretKey};
+use tokio::sync::Notify;
+use tracing::{info, warn};
 
 use crate::agents::AgentManager;
 use crate::config::HostConfig;
 use crate::framing::{read_json_frame, write_json_frame};
-use crate::protocol::{ALLEYCAT_ALPN, PROTOCOL_VERSION, Request, Response};
-use crate::state;
+use crate::protocol::{ALLEYCAT_ALPN, PROTOCOL_VERSION, Request, Response, Resume, SessionInfo};
 use crate::stream::IrohStream;
 
-pub async fn serve() -> anyhow::Result<()> {
-    let mut lock = state::acquire_lock().await?;
-    let _guard = lock
-        .try_write()
-        .context("another alleycat process is already running")?;
+/// Bind the iroh endpoint with the given identity and ALPN, returning it
+/// ready to be passed to [`accept_loop`]. Spawns a background "online" probe
+/// that logs when the endpoint reports relay connectivity.
+pub async fn bind_endpoint(secret_key: SecretKey) -> anyhow::Result<Endpoint> {
+    // iroh defaults already PING every 5s (HEARTBEAT_INTERVAL) which would
+    // normally keep the connection alive — but the connection-wide
+    // `max_idle_timeout` is still 30s by default, and once the holepunched
+    // direct path's per-path 15s timer fires plus the relay path drops, the
+    // connection has no live paths left and the 30s idle clock kicks in.
+    // Raise the connection-level idle timeout to 10 minutes so phone-side
+    // agent tunnels (pi/opencode sitting between thread/list calls) don't
+    // get torn down with `connection lost: timed out` while idle. Default
+    // path keep-alive (5s) keeps the actual paths alive in normal cases.
+    let idle_timeout = IdleTimeout::try_from(Duration::from_secs(600))
+        .context("constructing iroh idle timeout")?;
+    let transport = QuicTransportConfig::builder()
+        .max_idle_timeout(Some(idle_timeout))
+        .build();
 
-    let config = crate::config::load_or_init().await?;
-    let secret_key = state::load_or_create_secret_key().await?;
     let endpoint = Endpoint::builder(presets::N0)
         .secret_key(secret_key)
         .alpns(vec![ALLEYCAT_ALPN.to_vec()])
+        .transport_config(transport)
         .bind()
         .await
         .context("binding iroh endpoint")?;
@@ -41,14 +55,24 @@ pub async fn serve() -> anyhow::Result<()> {
         }
     });
 
-    let agents = AgentManager::new(config).await?;
+    Ok(endpoint)
+}
 
+/// Run the iroh accept loop until `shutdown` fires or the endpoint stops
+/// yielding incoming connections. Caller owns the [`Endpoint`] and the
+/// [`AgentManager`]; both are passed by `Arc`/clone so control-side handlers
+/// can keep using them concurrently.
+pub async fn accept_loop(
+    endpoint: Endpoint,
+    agents: AgentManager,
+    config: Arc<ArcSwap<HostConfig>>,
+    shutdown: Arc<Notify>,
+) -> anyhow::Result<()> {
     loop {
         tokio::select! {
             biased;
-            result = signal::ctrl_c() => {
-                result.context("waiting for ctrl-c")?;
-                info!("received shutdown signal");
+            _ = shutdown.notified() => {
+                info!("iroh accept loop received shutdown");
                 endpoint.close().await;
                 break;
             }
@@ -57,19 +81,37 @@ pub async fn serve() -> anyhow::Result<()> {
                     break;
                 };
                 let agents = agents.clone();
+                let config = Arc::clone(&config);
                 tokio::spawn(async move {
                     match connecting.await {
                         Ok(conn) => {
+                            let conn_id = conn.stable_id();
+                            // `remote_id` is the cryptographic identity we
+                            // key sessions on. It's stable across all
+                            // bi-streams of this connection.
+                            let node_id = conn.remote_id().to_string();
+                            info!(
+                                conn = conn_id,
+                                node_id = %node_id,
+                                "iroh connection accepted"
+                            );
                             while let Ok((send, recv)) = conn.accept_bi().await {
                                 let agents = agents.clone();
+                                let config = Arc::clone(&config);
+                                let node_id = node_id.clone();
                                 tokio::spawn(async move {
-                                    if let Err(error) = handle_stream(send, recv, agents).await {
-                                        debug!("alleycat stream ended: {error:#}");
+                                    if let Err(error) = handle_stream(
+                                        send, recv, agents, config, conn_id, node_id,
+                                    )
+                                    .await
+                                    {
+                                        info!(conn = conn_id, "alleycat stream ended: {error:#}");
                                     }
                                 });
                             }
+                            info!(conn = conn_id, "iroh connection closed");
                         }
-                        Err(error) => debug!("alleycat incoming connection failed: {error:#}"),
+                        Err(error) => warn!("alleycat incoming connection failed: {error:#}"),
                     }
                 });
             }
@@ -82,6 +124,9 @@ async fn handle_stream(
     mut send: iroh::endpoint::SendStream,
     mut recv: iroh::endpoint::RecvStream,
     agents: AgentManager,
+    config: Arc<ArcSwap<HostConfig>>,
+    conn: usize,
+    node_id: String,
 ) -> anyhow::Result<()> {
     let request: Request = read_json_frame(&mut recv).await?;
     if let Err(error) = validate_version(&request) {
@@ -89,20 +134,23 @@ async fn handle_stream(
         return Err(anyhow!(error));
     }
 
-    let config = crate::config::load_or_init().await?;
-    if let Err(error) = validate_token(&request, &config.token) {
+    let token = config.load().token.clone();
+    if let Err(error) = validate_token(&request, &token) {
+        warn!(conn = conn, "rejecting stream: {error}");
         write_json_frame(&mut send, &Response::error(&error)).await?;
         return Err(anyhow!(error));
     }
 
     match request {
         Request::ListAgents { .. } => {
+            info!(conn = conn, "list_agents");
             let list = agents.list_agents().await;
             write_json_frame(&mut send, &Response::agents(list)).await?;
             Ok(())
         }
-        Request::Connect { agent, .. } => {
+        Request::Connect { agent, resume, .. } => {
             if !agents.agent_enabled(&agent) {
+                warn!(conn = conn, %agent, "rejecting: agent disabled or unknown");
                 write_json_frame(
                     &mut send,
                     &Response::error(format!("agent `{agent}` is disabled or unknown")),
@@ -110,11 +158,60 @@ async fn handle_stream(
                 .await?;
                 return Err(anyhow!("agent disabled or unknown: {agent}"));
             }
-            write_json_frame(&mut send, &Response::ok()).await?;
-            agents
-                .serve_agent(&agent, IrohStream::new(send, recv))
+            let agent_static = match AgentManager::agent_id(&agent) {
+                Some(id) => id,
+                None => {
+                    write_json_frame(
+                        &mut send,
+                        &Response::error(format!("agent `{agent}` is unknown")),
+                    )
+                    .await?;
+                    return Err(anyhow!("unknown agent: {agent}"));
+                }
+            };
+
+            let last_seen = resume.as_ref().map(|r: &Resume| r.last_seq);
+            let resolved =
+                agents
+                    .session_registry()
+                    .resolve_attach(node_id.clone(), agent_static, last_seen);
+            let session_info = SessionInfo {
+                attached: resolved.kind.into(),
+                current_seq: resolved.current_seq,
+                floor_seq: resolved.floor_seq,
+            };
+            info!(
+                conn = conn,
+                %agent,
+                attached = ?session_info.attached,
+                current_seq = session_info.current_seq,
+                floor_seq = session_info.floor_seq,
+                "connect: dispatching to agent"
+            );
+            write_json_frame(&mut send, &Response::ok_with_session(session_info.clone())).await?;
+            // The registry already decided what cursor to actually replay from —
+            // either the client's explicit resume hint, or the server's own
+            // `last_attempted_seq` for a known session attaching without one.
+            // For Fresh and DriftReload paths it returned None, so the
+            // dispatcher sees an empty backlog.
+            let dispatch_last_seen = match resolved.kind {
+                alleycat_bridge_core::session::AttachKind::Resumed => resolved.effective_last_seen,
+                _ => None,
+            };
+            let result = agents
+                .serve_agent_with_session(
+                    &agent,
+                    IrohStream::new(send, recv),
+                    resolved.session,
+                    dispatch_last_seen,
+                )
                 .await
-                .with_context(|| format!("serving agent `{agent}`"))
+                .with_context(|| format!("serving agent `{agent}`"));
+            match &result {
+                Ok(()) => info!(conn = conn, %agent, "agent stream finished"),
+                Err(error) => warn!(conn = conn, %agent, "agent stream errored: {error:#}"),
+            }
+            result
         }
     }
 }
@@ -127,8 +224,17 @@ pub fn pair_payload(
         v: PROTOCOL_VERSION,
         node_id: secret_key.public().to_string(),
         token: config.token.clone(),
+        host_name: local_host_name(),
         relay: config.relay.clone(),
     }
+}
+
+fn local_host_name() -> Option<String> {
+    hostname::get()
+        .ok()
+        .and_then(|name| name.into_string().ok())
+        .map(|name| name.trim().trim_end_matches('.').to_string())
+        .filter(|name| !name.is_empty())
 }
 
 fn validate_version(request: &Request) -> Result<(), String> {
@@ -163,6 +269,7 @@ mod tests {
             token: "token-1".to_string(),
             relay: Some("https://relay.example".to_string()),
             agents: AgentsConfig::default(),
+            session: crate::config::SessionConfig::default(),
         };
 
         let payload = pair_payload(&secret_key, &config);
@@ -171,6 +278,12 @@ mod tests {
         assert_eq!(payload.node_id, secret_key.public().to_string());
         assert_eq!(payload.token, "token-1");
         assert_eq!(payload.relay.as_deref(), Some("https://relay.example"));
+        assert!(
+            payload
+                .host_name
+                .as_deref()
+                .is_some_and(|name| !name.is_empty())
+        );
     }
 
     #[test]
@@ -179,6 +292,7 @@ mod tests {
             v: PROTOCOL_VERSION,
             token: "secret".to_string(),
             agent: "codex".to_string(),
+            resume: None,
         };
 
         validate_version(&request).unwrap();

@@ -99,12 +99,8 @@ async fn assistant_message_streams_started_delta_completed() {
             }
         }),
     );
-    let delta1 = read_until_notification(
-        &mut read,
-        "item/agentMessage/delta",
-        Duration::from_secs(3),
-    )
-    .await;
+    let delta1 =
+        read_until_notification(&mut read, "item/agentMessage/delta", Duration::from_secs(3)).await;
     assert_eq!(delta1["params"]["delta"], "hello ");
 
     inject_sse(
@@ -120,12 +116,8 @@ async fn assistant_message_streams_started_delta_completed() {
             }
         }),
     );
-    let delta2 = read_until_notification(
-        &mut read,
-        "item/agentMessage/delta",
-        Duration::from_secs(3),
-    )
-    .await;
+    let delta2 =
+        read_until_notification(&mut read, "item/agentMessage/delta", Duration::from_secs(3)).await;
     assert_eq!(delta2["params"]["delta"], "world");
 
     // 4. message.updated with info.time.completed → item/completed with the
@@ -365,10 +357,7 @@ async fn send_notification<W: tokio::io::AsyncWrite + Unpin>(
     writer.flush().await.unwrap();
 }
 
-async fn read_until_response<R: tokio::io::AsyncBufRead + Unpin>(
-    reader: &mut R,
-    id: i64,
-) -> Value {
+async fn read_until_response<R: tokio::io::AsyncBufRead + Unpin>(reader: &mut R, id: i64) -> Value {
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             let value: Value = read_json_line(reader).await.unwrap().unwrap();

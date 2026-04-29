@@ -21,17 +21,17 @@
 //! UDS multiplexing lands the table moves into `state::ConnectionState`.
 
 use std::collections::HashMap;
-use std::process::Stdio;
+use std::ffi::OsString;
 use std::sync::Arc;
 use std::sync::LazyLock;
 use std::sync::Mutex;
 use std::time::Duration;
 
+use alleycat_bridge_core::{ChildProcess, ProcessRole, ProcessSpec, StdioMode};
 use anyhow::Result;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use tokio::io::AsyncReadExt;
-use tokio::process::{Child, Command};
 use tokio::sync::oneshot;
 use tokio::time::timeout;
 
@@ -116,29 +116,33 @@ pub async fn handle_command_exec(
     }
 
     let argv = params.command.clone();
-    let mut cmd = Command::new(&argv[0]);
-    cmd.args(&argv[1..]);
-    if let Some(cwd) = &params.cwd {
-        cmd.current_dir(cwd);
-    }
-    if let Some(env) = &params.env {
-        for (k, v) in env {
-            match v {
-                Some(value) => {
-                    cmd.env(k, value);
-                }
-                None => {
-                    cmd.env_remove(k);
-                }
-            }
-        }
-    }
-    cmd.stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
-
-    let child = cmd.spawn().map_err(ExecError::spawn)?;
+    let env: Vec<(OsString, OsString)> = params
+        .env
+        .as_ref()
+        .map(|e| {
+            e.iter()
+                .filter_map(|(k, v)| {
+                    v.as_ref()
+                        .map(|val| (OsString::from(k), OsString::from(val)))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let spec = ProcessSpec {
+        role: ProcessRole::ToolCommand,
+        program: std::path::PathBuf::from(&argv[0]),
+        args: argv[1..].iter().map(OsString::from).collect(),
+        cwd: params.cwd.as_ref().map(std::path::PathBuf::from),
+        env,
+        stdin: StdioMode::Null,
+        stdout: StdioMode::Piped,
+        stderr: StdioMode::Piped,
+    };
+    let child = state
+        .launcher()
+        .launch(spec)
+        .await
+        .map_err(ExecError::spawn)?;
 
     let cap = if params.disable_output_cap {
         usize::MAX
@@ -194,17 +198,15 @@ pub async fn handle_command_exec_resize(
 // === implementation =======================================================
 
 async fn run_buffered(
-    mut child: Child,
+    mut child: Box<dyn ChildProcess>,
     cap: usize,
     timeout_dur: Option<Duration>,
 ) -> Result<p::CommandExecResponse, ExecError> {
     let mut stdout = child
-        .stdout
-        .take()
+        .take_stdout()
         .ok_or_else(|| ExecError::internal("child has no stdout pipe"))?;
     let mut stderr = child
-        .stderr
-        .take()
+        .take_stderr()
         .ok_or_else(|| ExecError::internal("child has no stderr pipe"))?;
 
     let stdout_task = tokio::spawn(async move {
@@ -219,17 +221,14 @@ async fn run_buffered(
     });
 
     let exit_status = match timeout_dur {
-        Some(dur) => {
-            let wait_fut = child.wait();
-            match timeout(dur, wait_fut).await {
-                Ok(status) => status.map_err(ExecError::wait)?,
-                Err(_) => {
-                    let _ = child.start_kill();
-                    let _ = child.wait().await;
-                    return Err(ExecError::Timeout);
-                }
+        Some(dur) => match timeout(dur, child.wait()).await {
+            Ok(status) => status.map_err(ExecError::wait)?,
+            Err(_) => {
+                let _ = child.kill().await;
+                let _ = child.wait().await;
+                return Err(ExecError::Timeout);
             }
-        }
+        },
         None => child.wait().await.map_err(ExecError::wait)?,
     };
 
@@ -245,18 +244,16 @@ async fn run_buffered(
 
 async fn run_streaming(
     state: &Arc<ConnectionState>,
-    mut child: Child,
+    mut child: Box<dyn ChildProcess>,
     process_id: String,
     cap: usize,
     timeout_dur: Option<Duration>,
 ) -> Result<p::CommandExecResponse, ExecError> {
     let stdout = child
-        .stdout
-        .take()
+        .take_stdout()
         .ok_or_else(|| ExecError::internal("child has no stdout pipe"))?;
     let stderr = child
-        .stderr
-        .take()
+        .take_stderr()
         .ok_or_else(|| ExecError::internal("child has no stderr pipe"))?;
 
     let (terminate_tx, terminate_rx) = oneshot::channel::<()>();
@@ -294,26 +291,33 @@ async fn run_streaming(
     let (exit_tx, exit_rx) = oneshot::channel::<std::io::Result<std::process::ExitStatus>>();
     let supervisor_pid = process_id.clone();
     let supervisor = tokio::spawn(async move {
-        let result: SupervisorResult = match timeout_dur {
-            Some(dur) => tokio::select! {
+        let mut child = child;
+        // Use boxed wait future and select! against terminate/timeout.
+        // On non-`wait` branches we still need to call `child.kill()` —
+        // that requires the wait future to be dropped first. We borrow
+        // wait inside an inner block; cancelling the select arm drops
+        // the borrow, freeing `child` for `kill().await`.
+        let result: SupervisorResult = if let Some(dur) = timeout_dur {
+            tokio::select! {
                 res = child.wait() => SupervisorResult::Exited(res),
                 _ = terminate_rx => {
-                    let _ = child.start_kill();
+                    let _ = child.kill().await;
                     SupervisorResult::Exited(child.wait().await)
                 }
                 _ = tokio::time::sleep(dur) => {
-                    let _ = child.start_kill();
+                    let _ = child.kill().await;
                     let _ = child.wait().await;
                     SupervisorResult::TimedOut
                 }
-            },
-            None => tokio::select! {
+            }
+        } else {
+            tokio::select! {
                 res = child.wait() => SupervisorResult::Exited(res),
                 _ = terminate_rx => {
-                    let _ = child.start_kill();
+                    let _ = child.kill().await;
                     SupervisorResult::Exited(child.wait().await)
                 }
-            },
+            }
         };
         match result {
             SupervisorResult::Exited(res) => {
@@ -518,10 +522,8 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::time::Duration;
-    use tokio::sync::mpsc;
 
     async fn dummy_state() -> Arc<ConnectionState> {
-        let (tx, _rx) = mpsc::unbounded_channel();
         let dir = tempfile::tempdir().unwrap();
         let index = crate::index::ThreadIndex::open_at(dir.path().join("threads.json"))
             .await
@@ -529,12 +531,12 @@ mod tests {
         // tempdir auto-cleanup is fine for these tests — we don't restart a
         // ConnectionState across runs and threads.json is rebuilt each call.
         std::mem::forget(dir);
-        Arc::new(ConnectionState::new(
-            tx,
+        let (state, _rx) = ConnectionState::for_test(
             Arc::new(crate::pool::PiPool::new("/usr/bin/false")),
             index,
             Default::default(),
-        ))
+        );
+        state
     }
 
     #[tokio::test]
@@ -643,18 +645,16 @@ mod tests {
 
     #[tokio::test]
     async fn streaming_emits_outputdelta_for_chunks() {
-        let (tx, mut rx) = mpsc::unbounded_channel();
         let dir = tempfile::tempdir().unwrap();
         let index = crate::index::ThreadIndex::open_at(dir.path().join("threads.json"))
             .await
             .unwrap();
         std::mem::forget(dir);
-        let state = Arc::new(ConnectionState::new(
-            tx,
+        let (state, mut rx) = ConnectionState::for_test(
             Arc::new(crate::pool::PiPool::new("/usr/bin/false")),
             index,
             Default::default(),
-        ));
+        );
         let resp = handle_command_exec(
             &state,
             p::CommandExecParams {
@@ -673,8 +673,8 @@ mod tests {
         // stream and a base64 of "chunk".
         let mut saw_stdout_chunk = false;
         while let Ok(msg) = tokio::time::timeout(Duration::from_millis(50), rx.recv()).await {
-            let Some(msg) = msg else { break };
-            let value = serde_json::to_value(&msg).unwrap();
+            let Some(seq) = msg else { break };
+            let value = seq.payload;
             if value.get("method") == Some(&json!("command/exec/outputDelta")) {
                 let params = value.get("params").unwrap();
                 if params.get("stream") == Some(&json!("stdout"))

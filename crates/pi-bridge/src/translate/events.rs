@@ -63,6 +63,13 @@ struct OpenItem {
 struct OpenToolCall {
     item_id: String,
     kind: CodexToolKind,
+    /// Original `toolName` (`bash`, `read`, ...) and the args object pi
+    /// passed at `ToolExecutionStart`. Carried into `ToolExecutionEnd`
+    /// so the completion side can build canonical shapes that need both
+    /// the request (eg `command_actions: [{type: read, path}]` for Read)
+    /// and the response (`aggregated_output` for the file body).
+    tool_name: String,
+    args: Value,
 }
 
 impl EventTranslatorState {
@@ -181,7 +188,7 @@ impl EventTranslatorState {
         vec![self.item_started(ThreadItem::AgentMessage {
             id: item_id,
             text: extract_assistant_text(&message),
-            phase: None,
+            phase: Some(serde_json::Value::String("final_answer".into())),
             memory_citation: None,
         })]
     }
@@ -200,6 +207,7 @@ impl EventTranslatorState {
                             turn_id: self.turn_id.clone(),
                             item_id: item.item_id.clone(),
                             delta,
+                            parent_item_id: None,
                         },
                     )]
                 } else {
@@ -211,6 +219,7 @@ impl EventTranslatorState {
                                 turn_id: self.turn_id.clone(),
                                 item_id: item.item_id.clone(),
                                 delta,
+                                parent_item_id: None,
                             },
                         ));
                     }
@@ -241,6 +250,7 @@ impl EventTranslatorState {
                         item_id: item.item_id.clone(),
                         delta,
                         content_index: 0,
+                        parent_item_id: None,
                     },
                 )]
             }
@@ -280,7 +290,7 @@ impl EventTranslatorState {
         vec![self.item_completed(ThreadItem::AgentMessage {
             id: item.item_id,
             text: extract_assistant_text(&message),
-            phase: None,
+            phase: Some(serde_json::Value::String("final_answer".into())),
             memory_citation: None,
         })]
     }
@@ -294,12 +304,14 @@ impl EventTranslatorState {
         args: Value,
     ) -> Vec<ServerNotification> {
         let kind = classify(&tool_name);
-        let item = self.tool_started_item(&kind, &tool_call_id, &args);
+        let item = self.tool_started_item(&kind, &tool_name, &tool_call_id, &args);
         self.open_tool_calls.insert(
             tool_call_id.clone(),
             OpenToolCall {
                 item_id: tool_call_id,
                 kind,
+                tool_name,
+                args,
             },
         );
         vec![self.item_started(item)]
@@ -326,6 +338,7 @@ impl EventTranslatorState {
                         turn_id: self.turn_id.clone(),
                         item_id: open.item_id.clone(),
                         delta,
+                        parent_item_id: None,
                     },
                 )]
             }
@@ -337,10 +350,19 @@ impl EventTranslatorState {
                         turn_id: self.turn_id.clone(),
                         item_id: open.item_id.clone(),
                         message,
+                        parent_item_id: None,
                     },
                 )]
             }
-            CodexToolKind::FileChange | CodexToolKind::Dynamic { .. } => Vec::new(),
+            // FileChange + exploration reads + Dynamic — no streaming
+            // notification today. Exploration reads (read/grep/ls/find) are
+            // synchronous in pi-mono so the body lands in one chunk on
+            // ToolExecutionEnd.
+            CodexToolKind::FileChange
+            | CodexToolKind::ExplorationRead
+            | CodexToolKind::ExplorationSearch
+            | CodexToolKind::ExplorationList
+            | CodexToolKind::Dynamic { .. } => Vec::new(),
         }
     }
 
@@ -366,6 +388,7 @@ impl EventTranslatorState {
     fn tool_started_item(
         &self,
         kind: &CodexToolKind,
+        tool_name: &str,
         tool_call_id: &str,
         args: &Value,
     ) -> ThreadItem {
@@ -398,6 +421,16 @@ impl EventTranslatorState {
                 error: None,
                 duration_ms: None,
             },
+            CodexToolKind::ExplorationRead
+            | CodexToolKind::ExplorationSearch
+            | CodexToolKind::ExplorationList => build_exploration_command_item(
+                kind,
+                tool_name,
+                tool_call_id,
+                args,
+                CommandExecutionStatus::InProgress,
+                None,
+            ),
             CodexToolKind::Dynamic { namespace, tool } => ThreadItem::DynamicToolCall {
                 id: tool_call_id.to_string(),
                 namespace: namespace.clone(),
@@ -428,13 +461,13 @@ impl EventTranslatorState {
                 };
                 ThreadItem::CommandExecution {
                     id: open.item_id.clone(),
-                    command: String::new(),
+                    command: extract_command(&open.args),
                     cwd: String::new(),
                     process_id: None,
                     source: Default::default(),
                     status,
                     command_actions: Vec::new(),
-                    aggregated_output: aggregated,
+                    aggregated_output: aggregated.map(cap_aggregated_output),
                     exit_code,
                     duration_ms: None,
                 }
@@ -465,6 +498,24 @@ impl EventTranslatorState {
                     error,
                     duration_ms: None,
                 }
+            }
+            CodexToolKind::ExplorationRead
+            | CodexToolKind::ExplorationSearch
+            | CodexToolKind::ExplorationList => {
+                let body = extract_tool_text_output(&result).map(cap_aggregated_output);
+                let status = if is_error {
+                    CommandExecutionStatus::Failed
+                } else {
+                    CommandExecutionStatus::Completed
+                };
+                build_exploration_command_item(
+                    &open.kind,
+                    &open.tool_name,
+                    &open.item_id,
+                    &open.args,
+                    status,
+                    body,
+                )
             }
             CodexToolKind::Dynamic { namespace, tool } => ThreadItem::DynamicToolCall {
                 id: open.item_id.clone(),
@@ -541,6 +592,7 @@ impl EventTranslatorState {
             item,
             thread_id: self.thread_id.clone(),
             turn_id: self.turn_id.clone(),
+            parent_item_id: None,
         })
     }
 
@@ -549,6 +601,7 @@ impl EventTranslatorState {
             item,
             thread_id: self.thread_id.clone(),
             turn_id: self.turn_id.clone(),
+            parent_item_id: None,
         })
     }
 
@@ -618,6 +671,148 @@ fn extract_bash_output(result: &Value) -> Option<String> {
         return Some(s.to_string());
     }
     None
+}
+
+/// Cap aggregated_output at 256 KiB on a UTF-8 boundary. Multi-megabyte
+/// `read` bodies otherwise inflate every notification round-trip.
+const EXPLORATION_OUTPUT_CAP: usize = 256 * 1024;
+
+fn cap_aggregated_output(mut text: String) -> String {
+    if text.len() <= EXPLORATION_OUTPUT_CAP {
+        return text;
+    }
+    let mut idx = EXPLORATION_OUTPUT_CAP;
+    while idx > 0 && !text.is_char_boundary(idx) {
+        idx -= 1;
+    }
+    text.truncate(idx);
+    text.push_str("\n... [truncated]");
+    text
+}
+
+/// Pull the human-readable body out of a pi tool result. Pi normalizes
+/// most read/grep/ls results to one of:
+/// - a plain string,
+/// - `{"content": "..."}` or `{"output": "..."}`,
+/// - or a content-array `[{"type":"text","text":"..."}]` (mirrors what
+///   the model sees in toolResult).
+/// Returns `None` only when no recognizable shape is present.
+fn extract_tool_text_output(result: &Value) -> Option<String> {
+    if let Some(s) = result.as_str() {
+        return Some(s.to_string());
+    }
+    for key in ["content", "output", "text", "result"] {
+        if let Some(s) = result.get(key).and_then(Value::as_str) {
+            return Some(s.to_string());
+        }
+    }
+    if let Some(arr) = result.get("content").and_then(Value::as_array) {
+        let mut joined = String::new();
+        for entry in arr {
+            if let Some(text) = entry.get("text").and_then(Value::as_str) {
+                if !joined.is_empty() && !joined.ends_with('\n') {
+                    joined.push('\n');
+                }
+                joined.push_str(text);
+            }
+        }
+        if !joined.is_empty() {
+            return Some(joined);
+        }
+    }
+    None
+}
+
+/// Build a `ThreadItem::CommandExecution` for one of the read-only pi
+/// exploration tools (`read`, `grep`, `ls`, `find`). The same shape is
+/// reused at start time (status=InProgress, output=None) and at
+/// completion time (status from is_error, output filled from the
+/// extracted text body).
+fn build_exploration_command_item(
+    kind: &CodexToolKind,
+    tool_name: &str,
+    item_id: &str,
+    args: &Value,
+    status: CommandExecutionStatus,
+    aggregated_output: Option<String>,
+) -> ThreadItem {
+    let (command, command_actions) = match kind {
+        CodexToolKind::ExplorationRead => {
+            let path = args
+                .get("path")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let command = format!("read {path}");
+            let name = command_action_name(&path);
+            let action = serde_json::json!({
+                "type": "read",
+                "command": command.clone(),
+                "name": name,
+                "path": path
+            });
+            (command, vec![action])
+        }
+        CodexToolKind::ExplorationSearch => {
+            let pattern = args
+                .get("pattern")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let path = args.get("path").and_then(Value::as_str);
+            let command = format!("grep {pattern}");
+            let mut action = serde_json::json!({
+                "type": "search",
+                "command": command.clone(),
+                "query": pattern
+            });
+            if let Some(p) = path {
+                action["path"] = Value::String(p.to_string());
+            }
+            (command, vec![action])
+        }
+        CodexToolKind::ExplorationList => {
+            let pattern = args
+                .get("pattern")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            let path = args.get("path").and_then(Value::as_str).map(str::to_string);
+            let display = match (&pattern, &path) {
+                (Some(p), Some(d)) => format!("{tool_name} {p} {d}"),
+                (Some(p), None) => format!("{tool_name} {p}"),
+                (None, Some(d)) => format!("{tool_name} {d}"),
+                _ => tool_name.to_string(),
+            };
+            let mut action = serde_json::json!({"type": "listFiles", "command": display.clone()});
+            if let Some(p) = path {
+                action["path"] = Value::String(p);
+            }
+            if let Some(p) = pattern {
+                action["pattern"] = Value::String(p);
+            }
+            (display, vec![action])
+        }
+        _ => (String::new(), Vec::new()),
+    };
+    ThreadItem::CommandExecution {
+        id: item_id.to_string(),
+        command,
+        cwd: String::new(),
+        process_id: None,
+        source: Default::default(),
+        status,
+        command_actions,
+        aggregated_output,
+        exit_code: None,
+        duration_ms: None,
+    }
+}
+
+fn command_action_name(path: &str) -> String {
+    path.rsplit(['/', '\\'])
+        .find(|part| !part.is_empty())
+        .unwrap_or("file")
+        .to_string()
 }
 
 fn extract_bash_exit_code(result: &Value) -> Option<i32> {
@@ -974,15 +1169,21 @@ mod tests {
 
     #[test]
     fn unknown_tool_classified_as_dynamic() {
+        // `read` is now canonical (ExplorationRead → CommandExecution).
+        // Use a name that has no canonical mapping to keep the Dynamic
+        // fallback under test. `multi_tool_use.parallel` is a good
+        // representative — it should never appear at this layer (pi
+        // flattens it), but if it ever surfaces we want it visible as
+        // Dynamic rather than misclassified.
         let mut s = state();
         s.translate(PiEvent::ToolExecutionStart {
             tool_call_id: "tc1".into(),
-            tool_name: "read".into(),
-            args: json!({"path": "/tmp/x"}),
+            tool_name: "multi_tool_use.parallel".into(),
+            args: json!({"requests": []}),
         });
         let ended = s.translate(PiEvent::ToolExecutionEnd {
             tool_call_id: "tc1".into(),
-            tool_name: "read".into(),
+            tool_name: "multi_tool_use.parallel".into(),
             result: json!({"content": "hi"}),
             is_error: false,
         });
@@ -994,11 +1195,188 @@ mod tests {
                     success,
                     ..
                 } => {
-                    assert_eq!(tool, "read");
+                    assert_eq!(tool, "multi_tool_use.parallel");
                     assert_eq!(*status, DynamicToolCallStatus::Completed);
                     assert_eq!(*success, Some(true));
                 }
                 other => panic!("expected DynamicToolCall, got {other:?}"),
+            },
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn read_tool_lifecycle_emits_command_execution_with_read_action() {
+        let mut s = state();
+        let started = s.translate(PiEvent::ToolExecutionStart {
+            tool_call_id: "tc_read".into(),
+            tool_name: "read".into(),
+            args: json!({"path": ".pi-tool-demo.txt"}),
+        });
+        match &started[0] {
+            ServerNotification::ItemStarted(n) => match &n.item {
+                ThreadItem::CommandExecution {
+                    command,
+                    command_actions,
+                    status,
+                    ..
+                } => {
+                    assert_eq!(command, "read .pi-tool-demo.txt");
+                    assert_eq!(command_actions[0]["type"], "read");
+                    assert_eq!(command_actions[0]["command"], "read .pi-tool-demo.txt");
+                    assert_eq!(command_actions[0]["name"], ".pi-tool-demo.txt");
+                    assert_eq!(command_actions[0]["path"], ".pi-tool-demo.txt");
+                    assert_eq!(*status, CommandExecutionStatus::InProgress);
+                }
+                other => panic!("expected CommandExecution, got {other:?}"),
+            },
+            other => panic!("unexpected {other:?}"),
+        }
+        // Pi's read result is a plain string body in practice; the
+        // translator must populate aggregated_output and flip status.
+        let ended = s.translate(PiEvent::ToolExecutionEnd {
+            tool_call_id: "tc_read".into(),
+            tool_name: "read".into(),
+            result: json!("demo line 1\ndemo line 2 (edited)\n"),
+            is_error: false,
+        });
+        match &ended[0] {
+            ServerNotification::ItemCompleted(n) => match &n.item {
+                ThreadItem::CommandExecution {
+                    command,
+                    aggregated_output,
+                    command_actions,
+                    status,
+                    ..
+                } => {
+                    assert_eq!(command, "read .pi-tool-demo.txt");
+                    assert_eq!(
+                        aggregated_output.as_deref(),
+                        Some("demo line 1\ndemo line 2 (edited)\n")
+                    );
+                    assert_eq!(command_actions[0]["type"], "read");
+                    assert_eq!(command_actions[0]["command"], "read .pi-tool-demo.txt");
+                    assert_eq!(command_actions[0]["name"], ".pi-tool-demo.txt");
+                    assert_eq!(*status, CommandExecutionStatus::Completed);
+                }
+                other => panic!("expected CommandExecution, got {other:?}"),
+            },
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn grep_tool_lifecycle_emits_search_action() {
+        let mut s = state();
+        let started = s.translate(PiEvent::ToolExecutionStart {
+            tool_call_id: "tc_grep".into(),
+            tool_name: "grep".into(),
+            args: json!({"pattern": "fn main", "path": "src"}),
+        });
+        match &started[0] {
+            ServerNotification::ItemStarted(n) => match &n.item {
+                ThreadItem::CommandExecution {
+                    command,
+                    command_actions,
+                    ..
+                } => {
+                    assert_eq!(command, "grep fn main");
+                    assert_eq!(command_actions[0]["type"], "search");
+                    assert_eq!(command_actions[0]["command"], "grep fn main");
+                    assert_eq!(command_actions[0]["query"], "fn main");
+                    assert_eq!(command_actions[0]["path"], "src");
+                }
+                other => panic!("expected CommandExecution, got {other:?}"),
+            },
+            other => panic!("unexpected {other:?}"),
+        }
+        let _ended = s.translate(PiEvent::ToolExecutionEnd {
+            tool_call_id: "tc_grep".into(),
+            tool_name: "grep".into(),
+            result: json!("src/main.rs:1:fn main()\n"),
+            is_error: false,
+        });
+    }
+
+    #[test]
+    fn ls_tool_lifecycle_emits_list_files_action() {
+        let mut s = state();
+        let started = s.translate(PiEvent::ToolExecutionStart {
+            tool_call_id: "tc_ls".into(),
+            tool_name: "ls".into(),
+            args: json!({"path": "."}),
+        });
+        match &started[0] {
+            ServerNotification::ItemStarted(n) => match &n.item {
+                ThreadItem::CommandExecution {
+                    command,
+                    command_actions,
+                    ..
+                } => {
+                    assert_eq!(command, "ls .");
+                    assert_eq!(command_actions[0]["type"], "listFiles");
+                    assert_eq!(command_actions[0]["command"], "ls .");
+                    assert_eq!(command_actions[0]["path"], ".");
+                }
+                other => panic!("expected CommandExecution, got {other:?}"),
+            },
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn read_caps_aggregated_output_at_256_kib() {
+        let mut s = state();
+        s.translate(PiEvent::ToolExecutionStart {
+            tool_call_id: "tc_big".into(),
+            tool_name: "read".into(),
+            args: json!({"path": "/big.txt"}),
+        });
+        let big = "A".repeat(300 * 1024);
+        let ended = s.translate(PiEvent::ToolExecutionEnd {
+            tool_call_id: "tc_big".into(),
+            tool_name: "read".into(),
+            result: Value::String(big),
+            is_error: false,
+        });
+        match &ended[0] {
+            ServerNotification::ItemCompleted(n) => match &n.item {
+                ThreadItem::CommandExecution {
+                    aggregated_output, ..
+                } => {
+                    let body = aggregated_output.as_deref().unwrap();
+                    assert!(body.len() < 300 * 1024);
+                    assert!(body.ends_with("[truncated]"));
+                }
+                other => panic!("expected CommandExecution, got {other:?}"),
+            },
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn read_extracts_text_from_content_array() {
+        // Pi sometimes normalizes results to the canonical
+        // toolResult content-array shape (`[{"type":"text","text":"..."}]`).
+        // The extraction helper should pull the body out either way.
+        let mut s = state();
+        s.translate(PiEvent::ToolExecutionStart {
+            tool_call_id: "tc_arr".into(),
+            tool_name: "read".into(),
+            args: json!({"path": "/x"}),
+        });
+        let ended = s.translate(PiEvent::ToolExecutionEnd {
+            tool_call_id: "tc_arr".into(),
+            tool_name: "read".into(),
+            result: json!({"content": [{"type":"text","text":"hello"}]}),
+            is_error: false,
+        });
+        match &ended[0] {
+            ServerNotification::ItemCompleted(n) => match &n.item {
+                ThreadItem::CommandExecution {
+                    aggregated_output, ..
+                } => assert_eq!(aggregated_output.as_deref(), Some("hello")),
+                other => panic!("expected CommandExecution, got {other:?}"),
             },
             other => panic!("unexpected {other:?}"),
         }

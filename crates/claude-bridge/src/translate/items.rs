@@ -1,0 +1,1296 @@
+//! Read a claude on-disk transcript JSONL file and translate it into
+//! `Vec<Turn>` of `Vec<ThreadItem>`.
+//!
+//! Wire vs disk discrepancies (per the wire-corrections addendum):
+//! - The on-disk lines for one assistant message are split across multiple
+//!   JSONL records that share `message.id`; we merge by id before emitting
+//!   codex items.
+//! - The structured tool-result lives at top level under either
+//!   `tool_use_result` (live wire) or `toolUseResult` (camelCase, on-disk).
+//!   `OnDiskRecord::tool_use_result` accepts both via `serde(alias)`.
+//!
+//! Turn boundaries: each top-level `user` message anchors a new turn; every
+//! assistant + tool-result record between two `user` records belongs to the
+//! preceding turn.
+
+use std::collections::HashMap;
+use std::path::Path;
+
+use anyhow::Result;
+use serde::Deserialize;
+use serde_json::Value;
+use tokio::fs;
+
+use alleycat_codex_proto::{
+    CollabAgentState, CollabAgentStatus, CollabAgentTool, CollabAgentToolCallStatus,
+    CommandExecutionStatus, DynamicToolCallStatus, McpToolCallError, McpToolCallResult,
+    McpToolCallStatus, PatchApplyStatus, ThreadItem, Turn, TurnStatus, UserInput,
+};
+
+use crate::translate::tool_call::{CodexToolKind, classify};
+
+/// Read the JSONL transcript at `path` and convert it into per-turn codex
+/// items. Lines that fail to parse are skipped with a warning so a single
+/// malformed record can't poison the listing.
+pub async fn messages_to_turns(path: &Path) -> Result<Vec<Turn>> {
+    let text = match fs::read_to_string(path).await {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e.into()),
+    };
+    Ok(messages_text_to_turns(&text))
+}
+
+/// Convert already-read JSONL transcript text into per-turn codex items.
+/// Embedders with remote launchers use this after fetching the transcript over
+/// their transport instead of reading from the bridge process filesystem.
+pub fn messages_text_to_turns(text: &str) -> Vec<Turn> {
+    let records = parse_jsonl(text);
+    records_to_turns(&records)
+}
+
+/// Walk the on-disk transcript and return the per-record `uuid` of every
+/// "real" user message, in chronological order. Tool-result-only user records
+/// (where the message content is exclusively `tool_result` blocks) are
+/// skipped — those don't anchor a codex turn and would mis-bias rollback
+/// counts. Used by `handle_thread_rollback` to compute the
+/// `user_message_id` argument for `control_request{rewind_files}`.
+pub async fn list_user_message_ids(path: &Path) -> Result<Vec<String>> {
+    let text = match fs::read_to_string(path).await {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e.into()),
+    };
+    Ok(list_user_message_ids_from_text(&text))
+}
+
+/// Return user-message ids from already-read JSONL transcript text.
+pub fn list_user_message_ids_from_text(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for record in parse_jsonl(text) {
+        if record.record_type != "user" {
+            continue;
+        }
+        let Some(uuid) = record.uuid.as_deref() else {
+            continue;
+        };
+        let Some(message) = &record.message else {
+            continue;
+        };
+        // Skip tool-result-only user records (these are claude's tool loop
+        // feeding results back, not a fresh user turn).
+        let is_tool_result_only = message
+            .get("content")
+            .and_then(Value::as_array)
+            .is_some_and(|arr| {
+                !arr.is_empty()
+                    && arr
+                        .iter()
+                        .all(|b| b.get("type").and_then(Value::as_str) == Some("tool_result"))
+            });
+        if is_tool_result_only {
+            continue;
+        }
+        out.push(uuid.to_string());
+    }
+    out
+}
+
+/// Stable test seam. `messages_to_turns` calls this after reading.
+pub fn parse_jsonl(text: &str) -> Vec<OnDiskRecord> {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<OnDiskRecord>(trimmed) {
+            Ok(record) => out.push(record),
+            Err(err) => {
+                tracing::warn!(?err, "skipping unparseable claude jsonl record");
+            }
+        }
+    }
+    out
+}
+
+/// Group by `message.id` (assistant) / `uuid` (user) and fold into Turns.
+pub fn records_to_turns(records: &[OnDiskRecord]) -> Vec<Turn> {
+    let mut turns: Vec<Turn> = Vec::new();
+    let mut current_items: Vec<ThreadItem> = Vec::new();
+    let mut current_started_at: Option<i64> = None;
+    let mut current_completed_at: Option<i64> = None;
+    // Merge bookkeeping for assistant content blocks split across multiple
+    // JSONL lines with the same `message.id`.
+    let mut assistant_chunks: HashMap<String, MergedAssistant> = HashMap::new();
+    let mut assistant_order: Vec<String> = Vec::new();
+    // tool_use_id → indices into the items vector to support folding the
+    // tool_result back into the matching item.
+    let mut tool_call_index: HashMap<String, usize> = HashMap::new();
+
+    fn flush_assistants(
+        items: &mut Vec<ThreadItem>,
+        completed_at: &mut Option<i64>,
+        assistants: &mut HashMap<String, MergedAssistant>,
+        order: &mut Vec<String>,
+        tool_call_index: &mut HashMap<String, usize>,
+    ) {
+        for id in order.drain(..) {
+            let Some(merged) = assistants.remove(&id) else {
+                continue;
+            };
+            *completed_at = (*completed_at).max(Some(merged.timestamp));
+            for item in merged.into_items(tool_call_index, items.len()) {
+                items.push(item);
+            }
+        }
+    }
+
+    for record in records {
+        match record.classify() {
+            ClassifiedRecord::User { ts, content } => {
+                // Flush any in-flight assistants under the prior turn.
+                flush_assistants(
+                    &mut current_items,
+                    &mut current_completed_at,
+                    &mut assistant_chunks,
+                    &mut assistant_order,
+                    &mut tool_call_index,
+                );
+                // Tool-result inside a user content array doesn't open a new
+                // turn — fold it into the matching tool call instead.
+                if let Some(folded) = fold_tool_results_into_calls(
+                    &content,
+                    &record.tool_use_result,
+                    &mut current_items,
+                    &tool_call_index,
+                ) {
+                    if folded {
+                        // Tool-result-only user record: don't anchor a turn.
+                        current_completed_at = Some(ts);
+                        continue;
+                    }
+                }
+                // Genuine user message: close the previous turn and open a new one.
+                push_turn(
+                    &mut turns,
+                    &mut current_items,
+                    &mut current_started_at,
+                    &mut current_completed_at,
+                );
+                tool_call_index.clear();
+                current_started_at = Some(ts);
+                current_completed_at = Some(ts);
+                current_items.push(user_message_to_item(&content, ts, turns.len()));
+            }
+            ClassifiedRecord::AssistantBlocks { id, ts, blocks } => {
+                let entry = assistant_chunks
+                    .entry(id.clone())
+                    .or_insert_with(|| MergedAssistant {
+                        message_id: id.clone(),
+                        timestamp: ts,
+                        blocks: Vec::new(),
+                    });
+                if !assistant_order.contains(&id) {
+                    assistant_order.push(id);
+                }
+                entry.timestamp = entry.timestamp.max(ts);
+                entry.blocks.extend(blocks);
+            }
+            ClassifiedRecord::Skip => {}
+        }
+    }
+    flush_assistants(
+        &mut current_items,
+        &mut current_completed_at,
+        &mut assistant_chunks,
+        &mut assistant_order,
+        &mut tool_call_index,
+    );
+    push_turn(
+        &mut turns,
+        &mut current_items,
+        &mut current_started_at,
+        &mut current_completed_at,
+    );
+    turns
+}
+
+fn push_turn(
+    turns: &mut Vec<Turn>,
+    items: &mut Vec<ThreadItem>,
+    started_at: &mut Option<i64>,
+    completed_at: &mut Option<i64>,
+) {
+    if items.is_empty() {
+        return;
+    }
+    turns.push(Turn {
+        id: format!("turn_{}", turns.len()),
+        items: std::mem::take(items),
+        status: TurnStatus::Completed,
+        error: None,
+        started_at: started_at.take(),
+        completed_at: completed_at.take(),
+        duration_ms: None,
+    });
+}
+
+fn user_message_to_item(content: &Value, ts: i64, turn_index: usize) -> ThreadItem {
+    let inputs = match content {
+        Value::String(s) => vec![UserInput::Text {
+            text: s.clone(),
+            text_elements: Vec::new(),
+        }],
+        Value::Array(arr) => arr
+            .iter()
+            .filter_map(|entry| {
+                let block_type = entry.get("type").and_then(Value::as_str)?;
+                match block_type {
+                    "text" => Some(UserInput::Text {
+                        text: entry
+                            .get("text")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string(),
+                        text_elements: Vec::new(),
+                    }),
+                    "image" => entry
+                        .get("source")
+                        .and_then(image_source_to_data_url)
+                        .map(|url| UserInput::Image { url }),
+                    _ => None,
+                }
+            })
+            .collect(),
+        _ => Vec::new(),
+    };
+    ThreadItem::UserMessage {
+        id: format!("user_{turn_index}_{ts}"),
+        content: inputs,
+    }
+}
+
+/// Coerce a claude `tool_use_result` value into one or more codex
+/// `DynamicToolCallOutputContentItem` shapes. Codex's enum is internally
+/// tagged on `type` with two variants, `inputText` and `inputImage`; raw
+/// strings (e.g. claude's "user rejected this tool use" canned message),
+/// objects shaped like anthropic content blocks, arrays of those, and
+/// arbitrary structured payloads all need to land as one of those two
+/// shapes — otherwise litter's typed deserializer rejects the whole
+/// `thread/resume` response.
+fn normalize_dynamic_tool_call_output(value: &Value) -> Vec<Value> {
+    match value {
+        Value::String(s) => vec![serde_json::json!({"type": "inputText", "text": s})],
+        Value::Array(arr) => arr
+            .iter()
+            .flat_map(normalize_dynamic_tool_call_output)
+            .collect(),
+        Value::Object(obj) => {
+            // Anthropic-style text block: `{type: "text", text: "..."}`.
+            if obj.get("type").and_then(Value::as_str) == Some("text") {
+                if let Some(text) = obj.get("text").and_then(Value::as_str) {
+                    return vec![serde_json::json!({"type": "inputText", "text": text})];
+                }
+            }
+            // Anthropic-style image block: `{type: "image", source: {...}}`.
+            if obj.get("type").and_then(Value::as_str) == Some("image") {
+                if let Some(url) = obj.get("source").and_then(image_source_to_data_url) {
+                    return vec![serde_json::json!({"type": "inputImage", "imageUrl": url})];
+                }
+            }
+            // Already-codex-shaped: pass through unchanged.
+            if matches!(
+                obj.get("type").and_then(Value::as_str),
+                Some("inputText" | "inputImage")
+            ) {
+                return vec![Value::Object(obj.clone())];
+            }
+            // Unknown structured payload — stringify it so the client at
+            // least sees something rather than silently dropping it.
+            vec![serde_json::json!({
+                "type": "inputText",
+                "text": serde_json::to_string(value).unwrap_or_default(),
+            })]
+        }
+        Value::Null => Vec::new(),
+        other => vec![serde_json::json!({"type": "inputText", "text": other.to_string()})],
+    }
+}
+
+fn image_source_to_data_url(source: &Value) -> Option<String> {
+    let media_type = source.get("media_type").and_then(Value::as_str)?;
+    let data = source.get("data").and_then(Value::as_str)?;
+    Some(format!("data:{media_type};base64,{data}"))
+}
+
+/// If `content` is a single `tool_result` block (no human text), fold the
+/// result into the matching open tool call and return `Some(true)`. Otherwise
+/// return `Some(false)` (real user message) or `None` (no recognizable shape).
+fn fold_tool_results_into_calls(
+    content: &Value,
+    tool_use_result: &Option<Value>,
+    items: &mut [ThreadItem],
+    tool_call_index: &HashMap<String, usize>,
+) -> Option<bool> {
+    let arr = content.as_array()?;
+    let all_tool_results = arr
+        .iter()
+        .all(|e| e.get("type").and_then(Value::as_str) == Some("tool_result"));
+    if !all_tool_results {
+        return Some(false);
+    }
+    for entry in arr {
+        let Some(tool_use_id) = entry.get("tool_use_id").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(idx) = tool_call_index.get(tool_use_id).copied() else {
+            continue;
+        };
+        let is_error = entry
+            .get("is_error")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let inline = entry
+            .get("content")
+            .map(stringify_content)
+            .unwrap_or_default();
+        complete_tool_item(&mut items[idx], inline, tool_use_result.as_ref(), is_error);
+    }
+    Some(true)
+}
+
+fn stringify_content(content: &Value) -> String {
+    if let Some(s) = content.as_str() {
+        return s.to_string();
+    }
+    if let Some(arr) = content.as_array() {
+        let mut out = String::new();
+        for entry in arr {
+            if let Some(text) = entry.get("text").and_then(Value::as_str) {
+                if !out.is_empty() && !out.ends_with('\n') {
+                    out.push('\n');
+                }
+                out.push_str(text);
+            }
+        }
+        return out;
+    }
+    content.to_string()
+}
+
+fn complete_tool_item(
+    item: &mut ThreadItem,
+    inline: String,
+    tool_use_result: Option<&Value>,
+    is_error: bool,
+) {
+    match item {
+        ThreadItem::CommandExecution {
+            status,
+            aggregated_output,
+            ..
+        } => {
+            let stdout = tool_use_result
+                .and_then(|v| v.get("stdout"))
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            let stderr = tool_use_result
+                .and_then(|v| v.get("stderr"))
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            let interrupted = tool_use_result
+                .and_then(|v| v.get("interrupted"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let mut combined = stdout.unwrap_or(inline);
+            if let Some(stderr) = stderr {
+                if !stderr.is_empty() {
+                    if !combined.is_empty() && !combined.ends_with('\n') {
+                        combined.push('\n');
+                    }
+                    combined.push_str("[stderr] ");
+                    combined.push_str(&stderr);
+                }
+            }
+            *aggregated_output = Some(cap_aggregated_output_disk(combined));
+            *status = if is_error || interrupted {
+                CommandExecutionStatus::Failed
+            } else {
+                CommandExecutionStatus::Completed
+            };
+        }
+        ThreadItem::FileChange { status, .. } => {
+            *status = if is_error {
+                PatchApplyStatus::Failed
+            } else {
+                PatchApplyStatus::Completed
+            };
+        }
+        ThreadItem::McpToolCall {
+            status,
+            result,
+            error,
+            ..
+        } => {
+            if is_error {
+                *status = McpToolCallStatus::Failed;
+                *error = Some(McpToolCallError {
+                    message: inline,
+                    code: None,
+                    data: tool_use_result.cloned(),
+                });
+            } else {
+                *status = McpToolCallStatus::Completed;
+                *result = Some(Box::new(McpToolCallResult {
+                    content: vec![serde_json::json!({"type": "text", "text": inline})],
+                    structured_content: tool_use_result.cloned(),
+                    is_error: None,
+                    meta: None,
+                }));
+            }
+        }
+        ThreadItem::CollabAgentToolCall {
+            status,
+            agents_states,
+            ..
+        } => {
+            if is_error {
+                *status = CollabAgentToolCallStatus::Failed;
+                for state in agents_states.values_mut() {
+                    state.status = CollabAgentStatus::Errored;
+                }
+            }
+        }
+        ThreadItem::DynamicToolCall {
+            status,
+            content_items,
+            success,
+            ..
+        } => {
+            *status = if is_error {
+                DynamicToolCallStatus::Failed
+            } else {
+                DynamicToolCallStatus::Completed
+            };
+            *success = Some(!is_error);
+            // `DynamicToolCallOutputContentItem` is an internally-tagged enum
+            // on the codex side: `{"type":"inputText","text":...}` or
+            // `{"type":"inputImage","imageUrl":...}`. Bare strings (which
+            // claude returns when the user rejects a tool use) and arbitrary
+            // structured `tool_use_result` payloads need to be normalized
+            // into that shape or the codex client errors on `thread/resume`.
+            let mut items = Vec::new();
+            if !inline.is_empty() {
+                items.push(serde_json::json!({"type": "inputText", "text": inline}));
+            }
+            if let Some(extra) = tool_use_result {
+                items.extend(normalize_dynamic_tool_call_output(extra));
+            }
+            if !items.is_empty() {
+                *content_items = Some(items);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Bookkeeping for an assistant message split across multiple JSONL lines.
+#[derive(Debug)]
+struct MergedAssistant {
+    message_id: String,
+    timestamp: i64,
+    blocks: Vec<Value>,
+}
+
+impl MergedAssistant {
+    fn into_items(
+        self,
+        tool_call_index: &mut HashMap<String, usize>,
+        existing_items_len: usize,
+    ) -> Vec<ThreadItem> {
+        let mut out = Vec::new();
+        let mut text_acc = String::new();
+        let mut thinking_acc: Vec<String> = Vec::new();
+        let mut tool_items = Vec::new();
+        for block in &self.blocks {
+            let Some(t) = block.get("type").and_then(Value::as_str) else {
+                continue;
+            };
+            match t {
+                "text" => {
+                    if let Some(s) = block.get("text").and_then(Value::as_str) {
+                        text_acc.push_str(s);
+                    }
+                }
+                "thinking" => {
+                    if let Some(s) = block.get("thinking").and_then(Value::as_str) {
+                        thinking_acc.push(s.to_string());
+                    }
+                }
+                "tool_use" => {
+                    let id = block
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    let name = block.get("name").and_then(Value::as_str).unwrap_or("");
+                    let input = block.get("input").cloned().unwrap_or(Value::Null);
+                    let kind = classify(name);
+                    if let Some(item) = tool_call_to_item(&kind, name, id.clone(), input) {
+                        tool_items.push((id, item));
+                    }
+                }
+                _ => {}
+            }
+        }
+        // Final order: reasoning (if any) → agent message (if any) → tool_use items.
+        if !thinking_acc.is_empty() {
+            out.push(ThreadItem::Reasoning {
+                id: format!("reasoning_{}", self.message_id),
+                summary: Vec::new(),
+                content: thinking_acc,
+            });
+        }
+        if !text_acc.is_empty() {
+            out.push(ThreadItem::AgentMessage {
+                id: format!("assistant_{}", self.message_id),
+                text: text_acc,
+                phase: Some(serde_json::Value::String("final_answer".into())),
+                memory_citation: None,
+            });
+        }
+        for (tool_use_id, item) in tool_items {
+            tool_call_index.insert(tool_use_id, existing_items_len + out.len());
+            out.push(item);
+        }
+        out
+    }
+}
+
+fn tool_call_to_item(
+    kind: &CodexToolKind,
+    tool_name: &str,
+    id: String,
+    args: Value,
+) -> Option<ThreadItem> {
+    Some(match kind {
+        CodexToolKind::CommandExecution => ThreadItem::CommandExecution {
+            id,
+            command: args
+                .get("command")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+            cwd: String::new(),
+            process_id: None,
+            source: Default::default(),
+            status: CommandExecutionStatus::InProgress,
+            command_actions: Vec::new(),
+            aggregated_output: None,
+            exit_code: None,
+            duration_ms: None,
+        },
+        CodexToolKind::FileChange => ThreadItem::FileChange {
+            id,
+            changes: Vec::new(),
+            status: PatchApplyStatus::InProgress,
+        },
+        CodexToolKind::Mcp { server, tool } => ThreadItem::McpToolCall {
+            id,
+            server: server.clone(),
+            tool: tool.clone(),
+            status: McpToolCallStatus::InProgress,
+            arguments: args,
+            mcp_app_resource_uri: None,
+            result: None,
+            error: None,
+            duration_ms: None,
+        },
+        CodexToolKind::Dynamic { namespace, tool } => ThreadItem::DynamicToolCall {
+            id,
+            namespace: namespace.clone(),
+            tool: tool.clone(),
+            arguments: args,
+            status: DynamicToolCallStatus::InProgress,
+            content_items: None,
+            success: None,
+            duration_ms: None,
+        },
+        CodexToolKind::PlanExit => ThreadItem::Plan {
+            id,
+            text: args
+                .get("plan")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+        },
+        CodexToolKind::ExplorationRead
+        | CodexToolKind::ExplorationSearch
+        | CodexToolKind::ExplorationList => build_exploration_disk_item(kind, tool_name, id, &args),
+        CodexToolKind::WebSearch => ThreadItem::WebSearch {
+            id,
+            query: args
+                .get("query")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+            action: Some(serde_json::json!({"type": "search"})),
+        },
+        CodexToolKind::Subagent => build_subagent_disk_item(id, &args),
+        // TaskCreate / TaskUpdate / AskUserQuestion produce no
+        // ThreadItem on disk replay — the live notification streams
+        // (turn/plan/updated and item/tool/requestUserInput) carry the
+        // user-facing data; the surrounding UserMessage / AgentMessage
+        // records already preserve the question + answer text.
+        CodexToolKind::TodoUpdate | CodexToolKind::RequestUserInput => return None,
+    })
+}
+
+/// Cap a CommandExecution body before writing it into a disk-replayed
+/// `aggregated_output`. Mirrors `events.rs::cap_aggregated_output` so
+/// live-stream and replay land at the same size.
+const EXPLORATION_OUTPUT_CAP_DISK: usize = 256 * 1024;
+
+fn cap_aggregated_output_disk(mut text: String) -> String {
+    if text.len() <= EXPLORATION_OUTPUT_CAP_DISK {
+        return text;
+    }
+    let mut idx = EXPLORATION_OUTPUT_CAP_DISK;
+    while idx > 0 && !text.is_char_boundary(idx) {
+        idx -= 1;
+    }
+    text.truncate(idx);
+    text.push_str("\n... [truncated]");
+    text
+}
+
+/// Disk-side counterpart of `build_subagent_item` in events.rs. Disk
+/// replay shows the subagent as already completed (we don't have live
+/// state here), so emit `CollabAgentToolCallStatus::Completed` with
+/// `CollabAgentStatus::Completed`. The `sender_thread_id` is left blank
+/// — the live emission path stamps it from translator state, but disk
+/// replay doesn't know which thread the record belongs to from this
+/// helper. Callers higher up in the on-disk pipeline that need a real
+/// sender id should patch it after the fact.
+fn build_subagent_disk_item(id: String, args: &Value) -> ThreadItem {
+    let prompt = args
+        .get("prompt")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let subagent_type = args.get("subagent_type").and_then(Value::as_str);
+    let description = args.get("description").and_then(Value::as_str);
+    let label = match (subagent_type, description) {
+        (Some(t), Some(d)) if !t.is_empty() && !d.is_empty() => format!("{t}: {d}"),
+        (Some(t), _) if !t.is_empty() => t.to_string(),
+        (_, Some(d)) if !d.is_empty() => d.to_string(),
+        _ => String::new(),
+    };
+    let receiver_id = format!("subagent-{id}");
+    let mut agents_states = HashMap::new();
+    agents_states.insert(
+        receiver_id.clone(),
+        CollabAgentState {
+            status: CollabAgentStatus::Completed,
+            message: if label.is_empty() { None } else { Some(label) },
+        },
+    );
+    ThreadItem::CollabAgentToolCall {
+        id,
+        tool: CollabAgentTool::SpawnAgent,
+        status: CollabAgentToolCallStatus::Completed,
+        sender_thread_id: String::new(),
+        receiver_thread_ids: vec![receiver_id],
+        prompt,
+        model: None,
+        reasoning_effort: None,
+        agents_states,
+    }
+}
+
+/// Disk-side counterpart of `build_exploration_command_item` in events.rs.
+/// Mirrors the same command/command_actions shape so live-stream and disk
+/// replay produce identical items.
+fn build_exploration_disk_item(
+    kind: &CodexToolKind,
+    tool_name: &str,
+    id: String,
+    args: &Value,
+) -> ThreadItem {
+    let (command, command_actions) = match kind {
+        CodexToolKind::ExplorationRead => {
+            let path = args
+                .get("file_path")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let command = format!("Read {path}");
+            let name = command_action_name(&path);
+            let action = serde_json::json!({
+                "type": "read",
+                "command": command.clone(),
+                "name": name,
+                "path": path
+            });
+            (command, vec![action])
+        }
+        CodexToolKind::ExplorationSearch => {
+            let pattern = args
+                .get("pattern")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let path = args.get("path").and_then(Value::as_str);
+            let command = format!("Grep {pattern}");
+            let mut action = serde_json::json!({
+                "type": "search",
+                "command": command.clone(),
+                "query": pattern
+            });
+            if let Some(p) = path {
+                action["path"] = Value::String(p.to_string());
+            }
+            (command, vec![action])
+        }
+        CodexToolKind::ExplorationList => {
+            let pattern = args
+                .get("pattern")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            let path = args.get("path").and_then(Value::as_str).map(str::to_string);
+            let display = match (&pattern, &path) {
+                (Some(p), Some(d)) => format!("{tool_name} {p} {d}"),
+                (Some(p), None) => format!("{tool_name} {p}"),
+                (None, Some(d)) => format!("{tool_name} {d}"),
+                _ => tool_name.to_string(),
+            };
+            let mut action = serde_json::json!({"type": "listFiles", "command": display.clone()});
+            if let Some(p) = path {
+                action["path"] = Value::String(p);
+            }
+            if let Some(p) = pattern {
+                action["pattern"] = Value::String(p);
+            }
+            (display, vec![action])
+        }
+        _ => (String::new(), Vec::new()),
+    };
+    ThreadItem::CommandExecution {
+        id,
+        command,
+        cwd: String::new(),
+        process_id: None,
+        source: Default::default(),
+        status: CommandExecutionStatus::InProgress,
+        command_actions,
+        aggregated_output: None,
+        exit_code: None,
+        duration_ms: None,
+    }
+}
+
+fn command_action_name(path: &str) -> String {
+    path.rsplit(['/', '\\'])
+        .find(|part| !part.is_empty())
+        .unwrap_or("file")
+        .to_string()
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OnDiskRecord {
+    #[serde(rename = "type", default)]
+    pub record_type: String,
+    #[serde(default)]
+    pub message: Option<Value>,
+    /// Live wire field name — accepted alongside the camelCase on-disk
+    /// `toolUseResult` via serde alias.
+    #[serde(default, alias = "toolUseResult", alias = "tool_use_result")]
+    pub tool_use_result: Option<Value>,
+    #[serde(default)]
+    pub timestamp: Option<String>,
+    #[serde(default)]
+    pub uuid: Option<String>,
+}
+
+enum ClassifiedRecord {
+    User {
+        ts: i64,
+        content: Value,
+    },
+    AssistantBlocks {
+        id: String,
+        ts: i64,
+        blocks: Vec<Value>,
+    },
+    Skip,
+}
+
+impl OnDiskRecord {
+    fn classify(&self) -> ClassifiedRecord {
+        let ts = self
+            .timestamp
+            .as_deref()
+            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+            .map(|dt| dt.timestamp_millis())
+            .unwrap_or(0);
+        match self.record_type.as_str() {
+            "user" => {
+                let Some(message) = &self.message else {
+                    return ClassifiedRecord::Skip;
+                };
+                let content = message.get("content").cloned().unwrap_or(Value::Null);
+                ClassifiedRecord::User { ts, content }
+            }
+            "assistant" => {
+                let Some(message) = &self.message else {
+                    return ClassifiedRecord::Skip;
+                };
+                let id = message
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                let blocks = message
+                    .get("content")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                ClassifiedRecord::AssistantBlocks { id, ts, blocks }
+            }
+            // Permission mode notices, file-history snapshots, attachments,
+            // bridge_status announcements: not part of the codex turn shape.
+            _ => ClassifiedRecord::Skip,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn record(value: Value) -> OnDiskRecord {
+        serde_json::from_value(value).expect("parse")
+    }
+
+    #[test]
+    fn user_message_string_content_anchors_a_turn() {
+        let records = vec![record(json!({
+            "type": "user",
+            "message": {"role": "user", "content": "hello"},
+            "timestamp": "2026-04-27T10:00:00Z",
+            "uuid": "u1"
+        }))];
+        let turns = records_to_turns(&records);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].items.len(), 1);
+        match &turns[0].items[0] {
+            ThreadItem::UserMessage { content, .. } => match &content[0] {
+                UserInput::Text { text, .. } => assert_eq!(text, "hello"),
+                other => panic!("expected text, got {other:?}"),
+            },
+            other => panic!("expected UserMessage, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn assistant_blocks_split_across_lines_merged_by_message_id() {
+        let records = vec![
+            record(json!({
+                "type": "user",
+                "message": {"role": "user", "content": "q"},
+                "timestamp": "2026-04-27T10:00:00Z"
+            })),
+            record(json!({
+                "type": "assistant",
+                "timestamp": "2026-04-27T10:00:01Z",
+                "message": {
+                    "id": "msg_1",
+                    "content": [{"type": "thinking", "thinking": "ponder"}]
+                }
+            })),
+            record(json!({
+                "type": "assistant",
+                "timestamp": "2026-04-27T10:00:02Z",
+                "message": {
+                    "id": "msg_1",
+                    "content": [{"type": "text", "text": "answer"}]
+                }
+            })),
+        ];
+        let turns = records_to_turns(&records);
+        assert_eq!(turns.len(), 1);
+        let kinds: Vec<_> = turns[0]
+            .items
+            .iter()
+            .map(|i| match i {
+                ThreadItem::UserMessage { .. } => "user",
+                ThreadItem::AgentMessage { .. } => "agent",
+                ThreadItem::Reasoning { .. } => "reasoning",
+                _ => "other",
+            })
+            .collect();
+        assert!(kinds.contains(&"agent"));
+        assert!(kinds.contains(&"reasoning"));
+    }
+
+    #[test]
+    fn tool_use_then_tool_result_completes_command_execution() {
+        let records = vec![
+            record(json!({
+                "type": "user",
+                "message": {"role": "user", "content": "ls"},
+                "timestamp": "2026-04-27T10:00:00Z"
+            })),
+            record(json!({
+                "type": "assistant",
+                "timestamp": "2026-04-27T10:00:01Z",
+                "message": {
+                    "id": "msg_1",
+                    "content": [{
+                        "type": "tool_use",
+                        "id": "toolu_1",
+                        "name": "Bash",
+                        "input": {"command": "ls"}
+                    }]
+                }
+            })),
+            record(json!({
+                "type": "user",
+                "timestamp": "2026-04-27T10:00:02Z",
+                "message": {
+                    "role": "user",
+                    "content": [{
+                        "tool_use_id": "toolu_1",
+                        "type": "tool_result",
+                        "content": "file1\nfile2"
+                    }]
+                },
+                "toolUseResult": {
+                    "stdout": "file1\nfile2",
+                    "stderr": "",
+                    "interrupted": false,
+                    "isImage": false,
+                    "noOutputExpected": false
+                }
+            })),
+        ];
+        let turns = records_to_turns(&records);
+        assert_eq!(turns.len(), 1);
+        let exec = turns[0]
+            .items
+            .iter()
+            .find(|i| matches!(i, ThreadItem::CommandExecution { .. }))
+            .expect("CommandExecution");
+        match exec {
+            ThreadItem::CommandExecution {
+                command,
+                status,
+                aggregated_output,
+                ..
+            } => {
+                assert_eq!(command, "ls");
+                assert_eq!(*status, CommandExecutionStatus::Completed);
+                assert_eq!(aggregated_output.as_deref(), Some("file1\nfile2"));
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn unmatched_tool_use_stays_in_progress() {
+        let records = vec![
+            record(json!({
+                "type": "user",
+                "message": {"role": "user", "content": "ls"},
+                "timestamp": "2026-04-27T10:00:00Z"
+            })),
+            record(json!({
+                "type": "assistant",
+                "timestamp": "2026-04-27T10:00:01Z",
+                "message": {
+                    "id": "msg_1",
+                    "content": [{
+                        "type": "tool_use",
+                        "id": "toolu_1",
+                        "name": "Bash",
+                        "input": {"command": "ls"}
+                    }]
+                }
+            })),
+        ];
+        let turns = records_to_turns(&records);
+        let item = turns[0]
+            .items
+            .iter()
+            .find(|i| matches!(i, ThreadItem::CommandExecution { .. }))
+            .expect("CommandExecution");
+        let ThreadItem::CommandExecution { status, .. } = item else {
+            unreachable!()
+        };
+        assert_eq!(*status, CommandExecutionStatus::InProgress);
+    }
+
+    #[test]
+    fn camel_case_and_snake_case_tool_use_result_both_parse() {
+        let snake: OnDiskRecord = serde_json::from_value(json!({
+            "type": "user",
+            "message": {"role": "user", "content": "x"},
+            "tool_use_result": {"stdout": "snake"}
+        }))
+        .unwrap();
+        let camel: OnDiskRecord = serde_json::from_value(json!({
+            "type": "user",
+            "message": {"role": "user", "content": "x"},
+            "toolUseResult": {"stdout": "camel"}
+        }))
+        .unwrap();
+        assert!(snake.tool_use_result.is_some());
+        assert!(camel.tool_use_result.is_some());
+    }
+
+    #[test]
+    fn skip_record_types_silently_ignored() {
+        let records = vec![
+            record(json!({
+                "type": "permission-mode",
+                "permissionMode": "bypassPermissions"
+            })),
+            record(json!({
+                "type": "file-history-snapshot",
+                "messageId": "x"
+            })),
+            record(json!({
+                "type": "attachment"
+            })),
+            record(json!({
+                "type": "user",
+                "message": {"role": "user", "content": "real"},
+                "timestamp": "2026-04-27T10:00:00Z"
+            })),
+        ];
+        let turns = records_to_turns(&records);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].items.len(), 1);
+    }
+
+    #[test]
+    fn multiple_user_messages_split_into_multiple_turns() {
+        let records = vec![
+            record(json!({
+                "type": "user",
+                "message": {"role": "user", "content": "first"},
+                "timestamp": "2026-04-27T10:00:00Z"
+            })),
+            record(json!({
+                "type": "assistant",
+                "timestamp": "2026-04-27T10:00:01Z",
+                "message": {
+                    "id": "msg_1",
+                    "content": [{"type": "text", "text": "ack1"}]
+                }
+            })),
+            record(json!({
+                "type": "user",
+                "message": {"role": "user", "content": "second"},
+                "timestamp": "2026-04-27T10:00:02Z"
+            })),
+            record(json!({
+                "type": "assistant",
+                "timestamp": "2026-04-27T10:00:03Z",
+                "message": {
+                    "id": "msg_2",
+                    "content": [{"type": "text", "text": "ack2"}]
+                }
+            })),
+        ];
+        let turns = records_to_turns(&records);
+        assert_eq!(turns.len(), 2);
+    }
+
+    #[test]
+    fn normalize_dynamic_tool_call_output_wraps_bare_string() {
+        // Claude returns a bare string when the user rejects a tool use;
+        // codex's `DynamicToolCallOutputContentItem` requires the tagged
+        // `inputText` shape or `thread/resume` deserialization fails on
+        // the litter side.
+        let out = normalize_dynamic_tool_call_output(&json!(
+            "Error: The user doesn't want to proceed with this tool use."
+        ));
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0]["type"], "inputText");
+        assert!(
+            out[0]["text"]
+                .as_str()
+                .unwrap()
+                .starts_with("Error: The user doesn't want to proceed")
+        );
+    }
+
+    #[test]
+    fn normalize_dynamic_tool_call_output_passes_through_input_text() {
+        let out = normalize_dynamic_tool_call_output(&json!({
+            "type": "inputText",
+            "text": "already shaped"
+        }));
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0]["type"], "inputText");
+        assert_eq!(out[0]["text"], "already shaped");
+    }
+
+    #[test]
+    fn normalize_dynamic_tool_call_output_converts_anthropic_text_block() {
+        let out = normalize_dynamic_tool_call_output(&json!({
+            "type": "text",
+            "text": "hello from anthropic"
+        }));
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0]["type"], "inputText");
+        assert_eq!(out[0]["text"], "hello from anthropic");
+    }
+
+    #[test]
+    fn normalize_dynamic_tool_call_output_converts_anthropic_image_block() {
+        let out = normalize_dynamic_tool_call_output(&json!({
+            "type": "image",
+            "source": {
+                "media_type": "image/png",
+                "data": "AAA"
+            }
+        }));
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0]["type"], "inputImage");
+        assert_eq!(out[0]["imageUrl"], "data:image/png;base64,AAA");
+    }
+
+    #[test]
+    fn normalize_dynamic_tool_call_output_flattens_arrays() {
+        let out = normalize_dynamic_tool_call_output(&json!([
+            "first",
+            {"type": "text", "text": "second"},
+            {"type": "inputText", "text": "third"}
+        ]));
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[0]["text"], "first");
+        assert_eq!(out[1]["text"], "second");
+        assert_eq!(out[2]["text"], "third");
+        assert!(out.iter().all(|v| v["type"] == "inputText"));
+    }
+
+    #[test]
+    fn normalize_dynamic_tool_call_output_stringifies_unknown_objects() {
+        let out = normalize_dynamic_tool_call_output(&json!({
+            "stdout": "ok",
+            "stderr": ""
+        }));
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0]["type"], "inputText");
+        assert!(out[0]["text"].as_str().unwrap().contains("stdout"));
+    }
+
+    #[test]
+    fn normalize_dynamic_tool_call_output_drops_null() {
+        let out = normalize_dynamic_tool_call_output(&json!(null));
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn task_create_and_update_produce_no_disk_items() {
+        let records = vec![
+            record(json!({
+                "type": "user",
+                "message": {"role": "user", "content": "make a plan"},
+                "timestamp": "2026-04-27T10:00:00Z"
+            })),
+            record(json!({
+                "type": "assistant",
+                "timestamp": "2026-04-27T10:00:01Z",
+                "message": {
+                    "id": "msg_t",
+                    "content": [{
+                        "type": "tool_use",
+                        "id": "toolu_create",
+                        "name": "TaskCreate",
+                        "input": {"subject": "step one"}
+                    }]
+                }
+            })),
+            record(json!({
+                "type": "user",
+                "timestamp": "2026-04-27T10:00:02Z",
+                "message": {
+                    "role": "user",
+                    "content": [{
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_create",
+                        "content": "{\"id\": \"task-1\"}",
+                        "is_error": false
+                    }]
+                }
+            })),
+        ];
+        let turns = records_to_turns(&records);
+        // Replay must NOT produce a phantom DynamicToolCall card for
+        // TaskCreate. The only ThreadItem in the turn is the user
+        // anchor message.
+        let non_user_items: Vec<_> = turns
+            .iter()
+            .flat_map(|t| t.items.iter())
+            .filter(|i| !matches!(i, ThreadItem::UserMessage { .. }))
+            .collect();
+        assert!(
+            non_user_items.is_empty(),
+            "TaskCreate must produce no disk item; got {:?}",
+            non_user_items
+        );
+    }
+
+    #[test]
+    fn exit_plan_mode_disk_record_emits_plan_thread_item() {
+        let records = vec![
+            record(json!({
+                "type": "user",
+                "message": {"role": "user", "content": "what's the plan?"},
+                "timestamp": "2026-04-27T10:00:00Z"
+            })),
+            record(json!({
+                "type": "assistant",
+                "timestamp": "2026-04-27T10:00:01Z",
+                "message": {
+                    "id": "msg_p",
+                    "content": [{
+                        "type": "tool_use",
+                        "id": "toolu_plan",
+                        "name": "ExitPlanMode",
+                        "input": {"plan": "1. do this\n2. do that"}
+                    }]
+                }
+            })),
+            record(json!({
+                "type": "user",
+                "timestamp": "2026-04-27T10:00:02Z",
+                "message": {
+                    "role": "user",
+                    "content": [{
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_plan",
+                        "content": "approved",
+                        "is_error": false
+                    }]
+                }
+            })),
+        ];
+        let turns = records_to_turns(&records);
+        let plan = turns
+            .iter()
+            .flat_map(|t| t.items.iter())
+            .find_map(|i| match i {
+                ThreadItem::Plan { id, text } => Some((id.clone(), text.clone())),
+                _ => None,
+            })
+            .expect("plan item in disk replay");
+        assert_eq!(plan.0, "toolu_plan");
+        assert_eq!(plan.1, "1. do this\n2. do that");
+    }
+}

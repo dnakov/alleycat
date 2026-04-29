@@ -22,14 +22,18 @@
 //! EOF on stdin and exits per the bridge design doc).
 
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use alleycat_bridge_core::{
+    ChildProcess, ChildStderr, ChildStdin, ChildStdout, LocalLauncher, ProcessLauncher,
+    ProcessRole, ProcessSpec, StdioMode,
+};
 use anyhow::{Context, Result, anyhow};
 use serde::Serialize;
 use thiserror::Error;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
 use tokio::sync::{Mutex, broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
@@ -65,7 +69,20 @@ pub enum PiProcessError {
 }
 
 /// Pending in-flight requests keyed by their pi command id.
-type ResponseTable = Mutex<HashMap<String, oneshot::Sender<RpcResponse>>>;
+type ResponseTable = Mutex<HashMap<String, PendingResponse>>;
+
+struct PendingResponse {
+    command: String,
+    tx: oneshot::Sender<RpcResponse>,
+}
+
+impl std::fmt::Debug for PendingResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PendingResponse")
+            .field("command", &self.command)
+            .finish_non_exhaustive()
+    }
+}
 
 /// Handle to a single live pi-coding-agent subprocess. Cloning the handle
 /// shares the same channels and reference-counted state, so multiple bridge
@@ -91,7 +108,6 @@ pub struct PiProcessHandle {
     _tasks: Arc<TaskSet>,
 }
 
-#[derive(Debug)]
 struct TaskSet {
     writer: Mutex<Option<JoinHandle<()>>>,
     reader: Mutex<Option<JoinHandle<()>>>,
@@ -99,7 +115,13 @@ struct TaskSet {
     /// The owning Child handle. We hold it so the kernel doesn't reap pi
     /// before our reader sees EOF; explicit shutdown goes through
     /// `shutdown()` which kills the child if needed.
-    child: Mutex<Option<Child>>,
+    child: Mutex<Option<Box<dyn ChildProcess>>>,
+}
+
+impl std::fmt::Debug for TaskSet {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TaskSet").finish_non_exhaustive()
+    }
 }
 
 impl Drop for TaskSet {
@@ -115,52 +137,75 @@ impl Drop for TaskSet {
         if let Some(h) = self.stderr.try_lock().ok().and_then(|mut g| g.take()) {
             h.abort();
         }
+        // We can't `await` `child.kill()` in Drop, so we rely on the launcher's
+        // own kill-on-drop semantics (LocalLauncher uses `kill_on_drop(true)`)
+        // when the boxed handle is dropped here.
         if let Some(mut child) = self.child.try_lock().ok().and_then(|mut g| g.take()) {
-            // start_kill is non-blocking; we accept the race here because the
-            // alternative is awaiting in Drop, which we can't.
-            let _ = child.start_kill();
+            drop(child.take_stdin());
+            drop(child.take_stdout());
+            drop(child.take_stderr());
         }
     }
 }
 
 impl PiProcessHandle {
-    /// Spawn `pi-coding-agent --mode rpc` bound to `cwd` and wire up the I/O
-    /// tasks. The returned handle is ready to accept [`Self::send_request`] /
-    /// [`Self::send_notification`] calls immediately; pi may take a few hundred
-    /// ms to publish its first session event, callers should `.await` the
-    /// `new_session` response before sending downstream commands.
+    /// Spawn `pi-coding-agent --mode rpc` bound to `cwd` via the default
+    /// `LocalLauncher`. Compatibility wrapper for callers that don't yet
+    /// thread a `ProcessLauncher`; new callers should use `launch_with`.
     pub async fn spawn(cwd: impl AsRef<Path>, pi_bin: impl AsRef<Path>) -> Result<Self> {
+        Self::launch_with(&LocalLauncher, cwd, pi_bin).await
+    }
+
+    /// Launch `pi-coding-agent --mode rpc` through `launcher`, bound to
+    /// `cwd`, and wire up the I/O tasks. `launcher` may be a `LocalLauncher`
+    /// (the daemon) or a remote launcher (Litter's SSH variant) — the
+    /// reader/writer/stderr pipeline downstream of the launched child is
+    /// the same.
+    pub async fn launch_with(
+        launcher: &dyn ProcessLauncher,
+        cwd: impl AsRef<Path>,
+        pi_bin: impl AsRef<Path>,
+    ) -> Result<Self> {
         let cwd = cwd.as_ref().to_path_buf();
         let pi_bin = pi_bin.as_ref().to_path_buf();
 
-        let mut command = Command::new(&pi_bin);
-        command
-            .arg(RPC_MODE_FLAG.0)
-            .arg(RPC_MODE_FLAG.1)
-            .current_dir(&cwd)
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            // Guard against pi inheriting file descriptors from the bridge
-            // that could leak transport or auth state.
-            .kill_on_drop(true);
+        let spec = ProcessSpec {
+            role: ProcessRole::Agent,
+            program: pi_bin.clone(),
+            args: vec![
+                OsString::from(RPC_MODE_FLAG.0),
+                OsString::from(RPC_MODE_FLAG.1),
+            ],
+            cwd: Some(cwd.clone()),
+            env: Vec::new(),
+            stdin: StdioMode::Piped,
+            stdout: StdioMode::Piped,
+            stderr: StdioMode::Piped,
+        };
 
-        let mut child = command
-            .spawn()
-            .with_context(|| format!("spawning {}", pi_bin.display()))?;
+        let mut child = launcher.launch(spec).await.with_context(|| {
+            // posix_spawn's ENOENT doesn't tell you whether the missing file
+            // was the binary, the cwd, or the shebang interpreter. Log all
+            // three with their existence states so we can diagnose without
+            // attaching a debugger.
+            format!(
+                "launching {} (cwd={}, cwd_exists={}, pi_bin_exists={})",
+                pi_bin.display(),
+                cwd.display(),
+                cwd.is_dir(),
+                pi_bin.exists()
+            )
+        })?;
 
         let pid = child.id();
-        let stdin = child
-            .stdin
-            .take()
+        let stdin: ChildStdin = child
+            .take_stdin()
             .ok_or_else(|| anyhow!("pi child has no stdin pipe"))?;
-        let stdout = child
-            .stdout
-            .take()
+        let stdout: ChildStdout = child
+            .take_stdout()
             .ok_or_else(|| anyhow!("pi child has no stdout pipe"))?;
-        let stderr = child
-            .stderr
-            .take()
+        let stderr: ChildStderr = child
+            .take_stderr()
             .ok_or_else(|| anyhow!("pi child has no stderr pipe"))?;
 
         let (writer_tx, writer_rx) = mpsc::unbounded_channel::<String>();
@@ -223,14 +268,26 @@ impl PiProcessHandle {
     ) -> Result<RpcResponse, PiProcessError> {
         let id = Uuid::now_v7().to_string();
         set_command_id(&mut command, id.clone());
+        let command_value = serde_json::to_value(&command)?;
+        let command_name = command_value
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let line = serde_json::to_string(&command_value)?;
 
         let (tx, rx) = oneshot::channel();
         {
             let mut pending = self.pending.lock().await;
-            pending.insert(id.clone(), tx);
+            pending.insert(
+                id.clone(),
+                PendingResponse {
+                    command: command_name,
+                    tx,
+                },
+            );
         }
 
-        let line = serde_json::to_string(&command)?;
         if self.writer_tx.send(line).is_err() {
             // Writer is gone — pull the slot back so we don't leak.
             let mut pending = self.pending.lock().await;
@@ -261,10 +318,6 @@ impl PiProcessHandle {
     /// Close stdin to signal a clean shutdown, then wait for pi to exit and
     /// reap the child. Idempotent.
     pub async fn shutdown(&self) {
-        // Dropping the only writer_tx clone closes the writer mpsc.
-        // We can't move out of `&self`, but we can replace the channel sender
-        // with a closed one by sending a sentinel? Simpler: rely on Drop
-        // closing writer_tx. To make shutdown explicit, abort tasks here.
         if let Some(handle) = self._tasks.writer.lock().await.take() {
             handle.abort();
         }
@@ -272,7 +325,7 @@ impl PiProcessHandle {
             handle.abort();
         }
         if let Some(mut child) = self._tasks.child.lock().await.take() {
-            let _ = child.start_kill();
+            let _ = child.kill().await;
             let _ = child.wait().await;
         }
         if let Some(handle) = self._tasks.reader.lock().await.take() {
@@ -312,6 +365,7 @@ fn set_command_id(command: &mut RpcCommand, id: String) {
         GetForkMessages(c) => c.id = Some(id),
         GetLastAssistantText(c) => c.id = Some(id),
         SetSessionName(c) => c.id = Some(id),
+        ListSessions(c) => c.id = Some(id),
         GetMessages(c) => c.id = Some(id),
         GetCommands(c) => c.id = Some(id),
         // ExtensionUiResponse uses its own pi-supplied id and never expects
@@ -377,30 +431,70 @@ async fn reader_task(
     pending.lock().await.clear();
 }
 
-async fn deliver_response(pending: &ResponseTable, response: RpcResponse) {
-    let id = match &response.id {
-        Some(id) => id.clone(),
+async fn deliver_response(pending: &ResponseTable, mut response: RpcResponse) {
+    let id_from_response = response.id.clone();
+    let mut guard = pending.lock().await;
+    let (id, pending_response) = match id_from_response {
+        Some(id) => match guard.remove(&id) {
+            Some(pending_response) => (id, pending_response),
+            None => {
+                tracing::warn!(
+                    id,
+                    command = %response.command,
+                    "pi response had no matching pending request"
+                );
+                return;
+            }
+        },
         None => {
-            tracing::warn!(
-                command = %response.command,
-                "pi response missing id; dropping"
-            );
-            return;
-        }
-    };
-    let tx = pending.lock().await.remove(&id);
-    match tx {
-        Some(tx) => {
-            if tx.send(response).is_err() {
-                tracing::debug!(id, "response receiver dropped before delivery");
+            let matches = guard
+                .iter()
+                .filter_map(|(id, pending)| {
+                    (pending.command == response.command).then(|| id.clone())
+                })
+                .collect::<Vec<_>>();
+            match matches.as_slice() {
+                [id] => {
+                    let id = id.clone();
+                    let Some(pending_response) = guard.remove(&id) else {
+                        tracing::warn!(
+                            command = %response.command,
+                            "pi response missing id; matched request disappeared"
+                        );
+                        return;
+                    };
+                    tracing::debug!(
+                        command = %response.command,
+                        fallback_id = %id,
+                        "pi response missing id; matched by command"
+                    );
+                    response.id = Some(id.clone());
+                    (id, pending_response)
+                }
+                [] => {
+                    tracing::warn!(
+                        command = %response.command,
+                        "pi response missing id and no pending request matched command; dropping"
+                    );
+                    return;
+                }
+                _ => {
+                    tracing::warn!(
+                        command = %response.command,
+                        matches = matches.len(),
+                        "pi response missing id and multiple pending requests matched command; dropping"
+                    );
+                    return;
+                }
             }
         }
-        None => {
-            tracing::warn!(
-                id,
-                command = %response.command,
-                "pi response had no matching pending request"
-            );
+    };
+    drop(guard);
+
+    match pending_response.tx.send(response) {
+        Ok(()) => {}
+        Err(_) => {
+            tracing::debug!(id, "response receiver dropped before delivery");
         }
     }
 }
@@ -454,7 +548,7 @@ impl PiProcessHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pool::pi_protocol::{BareCmd, NewSessionCmd, PromptCmd};
+    use crate::pool::pi_protocol::{BareCmd, NewSessionCmd, PromptCmd, ResponseKind};
 
     #[test]
     fn set_command_id_overwrites_for_each_variant() {
@@ -490,6 +584,37 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn response_missing_id_matches_single_pending_command() {
+        let pending = Mutex::new(HashMap::new());
+        let (tx, rx) = oneshot::channel();
+        pending.lock().await.insert(
+            "req-1".to_string(),
+            PendingResponse {
+                command: "list_sessions".to_string(),
+                tx,
+            },
+        );
+
+        deliver_response(
+            &pending,
+            RpcResponse {
+                kind: ResponseKind::Response,
+                id: None,
+                command: "list_sessions".to_string(),
+                success: true,
+                data: None,
+                error: None,
+            },
+        )
+        .await;
+
+        let response = rx.await.expect("response delivered");
+        assert_eq!(response.id.as_deref(), Some("req-1"));
+        assert_eq!(response.command, "list_sessions");
+        assert!(response.success);
+    }
+
     /// Drive a fake "pi" process (cat-like binary that echoes our commands as
     /// pre-shaped responses) through the full PiProcessHandle pipeline.
     /// Disabled by default; this test requires `bash` and is purely an
@@ -514,43 +639,40 @@ printf '{"type":"response","id":"%s","command":"abort","success":true}\n' "$id"
         }
         std::fs::set_permissions(tmp.path(), perms).unwrap();
 
-        // Wrap the script in `bash <script>` since the file isn't shebanged.
-        let handle = {
-            let mut command = Command::new("bash");
-            command
-                .arg(tmp.path())
-                .stdin(std::process::Stdio::piped())
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::piped())
-                .kill_on_drop(true);
-            let mut child = command.spawn().unwrap();
-            let stdin = child.stdin.take().unwrap();
-            let stdout = child.stdout.take().unwrap();
-            let stderr = child.stderr.take().unwrap();
-
-            let (writer_tx, writer_rx) = mpsc::unbounded_channel::<String>();
-            let (events_tx, _) = broadcast::channel(8);
-            let pending: Arc<ResponseTable> = Arc::new(Mutex::new(HashMap::new()));
-
-            let writer = tokio::spawn(writer_task(stdin, writer_rx));
-            let reader = tokio::spawn(reader_task(stdout, pending.clone(), events_tx.clone()));
-            let stderr_handle = tokio::spawn(stderr_task(stderr, child.id()));
-            let tasks = Arc::new(TaskSet {
-                writer: Mutex::new(Some(writer)),
-                reader: Mutex::new(Some(reader)),
-                stderr: Mutex::new(Some(stderr_handle)),
-                child: Mutex::new(Some(child)),
-            });
-            PiProcessHandle {
-                cwd: std::env::current_dir().unwrap(),
-                pi_bin: "bash".into(),
-                pid: None,
-                writer_tx,
-                events_tx,
-                pending,
-                _tasks: tasks,
+        // Use a custom launcher that swaps the program for `bash` and
+        // prepends the script path. Avoids reaching into private internals.
+        struct BashLauncher {
+            script: PathBuf,
+        }
+        impl ProcessLauncher for BashLauncher {
+            fn launch(
+                &self,
+                _spec: ProcessSpec,
+            ) -> futures::future::BoxFuture<'_, std::io::Result<Box<dyn ChildProcess>>>
+            {
+                let script = self.script.clone();
+                Box::pin(async move {
+                    let new_spec = ProcessSpec {
+                        role: ProcessRole::Agent,
+                        program: PathBuf::from("bash"),
+                        args: vec![OsString::from(script.as_os_str())],
+                        cwd: None,
+                        env: Vec::new(),
+                        stdin: StdioMode::Piped,
+                        stdout: StdioMode::Piped,
+                        stderr: StdioMode::Piped,
+                    };
+                    LocalLauncher.launch(new_spec).await
+                })
             }
+        }
+        let launcher = BashLauncher {
+            script: tmp.path().to_path_buf(),
         };
+        let handle =
+            PiProcessHandle::launch_with(&launcher, std::env::current_dir().unwrap(), "bash")
+                .await
+                .unwrap();
 
         let response = handle
             .send_request(RpcCommand::Abort(BareCmd { id: None }))

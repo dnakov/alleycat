@@ -3,6 +3,20 @@ name = "alleycat-opencode-bridge"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+description = "Codex app-server façade over a single shared `opencode serve` backend, used by the alleycat daemon."
+
+[package.metadata.dist]
+dist = false
+
+[package.metadata.wix]
+upgrade-guid = "CD13D185-C39C-4498-A5DB-ED3CF6FD8E36"
+path-guid = "0D96A9F1-140B-4E0C-8668-27474D68A026"
+license = false
+eula = false
 
 [[bin]]
 name = "alleycat-opencode-bridge"
@@ -13,7 +27,7 @@ name = "alleycat_opencode_bridge"
 path = "src/lib.rs"
 
 [dependencies]
-alleycat-bridge-core = { path = "../bridge-core" }
+alleycat-bridge-core = { workspace = true }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 base64 = { workspace = true }

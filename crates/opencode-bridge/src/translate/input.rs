@@ -68,7 +68,11 @@ fn local_image_to_part(path: &str) -> Value {
             })
         }
         Err(err) => {
-            tracing::warn!(?err, path, "failed to read local image; falling back to text");
+            tracing::warn!(
+                ?err,
+                path,
+                "failed to read local image; falling back to text"
+            );
             json!({"type":"text","text":format!("[local image unavailable: {path}]")})
         }
     }

@@ -55,8 +55,14 @@ impl<'de> Deserialize<'de> for JsonRpcVersion {
     }
 }
 
+// `jsonrpc` is `#[serde(default)]` so we tolerate clients (notably the codex
+// app-server test client and the litter mobile client) that omit the version
+// field even though JSON-RPC 2.0 requires it. Defaulting to `JsonRpcVersion`
+// transparently fills it in; explicit non-`"2.0"` values still error via the
+// custom `Deserialize` impl. Mirrors `pi-bridge`'s behavior.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct JsonRpcRequest {
+    #[serde(default)]
     pub jsonrpc: JsonRpcVersion,
     pub id: RequestId,
     pub method: String,
@@ -66,6 +72,7 @@ pub struct JsonRpcRequest {
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct JsonRpcNotification {
+    #[serde(default)]
     pub jsonrpc: JsonRpcVersion,
     pub method: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -74,6 +81,7 @@ pub struct JsonRpcNotification {
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct JsonRpcResponse {
+    #[serde(default)]
     pub jsonrpc: JsonRpcVersion,
     pub id: RequestId,
     #[serde(default, skip_serializing_if = "Option::is_none")]

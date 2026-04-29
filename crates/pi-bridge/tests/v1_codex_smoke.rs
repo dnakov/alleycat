@@ -93,14 +93,12 @@ async fn initialize_thread_start_turn_start_smoke() {
     // Build the bridge state. `NoopThreadIndex` is fine because this test
     // doesn't drive `thread/list` / `thread/read` — those have their own
     // verification matrix entries.
-    let (notif_tx, notif_rx) = mpsc::unbounded_channel::<p::JsonRpcMessage>();
     let pool = Arc::new(PiPool::new(fake_pi_path()));
-    let state = Arc::new(ConnectionState::new(
-        notif_tx,
+    let (state, notif_rx) = ConnectionState::for_test(
         Arc::clone(&pool),
         Arc::new(NoopThreadIndex),
         ThreadDefaults::default(),
-    ));
+    );
 
     // --- initialize -------------------------------------------------------
     let init_resp = handlers::lifecycle::handle_initialize(
@@ -269,7 +267,7 @@ fn assistant_message(text: &str, timestamp: i64) -> Value {
 /// `quiet_period` (200ms is plenty for the fake — pi events arrive in
 /// microseconds once the writer flushes).
 async fn drain_notifications(
-    mut notif_rx: mpsc::UnboundedReceiver<p::JsonRpcMessage>,
+    mut notif_rx: mpsc::UnboundedReceiver<alleycat_bridge_core::session::Sequenced>,
     overall_timeout: Duration,
 ) -> Vec<(String, Value)> {
     let mut out = Vec::new();
@@ -284,13 +282,18 @@ async fn drain_notifications(
         let remaining = deadline.saturating_duration_since(now);
         let wait = remaining.min(quiet_period);
         match timeout(wait, notif_rx.recv()).await {
-            Ok(Some(p::JsonRpcMessage::Notification(n))) => {
-                let params = n.params.unwrap_or(Value::Null);
-                out.push((n.method, params));
-            }
-            Ok(Some(_other)) => {
-                // Responses / requests aren't part of the smoke contract;
-                // ignore so this drain stays focused on notifications.
+            Ok(Some(seq)) => {
+                let value = seq.payload;
+                // Filter to notifications: requests/responses have an `id`
+                // field, notifications have a method and no id.
+                if value.get("id").is_some() {
+                    continue;
+                }
+                let Some(method) = value.get("method").and_then(Value::as_str) else {
+                    continue;
+                };
+                let params = value.get("params").cloned().unwrap_or(Value::Null);
+                out.push((method.to_string(), params));
             }
             Ok(None) => break, // sender dropped
             Err(_) => {

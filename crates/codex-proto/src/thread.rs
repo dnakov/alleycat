@@ -19,7 +19,7 @@ use super::items::ThreadItem;
 #[serde(rename_all = "camelCase")]
 pub struct Thread {
     pub id: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub forked_from_id: Option<String>,
     pub preview: String,
     pub ephemeral: bool,
@@ -29,18 +29,18 @@ pub struct Thread {
     pub status: ThreadStatus,
     /// Path to the underlying session file. For pi-bridge this is the pi
     /// JSONL path.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub path: Option<String>,
     pub cwd: String,
     pub cli_version: String,
     pub source: SessionSource,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub agent_nickname: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub agent_role: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub git_info: Option<GitInfo>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub name: Option<String>,
     /// Populated only on resume / fork / rollback / read+includeTurns.
     #[serde(default)]
@@ -55,13 +55,13 @@ pub struct Turn {
     #[serde(default)]
     pub items: Vec<ThreadItem>,
     pub status: TurnStatus,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub error: Option<TurnError>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub started_at: Option<i64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub completed_at: Option<i64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub duration_ms: Option<i64>,
 }
 
@@ -110,7 +110,7 @@ pub struct ThreadStartResponse {
     pub thread: Thread,
     pub model: String,
     pub model_provider: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub service_tier: Option<ServiceTier>,
     pub cwd: String,
     #[serde(default)]
@@ -118,9 +118,9 @@ pub struct ThreadStartResponse {
     pub approval_policy: AskForApproval,
     pub approvals_reviewer: ApprovalsReviewer,
     pub sandbox: SandboxPolicy,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub permission_profile: Option<PermissionProfile>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub reasoning_effort: Option<ReasoningEffort>,
 }
 
@@ -170,7 +170,7 @@ pub struct ThreadResumeResponse {
     pub thread: Thread,
     pub model: String,
     pub model_provider: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub service_tier: Option<ServiceTier>,
     pub cwd: String,
     #[serde(default)]
@@ -178,9 +178,9 @@ pub struct ThreadResumeResponse {
     pub approval_policy: AskForApproval,
     pub approvals_reviewer: ApprovalsReviewer,
     pub sandbox: SandboxPolicy,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub permission_profile: Option<PermissionProfile>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub reasoning_effort: Option<ReasoningEffort>,
 }
 
@@ -387,6 +387,28 @@ pub struct ThreadReadParams {
 #[serde(rename_all = "camelCase")]
 pub struct ThreadReadResponse {
     pub thread: Thread,
+}
+
+// === thread/turns/list =====================================================
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadTurnsListParams {
+    pub thread_id: String,
+    #[serde(default)]
+    pub cursor: Option<String>,
+    #[serde(default)]
+    pub limit: Option<u32>,
+    #[serde(default)]
+    pub sort_direction: Option<SortDirection>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadTurnsListResponse {
+    pub data: Vec<Turn>,
+    pub next_cursor: Option<String>,
+    pub backwards_cursor: Option<String>,
 }
 
 // === thread/backgroundTerminals/clean ======================================

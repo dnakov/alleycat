@@ -83,7 +83,10 @@ async fn turn_start_acks_immediately_then_session_idle_completes_turn() {
     )
     .await;
     let started = read_until_response(&mut read, 2).await;
-    let thread_id = started["result"]["thread"]["id"].as_str().unwrap().to_string();
+    let thread_id = started["result"]["thread"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
 
     // turn/start should return immediately with status:"inProgress".
     send(
@@ -118,11 +121,15 @@ async fn turn_start_acks_immediately_then_session_idle_completes_turn() {
     // Confirm prompt_async was the upstream call (not the legacy /message).
     let paths = seen.lock().unwrap().clone();
     assert!(
-        paths.iter().any(|p| p.starts_with("POST /session/ses_1/prompt_async")),
+        paths
+            .iter()
+            .any(|p| p.starts_with("POST /session/ses_1/prompt_async")),
         "expected prompt_async in upstream calls: {paths:?}"
     );
     assert!(
-        !paths.iter().any(|p| p.starts_with("POST /session/ses_1/message")),
+        !paths
+            .iter()
+            .any(|p| p.starts_with("POST /session/ses_1/message")),
         "synchronous /message should no longer be used: {paths:?}"
     );
 
@@ -133,7 +140,8 @@ async fn turn_start_acks_immediately_then_session_idle_completes_turn() {
         json!({"type":"session.idle","properties":{"sessionID":"ses_1"}}),
     );
 
-    let turn_completed = read_until_notification(&mut read, "turn/completed", Duration::from_secs(3)).await;
+    let turn_completed =
+        read_until_notification(&mut read, "turn/completed", Duration::from_secs(3)).await;
     assert_eq!(turn_completed["params"]["threadId"], thread_id);
     assert_eq!(turn_completed["params"]["turn"]["status"], "completed");
 
@@ -185,10 +193,7 @@ async fn send_notification<W: tokio::io::AsyncWrite + Unpin>(
     writer.flush().await.unwrap();
 }
 
-async fn read_until_response<R: tokio::io::AsyncBufRead + Unpin>(
-    reader: &mut R,
-    id: i64,
-) -> Value {
+async fn read_until_response<R: tokio::io::AsyncBufRead + Unpin>(reader: &mut R, id: i64) -> Value {
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             let value: Value = read_json_line(reader).await.unwrap().unwrap();
@@ -218,10 +223,7 @@ async fn read_until_notification<R: tokio::io::AsyncBufRead + Unpin>(
     .unwrap_or_else(|_| panic!("notification {method} not seen within {timeout:?}"))
 }
 
-fn start_fake_opencode(
-    seen: Arc<Mutex<Vec<String>>>,
-    injector: SseInjector,
-) -> String {
+fn start_fake_opencode(seen: Arc<Mutex<Vec<String>>>, injector: SseInjector) -> String {
     let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
     let addr = listener.local_addr().unwrap();
     thread::spawn(move || {

@@ -89,14 +89,20 @@ fn flush_turn(
     if items.is_empty() {
         return;
     }
+    let s = started_at.take();
+    let c = completed_at.take();
+    let duration_ms = match (s, c) {
+        (Some(s), Some(c)) if c >= s => Some(c - s),
+        _ => None,
+    };
     turns.push(Turn {
         id: format!("turn_{}", turns.len()),
         items: std::mem::take(items),
         status: TurnStatus::Completed,
         error: None,
-        started_at: started_at.take(),
-        completed_at: completed_at.take(),
-        duration_ms: None,
+        started_at: s,
+        completed_at: c,
+        duration_ms,
     });
 }
 
@@ -155,7 +161,7 @@ fn push_assistant_items(
         out.push(ThreadItem::AgentMessage {
             id: format!("assistant_{}", message.timestamp),
             text,
-            phase: None,
+            phase: Some(serde_json::Value::String("final_answer".into())),
             memory_citation: None,
         });
     }
@@ -243,6 +249,19 @@ fn tool_call_to_item(
             }),
             duration_ms: None,
         },
+        CodexToolKind::ExplorationRead
+        | CodexToolKind::ExplorationSearch
+        | CodexToolKind::ExplorationList => {
+            let body = result.map(|r| cap_aggregated_output_disk(merge_tool_result_text(r)));
+            build_exploration_disk_item(
+                kind,
+                &call.name,
+                id,
+                &call.arguments,
+                tool_status_command(result, is_error),
+                body,
+            )
+        }
         CodexToolKind::Dynamic { namespace, tool } => ThreadItem::DynamicToolCall {
             id,
             namespace: namespace.clone(),
@@ -259,6 +278,111 @@ fn tool_call_to_item(
             duration_ms: None,
         },
     }
+}
+
+/// Disk-side counterpart of `build_exploration_command_item` in events.rs.
+/// Mirrors the same command/command_actions shape so live-stream and disk
+/// replay produce identical items.
+fn build_exploration_disk_item(
+    kind: &CodexToolKind,
+    tool_name: &str,
+    id: String,
+    args: &Value,
+    status: CommandExecutionStatus,
+    aggregated_output: Option<String>,
+) -> ThreadItem {
+    let (command, command_actions) = match kind {
+        CodexToolKind::ExplorationRead => {
+            let path = args
+                .get("path")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let command = format!("read {path}");
+            let name = command_action_name(&path);
+            let action = serde_json::json!({
+                "type": "read",
+                "command": command.clone(),
+                "name": name,
+                "path": path
+            });
+            (command, vec![action])
+        }
+        CodexToolKind::ExplorationSearch => {
+            let pattern = args
+                .get("pattern")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let path = args.get("path").and_then(Value::as_str);
+            let command = format!("grep {pattern}");
+            let mut action = serde_json::json!({
+                "type": "search",
+                "command": command.clone(),
+                "query": pattern
+            });
+            if let Some(p) = path {
+                action["path"] = Value::String(p.to_string());
+            }
+            (command, vec![action])
+        }
+        CodexToolKind::ExplorationList => {
+            let pattern = args
+                .get("pattern")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            let path = args.get("path").and_then(Value::as_str).map(str::to_string);
+            let display = match (&pattern, &path) {
+                (Some(p), Some(d)) => format!("{tool_name} {p} {d}"),
+                (Some(p), None) => format!("{tool_name} {p}"),
+                (None, Some(d)) => format!("{tool_name} {d}"),
+                _ => tool_name.to_string(),
+            };
+            let mut action = serde_json::json!({"type": "listFiles", "command": display.clone()});
+            if let Some(p) = path {
+                action["path"] = Value::String(p);
+            }
+            if let Some(p) = pattern {
+                action["pattern"] = Value::String(p);
+            }
+            (display, vec![action])
+        }
+        _ => (String::new(), Vec::new()),
+    };
+    ThreadItem::CommandExecution {
+        id,
+        command,
+        cwd: String::new(),
+        process_id: None,
+        source: Default::default(),
+        status,
+        command_actions,
+        aggregated_output,
+        exit_code: None,
+        duration_ms: None,
+    }
+}
+
+fn command_action_name(path: &str) -> String {
+    path.rsplit(['/', '\\'])
+        .find(|part| !part.is_empty())
+        .unwrap_or("file")
+        .to_string()
+}
+
+const EXPLORATION_OUTPUT_CAP_DISK: usize = 256 * 1024;
+
+fn cap_aggregated_output_disk(mut text: String) -> String {
+    if text.len() <= EXPLORATION_OUTPUT_CAP_DISK {
+        return text;
+    }
+    let mut idx = EXPLORATION_OUTPUT_CAP_DISK;
+    while idx > 0 && !text.is_char_boundary(idx) {
+        idx -= 1;
+    }
+    text.truncate(idx);
+    text.push_str("\n... [truncated]");
+    text
 }
 
 fn tool_status_command(

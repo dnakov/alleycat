@@ -170,7 +170,10 @@ mod tests {
             bucket_decision(&json!("approvedForSession")),
             ApprovalOutcome::ApprovedForSession
         );
-        assert_eq!(bucket_decision(&json!("decline")), ApprovalOutcome::Rejected);
+        assert_eq!(
+            bucket_decision(&json!("decline")),
+            ApprovalOutcome::Rejected
+        );
         assert_eq!(bucket_decision(&json!("denied")), ApprovalOutcome::Rejected);
         assert_eq!(bucket_decision(&json!("cancel")), ApprovalOutcome::Rejected);
         assert_eq!(

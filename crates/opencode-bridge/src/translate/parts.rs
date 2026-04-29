@@ -29,9 +29,32 @@ pub fn part_to_item(part: &Value, role: &str, sender_thread_id: &str) -> Option<
         .and_then(Value::as_str)
         .unwrap_or("opencode-part");
     match part.get("type").and_then(Value::as_str)? {
-        "text" => Some(
-            json!({"type":"agentMessage","id":id,"text":part.get("text").and_then(Value::as_str).unwrap_or("")}),
-        ),
+        "text" => {
+            let text = part.get("text").and_then(Value::as_str).unwrap_or("");
+            if role == "user" {
+                // Codex wire shape for the user prompt: a `userMessage` item
+                // whose `content` is a list of `UserInput` blocks. Opencode
+                // stores the prompt as a plain text part on a `role: "user"`
+                // message, so we lift it into the codex envelope here.
+                Some(json!({
+                    "type": "userMessage",
+                    "id": id,
+                    "content": [{
+                        "type": "text",
+                        "text": text,
+                        "text_elements": []
+                    }]
+                }))
+            } else {
+                Some(json!({
+                    "type": "agentMessage",
+                    "id": id,
+                    "text": text,
+                    "phase": "final_answer",
+                    "memoryCitation": null,
+                }))
+            }
+        }
         "reasoning" => Some(
             json!({"type":"reasoning","id":id,"summary":[],"content":[part.get("text").and_then(Value::as_str).unwrap_or("")]}),
         ),
@@ -85,7 +108,13 @@ fn file_part_to_item(part: &Value, id: &str, role: &str) -> Option<Value> {
         .get("filename")
         .and_then(Value::as_str)
         .unwrap_or("file");
-    Some(json!({"type":"agentMessage","id":id,"text":format!("[file: {filename} ({mime})]")}))
+    Some(json!({
+        "type": "agentMessage",
+        "id": id,
+        "text": format!("[file: {filename} ({mime})]"),
+        "phase": "final_answer",
+        "memoryCitation": null,
+    }))
 }
 
 fn agent_part_to_item(part: &Value, id: &str, role: &str) -> Option<Value> {
@@ -105,7 +134,13 @@ fn agent_part_to_item(part: &Value, id: &str, role: &str) -> Option<Value> {
             "content": [skill]
         }));
     }
-    Some(json!({"type":"agentMessage","id":id,"text":format!("[skill: {name}]")}))
+    Some(json!({
+        "type": "agentMessage",
+        "id": id,
+        "text": format!("[skill: {name}]"),
+        "phase": "final_answer",
+        "memoryCitation": null,
+    }))
 }
 
 fn subtask_part_to_item(part: &Value, id: &str, sender_thread_id: &str) -> Value {
@@ -193,7 +228,9 @@ mod tests {
     fn user_file_image_renders_as_user_input_image() {
         let message = make_message(
             "user",
-            vec![json!({"id":"p1","type":"file","mime":"image/jpeg","url":"data:image/jpeg;base64,Zm9v"})],
+            vec![
+                json!({"id":"p1","type":"file","mime":"image/jpeg","url":"data:image/jpeg;base64,Zm9v"}),
+            ],
         );
         let items = message_to_turn_items(&message);
         assert_eq!(items.len(), 1);
@@ -203,10 +240,38 @@ mod tests {
     }
 
     #[test]
+    fn user_text_part_emits_user_message_with_text_elements() {
+        let message = make_message(
+            "user",
+            vec![json!({"id":"p1","type":"text","text":"hello"})],
+        );
+        let items = message_to_turn_items(&message);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["type"], "userMessage");
+        assert_eq!(items[0]["content"][0]["type"], "text");
+        assert_eq!(items[0]["content"][0]["text"], "hello");
+        assert_eq!(items[0]["content"][0]["text_elements"], json!([]));
+    }
+
+    #[test]
+    fn assistant_text_part_still_emits_agent_message() {
+        let message = make_message(
+            "assistant",
+            vec![json!({"id":"p1","type":"text","text":"reply"})],
+        );
+        let items = message_to_turn_items(&message);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["type"], "agentMessage");
+        assert_eq!(items[0]["text"], "reply");
+    }
+
+    #[test]
     fn user_agent_part_renders_as_skill() {
         let message = make_message(
             "user",
-            vec![json!({"id":"p1","type":"agent","name":"reviewer","source":{"value":"@reviewer","start":0,"end":9}})],
+            vec![
+                json!({"id":"p1","type":"agent","name":"reviewer","source":{"value":"@reviewer","start":0,"end":9}}),
+            ],
         );
         let items = message_to_turn_items(&message);
         assert_eq!(items[0]["content"][0]["type"], "skill");

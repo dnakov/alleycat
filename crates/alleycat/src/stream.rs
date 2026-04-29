@@ -14,10 +14,6 @@ impl IrohStream {
     pub fn new(send: SendStream, recv: RecvStream) -> Self {
         Self { send, recv }
     }
-
-    pub fn split(self) -> (RecvStream, SendStream) {
-        (self.recv, self.send)
-    }
 }
 
 impl AsyncRead for IrohStream {

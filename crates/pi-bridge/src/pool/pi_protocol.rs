@@ -76,6 +76,7 @@ pub enum RpcCommand {
     GetForkMessages(BareCmd),
     GetLastAssistantText(BareCmd),
     SetSessionName(SetSessionNameCmd),
+    ListSessions(ListSessionsCmd),
 
     // Messages
     GetMessages(BareCmd),
@@ -221,6 +222,18 @@ pub struct SetSessionNameCmd {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
     pub name: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ListSessionsCmd {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    #[serde(default, skip_serializing_if = "is_false", rename = "allProjects")]
+    pub all_projects: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// Streaming behavior for `prompt` when an existing turn is in flight.
@@ -445,6 +458,34 @@ pub struct ForkMessageEntry {
 pub struct LastAssistantTextData {
     /// `null` when no assistant text exists yet.
     pub text: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ListSessionsData {
+    pub sessions: Vec<SessionInfoData>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionInfoData {
+    pub path: String,
+    pub id: String,
+    pub cwd: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "parentSessionPath"
+    )]
+    pub parent_session_path: Option<String>,
+    pub created: String,
+    pub modified: String,
+    #[serde(rename = "messageCount")]
+    pub message_count: usize,
+    #[serde(rename = "firstMessage")]
+    pub first_message: String,
+    #[serde(default, rename = "allMessagesText")]
+    pub all_messages_text: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -1146,6 +1187,22 @@ mod tests {
         let cmd = RpcCommand::Abort(BareCmd { id: None });
         let v = serde_json::to_value(&cmd).unwrap();
         assert_eq!(v, json!({"type":"abort"}));
+    }
+
+    #[test]
+    fn list_sessions_command_uses_pi_wire_name() {
+        let cmd = RpcCommand::ListSessions(ListSessionsCmd {
+            id: Some("list-1".into()),
+            all_projects: true,
+        });
+        round_trip(
+            &cmd,
+            json!({
+                "type": "list_sessions",
+                "id": "list-1",
+                "allProjects": true
+            }),
+        );
     }
 
     #[test]

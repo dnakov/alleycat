@@ -14,6 +14,7 @@ pub struct HostConfig {
     pub token: String,
     pub relay: Option<String>,
     pub agents: AgentsConfig,
+    pub session: SessionConfig,
 }
 
 impl Default for HostConfig {
@@ -22,6 +23,32 @@ impl Default for HostConfig {
             token: random_token(),
             relay: None,
             agents: AgentsConfig::default(),
+            session: SessionConfig::default(),
+        }
+    }
+}
+
+/// Knobs for the daemon-lifetime session registry. Defaults are tuned for a
+/// phone client that may sit on a flaky relay path: 16 MiB of replay history
+/// covers a long turn, the 10-minute idle TTL keeps a session warm across
+/// short backgrounding, and the 60-second pending grace lets a reconnecting
+/// client re-render approval prompts.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct SessionConfig {
+    pub replay_max_msgs: usize,
+    pub replay_max_bytes: usize,
+    pub idle_ttl_secs: u64,
+    pub pending_grace_secs: u64,
+}
+
+impl Default for SessionConfig {
+    fn default() -> Self {
+        Self {
+            replay_max_msgs: 2048,
+            replay_max_bytes: 16 << 20,
+            idle_ttl_secs: 600,
+            pending_grace_secs: 60,
         }
     }
 }
@@ -32,6 +59,7 @@ pub struct AgentsConfig {
     pub codex: CodexAgentConfig,
     pub pi: PiAgentConfig,
     pub opencode: OpencodeAgentConfig,
+    pub claude: ClaudeAgentConfig,
 }
 
 impl Default for AgentsConfig {
@@ -40,6 +68,7 @@ impl Default for AgentsConfig {
             codex: CodexAgentConfig::default(),
             pi: PiAgentConfig::default(),
             opencode: OpencodeAgentConfig::default(),
+            claude: ClaudeAgentConfig::default(),
         }
     }
 }
@@ -90,6 +119,30 @@ impl Default for OpencodeAgentConfig {
         Self {
             enabled: true,
             bin: "opencode".to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct ClaudeAgentConfig {
+    pub enabled: bool,
+    pub bin: String,
+    /// When true (default), spawn `claude` with `--dangerously-skip-permissions`
+    /// (matches the user's local `claude` shell alias). When false, spawn with
+    /// `--permission-prompt-tool stdio` and bridge each `can_use_tool`
+    /// inbound control_request to a codex `requestApproval` server→client
+    /// request — the connected phone client gets to approve/deny each tool
+    /// call.
+    pub bypass_permissions: bool,
+}
+
+impl Default for ClaudeAgentConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            bin: "claude".to_string(),
+            bypass_permissions: true,
         }
     }
 }
@@ -194,5 +247,6 @@ mod tests {
         assert_eq!(config.agents.codex.port, 8390);
         assert!(config.agents.pi.enabled);
         assert!(config.agents.opencode.enabled);
+        assert!(config.agents.claude.enabled);
     }
 }

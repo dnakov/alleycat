@@ -131,7 +131,11 @@ impl OpencodeClient {
         .await
     }
 
-    pub async fn revert_session(&self, session_id: &str, message_id: &str) -> anyhow::Result<Value> {
+    pub async fn revert_session(
+        &self,
+        session_id: &str,
+        message_id: &str,
+    ) -> anyhow::Result<Value> {
         self.post(
             &format!("/session/{session_id}/revert"),
             json!({"messageID": message_id}),
@@ -148,7 +152,8 @@ impl OpencodeClient {
             Some(id) => json!({"messageID": id}),
             None => json!({}),
         };
-        self.post(&format!("/session/{session_id}/fork"), body).await
+        self.post(&format!("/session/{session_id}/fork"), body)
+            .await
     }
 
     pub async fn list_messages(&self, session_id: &str) -> anyhow::Result<Value> {
@@ -185,11 +190,7 @@ impl OpencodeClient {
     /// is `Array<Array<string>>` ordered to match the question array in the
     /// original `Question.Request` (see
     /// `~/dev/opencode/packages/opencode/src/question/index.ts:Reply`).
-    pub async fn question_reply(
-        &self,
-        request_id: &str,
-        answers: Value,
-    ) -> anyhow::Result<()> {
+    pub async fn question_reply(&self, request_id: &str, answers: Value) -> anyhow::Result<()> {
         self.post(
             &format!("/question/{request_id}/reply"),
             json!({"answers": answers}),

@@ -1,0 +1,1048 @@
+//! `thread/*` request handlers.
+//!
+//! Mapped to the bridge plan's "Thread management" surface. The handlers
+//! coordinate three resources:
+//!
+//! - [`crate::pool::ClaudePool`] — the live `claude -p` subprocesses.
+//! - [`crate::state::ThreadIndexHandle`] — the disk-backed `threads.json`
+//!   metadata (cwd, name, archive flag, preview, fork chain).
+//! - [`crate::state::ConnectionState::defaults`] — the connection-scoped
+//!   defaults applied when the request omits them (model, etc.).
+
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::SystemTime;
+
+use alleycat_bridge_core::{ProcessRole, ProcessSpec, StdioMode};
+use thiserror::Error;
+use tokio::io::AsyncReadExt;
+use uuid::Uuid;
+
+use alleycat_codex_proto as p;
+
+use crate::handlers::model::{normalize_claude_model, normalize_claude_model_id};
+use crate::index::IndexEntry;
+use crate::pool::PoolError;
+use crate::pool::claude_protocol::ControlRequestBody;
+use crate::pool::process::ClaudeProcessError;
+use crate::state::ConnectionState;
+use crate::translate::items::{
+    list_user_message_ids, list_user_message_ids_from_text, messages_text_to_turns,
+    messages_to_turns,
+};
+
+#[derive(Debug, Error)]
+pub enum ThreadError {
+    #[error("invalid params: {0}")]
+    InvalidParams(String),
+    #[error("thread `{0}` not found in index")]
+    NotFound(String),
+    #[error("pool error: {0}")]
+    Pool(String),
+    #[error("claude rpc error: {0}")]
+    ClaudeRpc(String),
+    #[error("method `{0}` is not implemented in claude-bridge v1")]
+    Unsupported(String),
+    #[error(transparent)]
+    Index(#[from] anyhow::Error),
+}
+
+impl ThreadError {
+    pub fn rpc_code(&self) -> i64 {
+        match self {
+            ThreadError::InvalidParams(_) | ThreadError::NotFound(_) => {
+                p::error_codes::INVALID_PARAMS
+            }
+            ThreadError::Unsupported(_) => p::error_codes::METHOD_NOT_FOUND,
+            ThreadError::Pool(_) | ThreadError::ClaudeRpc(_) | ThreadError::Index(_) => {
+                p::error_codes::INTERNAL_ERROR
+            }
+        }
+    }
+
+    fn pool(err: PoolError) -> Self {
+        Self::Pool(format!("{err:#}"))
+    }
+}
+
+// ============================================================================
+// thread/start
+// ============================================================================
+
+pub async fn handle_thread_start(
+    state: &Arc<ConnectionState>,
+    params: p::ThreadStartParams,
+) -> Result<p::ThreadStartResponse, ThreadError> {
+    let cwd = resolve_cwd(params.cwd.as_deref())?;
+    let defaults = state.defaults();
+
+    let model = normalize_claude_model(params.model.clone().or_else(|| defaults.model.clone()));
+    let system_prompt = defaults.system_prompt.clone();
+
+    let (thread_id, _handle) = state
+        .claude_pool()
+        .acquire_for_new_thread(&cwd, model.clone(), system_prompt)
+        .await
+        .map_err(ThreadError::pool)?;
+
+    // Real claude does not emit `system/init` until the first user message
+    // arrives on stdin (verified empirically and against the Anthropic SDK).
+    // Awaiting init here would deadlock — we'd wait 30s, claude would exit,
+    // and the bridge would error. The pump in `turn::handle_turn_start`
+    // refreshes the init cache as a normal first-event side effect once the
+    // user envelope is written.
+
+    let now_ms = now_unix_millis();
+    let model_provider = params
+        .model_provider
+        .clone()
+        .or_else(|| defaults.model_provider.clone())
+        .unwrap_or_else(|| "anthropic".to_string());
+    let entry = IndexEntry {
+        thread_id: thread_id.clone(),
+        cwd: cwd.to_string_lossy().into_owned(),
+        name: params.service_name.clone(),
+        preview: String::new(),
+        created_at: now_ms,
+        updated_at: now_ms,
+        archived: false,
+        forked_from_id: None,
+        model_provider: model_provider.clone(),
+        source: p::ThreadSourceKind::AppServer,
+        metadata: crate::index::ClaudeSessionRef {
+            claude_session_path: claude_session_path_for(&cwd, &thread_id),
+            claude_session_id: thread_id.clone(),
+        },
+    };
+    state
+        .thread_index()
+        .insert(entry.clone())
+        .await
+        .map_err(ThreadError::from)?;
+
+    // Emit `thread/started` so codex clients pick up the new thread.
+    if state.should_emit("thread/started") {
+        let frame = notification_frame(p::ServerNotification::ThreadStarted(
+            p::ThreadStartedNotification {
+                thread: thread_from_entry(&entry),
+            },
+        ));
+        let _ = state.send(frame);
+    }
+
+    // Without a captured init, fall back to the cached model (set by the
+    // pump on a previous turn against any thread) or the empty string.
+    let response_model = model
+        .or_else(|| state.caches().last_init.as_ref().map(|i| i.model.clone()))
+        .map(|model| normalize_claude_model_id(&model))
+        .unwrap_or_default();
+    let approval_policy = params
+        .approval_policy
+        .clone()
+        .or(defaults.approval_policy)
+        .unwrap_or(p::AskForApproval::OnRequest);
+    let approvals_reviewer = params
+        .approvals_reviewer
+        .or(defaults.approvals_reviewer)
+        .unwrap_or(p::ApprovalsReviewer::User);
+    let sandbox = sandbox_value(params.sandbox.or(defaults.sandbox));
+    let reasoning_effort = effort_from_params(&params.additional)
+        .or(defaults.reasoning_effort)
+        .or(Some(p::ReasoningEffort::High));
+
+    Ok(p::ThreadStartResponse {
+        thread: thread_from_entry(&entry),
+        model: response_model,
+        model_provider,
+        service_tier: Some(default_service_tier()),
+        cwd: cwd.to_string_lossy().into_owned(),
+        instruction_sources: Vec::new(),
+        approval_policy,
+        approvals_reviewer,
+        sandbox,
+        permission_profile: params
+            .permission_profile
+            .clone()
+            .or_else(|| Some(default_permission_profile())),
+        reasoning_effort,
+    })
+}
+
+// ============================================================================
+// thread/resume
+// ============================================================================
+
+pub async fn handle_thread_resume(
+    state: &Arc<ConnectionState>,
+    params: p::ThreadResumeParams,
+) -> Result<p::ThreadResumeResponse, ThreadError> {
+    let entry = state
+        .thread_index()
+        .lookup(&params.thread_id)
+        .await
+        .ok_or_else(|| ThreadError::NotFound(params.thread_id.clone()))?;
+
+    let cwd = resume_cwd_or_fallback(&entry.cwd, &params.thread_id, state.trust_persisted_cwd());
+    let defaults = state.defaults();
+    let model = normalize_claude_model(params.model.clone().or_else(|| defaults.model.clone()));
+    let system_prompt = defaults.system_prompt.clone();
+
+    let _handle = match state.claude_pool().get(&params.thread_id).await {
+        Some(h) => h,
+        None => state
+            .claude_pool()
+            .acquire_for_resume(params.thread_id.clone(), &cwd, model.clone(), system_prompt)
+            .await
+            .map_err(ThreadError::pool)?,
+    };
+    // Init is deferred to the first `turn/start` — see handle_thread_start
+    // for the rationale (claude only emits init after the first user
+    // envelope arrives on stdin).
+
+    let mut thread = thread_from_entry(&entry);
+    if !params.exclude_turns {
+        let live = state.thread_log(&params.thread_id);
+        thread.turns = if !live.is_empty() {
+            live
+        } else {
+            transcript_turns(state, &entry.metadata.claude_session_path).await?
+        };
+    }
+
+    let response_model = model
+        .or_else(|| state.caches().last_init.as_ref().map(|i| i.model.clone()))
+        .map(|model| normalize_claude_model_id(&model))
+        .unwrap_or_default();
+    let model_provider = params
+        .model_provider
+        .clone()
+        .unwrap_or_else(|| entry.model_provider.clone());
+    let approval_policy = params
+        .approval_policy
+        .clone()
+        .or(defaults.approval_policy)
+        .unwrap_or(p::AskForApproval::OnRequest);
+    let approvals_reviewer = params
+        .approvals_reviewer
+        .or(defaults.approvals_reviewer)
+        .unwrap_or(p::ApprovalsReviewer::User);
+    let sandbox = sandbox_value(params.sandbox.or(defaults.sandbox));
+
+    Ok(p::ThreadResumeResponse {
+        thread,
+        model: response_model,
+        model_provider,
+        service_tier: Some(default_service_tier()),
+        cwd: entry.cwd.clone(),
+        instruction_sources: Vec::new(),
+        approval_policy,
+        approvals_reviewer,
+        sandbox,
+        permission_profile: params
+            .permission_profile
+            .clone()
+            .or_else(|| Some(default_permission_profile())),
+        reasoning_effort: effort_from_params(&params.additional)
+            .or(defaults.reasoning_effort)
+            .or(Some(p::ReasoningEffort::High)),
+    })
+}
+
+// ============================================================================
+// thread/fork
+// ============================================================================
+
+pub async fn handle_thread_fork(
+    state: &Arc<ConnectionState>,
+    params: p::ThreadForkParams,
+) -> Result<p::ThreadForkResponse, ThreadError> {
+    let source = state
+        .thread_index()
+        .lookup(&params.thread_id)
+        .await
+        .ok_or_else(|| ThreadError::NotFound(params.thread_id.clone()))?;
+    let cwd = PathBuf::from(&source.cwd);
+    let defaults = state.defaults();
+    let model = normalize_claude_model(params.model.clone().or_else(|| defaults.model.clone()));
+    let system_prompt = defaults.system_prompt.clone();
+
+    // Mint a new UUID and resume a fresh session id. Local daemon mode keeps
+    // the older "copy the parent's transcript into the new id's slot"
+    // approximation. Remote launcher mode must not copy transcript files into
+    // the bridge process filesystem; it records the remote target path and
+    // relies on the spawned remote agent for subsequent history.
+    let new_thread_id = Uuid::now_v7().to_string();
+    let new_session_path = claude_session_path_for(&cwd, &new_thread_id);
+    if !state.trust_persisted_cwd() {
+        if let Some(parent) = new_session_path.parent() {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .map_err(|e| ThreadError::ClaudeRpc(format!("create fork dir: {e}")))?;
+        }
+        if source.metadata.claude_session_path.exists() {
+            tokio::fs::copy(&source.metadata.claude_session_path, &new_session_path)
+                .await
+                .map_err(|e| ThreadError::ClaudeRpc(format!("copy fork transcript: {e}")))?;
+        }
+    }
+
+    let _handle = state
+        .claude_pool()
+        .acquire_for_resume(new_thread_id.clone(), &cwd, model.clone(), system_prompt)
+        .await
+        .map_err(ThreadError::pool)?;
+    // Init deferred to first turn — see handle_thread_start.
+
+    let now_ms = now_unix_millis();
+    let entry = IndexEntry {
+        thread_id: new_thread_id.clone(),
+        cwd: source.cwd.clone(),
+        name: source.name.clone(),
+        preview: source.preview.clone(),
+        created_at: now_ms,
+        updated_at: now_ms,
+        archived: false,
+        forked_from_id: Some(source.thread_id.clone()),
+        model_provider: source.model_provider.clone(),
+        source: p::ThreadSourceKind::AppServer,
+        metadata: crate::index::ClaudeSessionRef {
+            claude_session_path: new_session_path,
+            claude_session_id: new_thread_id.clone(),
+        },
+    };
+    state
+        .thread_index()
+        .insert(entry.clone())
+        .await
+        .map_err(ThreadError::from)?;
+
+    let mut thread = thread_from_entry(&entry);
+    if !params.exclude_turns {
+        thread.turns = transcript_turns(state, &entry.metadata.claude_session_path).await?;
+    }
+
+    let response_model = model
+        .or_else(|| state.caches().last_init.as_ref().map(|i| i.model.clone()))
+        .map(|model| normalize_claude_model_id(&model))
+        .unwrap_or_default();
+    Ok(p::ThreadForkResponse {
+        thread,
+        model: response_model,
+        model_provider: params
+            .model_provider
+            .clone()
+            .unwrap_or_else(|| source.model_provider.clone()),
+        service_tier: Some(default_service_tier()),
+        cwd: source.cwd.clone(),
+        instruction_sources: Vec::new(),
+        approval_policy: params
+            .approval_policy
+            .clone()
+            .or(defaults.approval_policy)
+            .unwrap_or(p::AskForApproval::OnRequest),
+        approvals_reviewer: params
+            .approvals_reviewer
+            .or(defaults.approvals_reviewer)
+            .unwrap_or(p::ApprovalsReviewer::User),
+        sandbox: sandbox_value(params.sandbox.or(defaults.sandbox)),
+        permission_profile: params
+            .permission_profile
+            .clone()
+            .or_else(|| Some(default_permission_profile())),
+        reasoning_effort: effort_from_params(&params.additional)
+            .or(defaults.reasoning_effort)
+            .or(Some(p::ReasoningEffort::High)),
+    })
+}
+
+// ============================================================================
+// thread/archive / unarchive
+// ============================================================================
+
+pub async fn handle_thread_archive(
+    state: &Arc<ConnectionState>,
+    params: p::ThreadArchiveParams,
+) -> Result<p::ThreadArchiveResponse, ThreadError> {
+    let changed = state
+        .thread_index()
+        .set_archived(&params.thread_id, true)
+        .await
+        .map_err(ThreadError::from)?;
+    if !changed {
+        return Err(ThreadError::NotFound(params.thread_id));
+    }
+    if state.should_emit("thread/archived") {
+        let frame = notification_frame(p::ServerNotification::ThreadArchived(p::ThreadIdOnly {
+            thread_id: params.thread_id.clone(),
+        }));
+        let _ = state.send(frame);
+    }
+    Ok(p::ThreadArchiveResponse::default())
+}
+
+pub async fn handle_thread_unarchive(
+    state: &Arc<ConnectionState>,
+    params: p::ThreadUnarchiveParams,
+) -> Result<p::ThreadUnarchiveResponse, ThreadError> {
+    let changed = state
+        .thread_index()
+        .set_archived(&params.thread_id, false)
+        .await
+        .map_err(ThreadError::from)?;
+    if !changed {
+        return Err(ThreadError::NotFound(params.thread_id));
+    }
+    let entry = state
+        .thread_index()
+        .lookup(&params.thread_id)
+        .await
+        .ok_or_else(|| ThreadError::NotFound(params.thread_id.clone()))?;
+    if state.should_emit("thread/unarchived") {
+        let frame = notification_frame(p::ServerNotification::ThreadUnarchived(p::ThreadIdOnly {
+            thread_id: params.thread_id.clone(),
+        }));
+        let _ = state.send(frame);
+    }
+    Ok(p::ThreadUnarchiveResponse {
+        thread: thread_from_entry(&entry),
+    })
+}
+
+// ============================================================================
+// thread/name/set
+// ============================================================================
+
+pub async fn handle_thread_set_name(
+    state: &Arc<ConnectionState>,
+    params: p::ThreadSetNameParams,
+) -> Result<p::ThreadSetNameResponse, ThreadError> {
+    let trimmed = params.name.trim().to_string();
+    let stored = if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.clone())
+    };
+    let changed = state
+        .thread_index()
+        .set_name(&params.thread_id, stored.clone())
+        .await
+        .map_err(ThreadError::from)?;
+    if !changed {
+        return Err(ThreadError::NotFound(params.thread_id.clone()));
+    }
+    if state.should_emit("thread/name/updated") {
+        let frame = notification_frame(p::ServerNotification::ThreadNameUpdated(
+            p::ThreadNameUpdatedNotification {
+                thread_id: params.thread_id.clone(),
+                thread_name: stored,
+            },
+        ));
+        let _ = state.send(frame);
+    }
+    Ok(p::ThreadSetNameResponse::default())
+}
+
+// ============================================================================
+// thread/compact/start
+// ============================================================================
+
+pub async fn handle_thread_compact_start(
+    state: &Arc<ConnectionState>,
+    params: p::ThreadCompactStartParams,
+) -> Result<p::ThreadCompactStartResponse, ThreadError> {
+    let handle = state
+        .claude_pool()
+        .get(&params.thread_id)
+        .await
+        .ok_or_else(|| ThreadError::NotFound(params.thread_id.clone()))?;
+
+    // claude treats `/compact` as an inline slash command in the user
+    // envelope. Fire-and-forget; the matching `thread/compacted` notification
+    // arrives via the event pump on the next `result`.
+    let envelope = crate::pool::claude_protocol::ClaudeInbound::User(
+        crate::pool::claude_protocol::ClaudeUserMessageEnvelope {
+            message: crate::pool::claude_protocol::ClaudeUserMessage {
+                role: crate::pool::claude_protocol::ClaudeUserRole::User,
+                content: crate::pool::claude_protocol::ClaudeUserContent::Text(
+                    "/compact".to_string(),
+                ),
+            },
+            parent_tool_use_id: None,
+        },
+    );
+    handle
+        .send_serialized(&envelope)
+        .map_err(|e| ThreadError::ClaudeRpc(e.to_string()))?;
+    Ok(p::ThreadCompactStartResponse::default())
+}
+
+// ============================================================================
+// thread/rollback
+// ============================================================================
+
+pub async fn handle_thread_rollback(
+    state: &Arc<ConnectionState>,
+    params: p::ThreadRollbackParams,
+) -> Result<p::ThreadRollbackResponse, ThreadError> {
+    if params.num_turns == 0 {
+        return Err(ThreadError::InvalidParams(
+            "numTurns must be >= 1".to_string(),
+        ));
+    }
+    let entry = state
+        .thread_index()
+        .lookup(&params.thread_id)
+        .await
+        .ok_or_else(|| ThreadError::NotFound(params.thread_id.clone()))?;
+
+    // Walk the on-disk transcript and pick the user message we want to rewind
+    // *to* — i.e. the most recent message we want to keep. Codex's semantic
+    // is "drop the last numTurns user-anchored turns"; rewind_files's semantic
+    // (per the SDK signature) is "rewind to (i.e. immediately after) this
+    // user message". So with N user messages and numTurns=K we keep the
+    // first (N - K) and target the (N - K - 1)-th id.
+    let path = std::path::PathBuf::from(&entry.metadata.claude_session_path);
+    let user_ids = transcript_user_message_ids(state, &path).await?;
+    let n = user_ids.len();
+    let target_index = n
+        .checked_sub(params.num_turns as usize)
+        .and_then(|i| i.checked_sub(1))
+        .ok_or_else(|| {
+            ThreadError::InvalidParams(format!(
+                "thread has {n} user turns; cannot rollback {} (would leave nothing)",
+                params.num_turns
+            ))
+        })?;
+    let target_id = user_ids[target_index].clone();
+
+    // Need a live process to send the control_request. Resume into the pool
+    // if not already loaded — same pattern as `thread/resume`.
+    let handle = match state.claude_pool().get(&params.thread_id).await {
+        Some(h) => h,
+        None => {
+            let cwd = std::path::PathBuf::from(&entry.cwd);
+            state
+                .claude_pool()
+                .acquire_for_resume(params.thread_id.clone(), &cwd, None, None)
+                .await
+                .map_err(ThreadError::pool)?
+        }
+    };
+
+    handle
+        .request_control(
+            ControlRequestBody::RewindFiles {
+                user_message_id: target_id,
+                dry_run: None,
+            },
+            std::time::Duration::from_secs(30),
+        )
+        .await
+        .map_err(|e: ClaudeProcessError| match e {
+            ClaudeProcessError::ControlError { message, .. } => ThreadError::ClaudeRpc(message),
+            other => ThreadError::ClaudeRpc(other.to_string()),
+        })?;
+
+    // Rebuild the Thread snapshot from the (now-rewound) transcript so the
+    // codex client sees the new state.
+    let turns = transcript_turns(state, &path).await?;
+    let mut thread = thread_from_entry(&entry);
+    thread.turns = turns;
+    Ok(p::ThreadRollbackResponse { thread })
+}
+
+// ============================================================================
+// thread/list
+// ============================================================================
+
+pub async fn handle_thread_list(
+    state: &Arc<ConnectionState>,
+    params: p::ThreadListParams,
+) -> Result<p::ThreadListResponse, ThreadError> {
+    // Match codex-rs semantics: omitted `archived` means "non-archived only"
+    // (`unwrap_or(false)`), not "all".
+    let archived = Some(params.archived.unwrap_or(false));
+    let filter = crate::index::ListFilter {
+        archived,
+        cwds: parse_cwd_filter(&params.cwd),
+        search_term: params.search_term.clone(),
+        model_providers: params.model_providers.clone(),
+        source_kinds: params.source_kinds.clone(),
+    };
+    // Default sort is `created_at` per the codex schema.
+    let sort = crate::index::ListSort {
+        key: params.sort_key.unwrap_or(p::ThreadSortKey::CreatedAt),
+        direction: params.sort_direction.unwrap_or(p::SortDirection::Desc),
+    };
+    let limit = alleycat_bridge_core::resolve_list_limit(params.limit);
+    // `use_state_db_only` is accepted but always-true for this bridge: list
+    // is served from the threads.json index, and the JSONL scan-and-repair
+    // hydration happens at startup, not per-list.
+    let _ = params.use_state_db_only;
+
+    let page = state
+        .thread_index()
+        .list(&filter, sort, params.cursor.as_deref(), Some(limit))
+        .await
+        .map_err(ThreadError::from)?;
+
+    let backwards_cursor = page
+        .data
+        .first()
+        .map(|e| alleycat_bridge_core::encode_backwards_cursor(e, sort));
+
+    let loaded: std::collections::HashSet<String> = state
+        .claude_pool()
+        .loaded_thread_ids()
+        .await
+        .into_iter()
+        .filter(|id| !id.starts_with("utility_"))
+        .collect();
+    let data = page
+        .data
+        .into_iter()
+        .map(|entry| {
+            let mut t = thread_from_entry(&entry);
+            if loaded.contains(&t.id) {
+                t.status = p::ThreadStatus::Idle;
+            }
+            t
+        })
+        .collect();
+    Ok(p::ThreadListResponse {
+        data,
+        next_cursor: page.next_cursor,
+        backwards_cursor,
+    })
+}
+
+// ============================================================================
+// thread/loaded/list
+// ============================================================================
+
+pub async fn handle_thread_loaded_list(
+    state: &Arc<ConnectionState>,
+    _params: p::ThreadLoadedListParams,
+) -> p::ThreadLoadedListResponse {
+    let mut data = state.claude_pool().loaded_thread_ids().await;
+    data.retain(|id| !id.starts_with("utility_"));
+    p::ThreadLoadedListResponse {
+        data,
+        next_cursor: None,
+    }
+}
+
+// ============================================================================
+// thread/read
+// ============================================================================
+
+pub async fn handle_thread_read(
+    state: &Arc<ConnectionState>,
+    params: p::ThreadReadParams,
+) -> Result<p::ThreadReadResponse, ThreadError> {
+    let entry = state
+        .thread_index()
+        .lookup(&params.thread_id)
+        .await
+        .ok_or_else(|| ThreadError::NotFound(params.thread_id.clone()))?;
+    let mut thread = thread_from_entry(&entry);
+    if params.include_turns {
+        // Prefer the in-memory log (canonical, captured live from the event
+        // pump) over the on-disk JSONL parse — claude's process flushes
+        // its session file with a small lag, so a fast `thread/read` after
+        // `turn/completed` can otherwise miss the just-completed assistant
+        // message. The JSONL parse remains the cold-start fallback for
+        // threads the bridge hasn't observed on this connection.
+        let live = state.thread_log(&params.thread_id);
+        thread.turns = if !live.is_empty() {
+            live
+        } else {
+            transcript_turns(state, &entry.metadata.claude_session_path).await?
+        };
+    }
+    Ok(p::ThreadReadResponse { thread })
+}
+
+// ============================================================================
+// thread/turns/list
+// ============================================================================
+
+pub async fn handle_thread_turns_list(
+    state: &Arc<ConnectionState>,
+    params: p::ThreadTurnsListParams,
+) -> Result<p::ThreadTurnsListResponse, ThreadError> {
+    if params.cursor.as_deref().is_some_and(|c| !c.is_empty()) {
+        return Ok(p::ThreadTurnsListResponse::default());
+    }
+    let entry = state
+        .thread_index()
+        .lookup(&params.thread_id)
+        .await
+        .ok_or_else(|| ThreadError::NotFound(params.thread_id.clone()))?;
+    let live = state.thread_log(&params.thread_id);
+    let mut turns = if !live.is_empty() {
+        live
+    } else {
+        transcript_turns(state, &entry.metadata.claude_session_path).await?
+    };
+    if matches!(
+        params.sort_direction.unwrap_or(p::SortDirection::Desc),
+        p::SortDirection::Desc
+    ) {
+        turns.reverse();
+    }
+    if let Some(limit) = params.limit
+        && (limit as usize) < turns.len()
+    {
+        turns.truncate(limit as usize);
+    }
+    Ok(p::ThreadTurnsListResponse {
+        data: turns,
+        next_cursor: None,
+        backwards_cursor: None,
+    })
+}
+
+// ============================================================================
+// thread/backgroundTerminals/clean
+// ============================================================================
+
+pub async fn handle_thread_background_terminals_clean(
+    _state: &Arc<ConnectionState>,
+    _params: p::ThreadBackgroundTerminalsCleanParams,
+) -> p::ThreadBackgroundTerminalsCleanResponse {
+    p::ThreadBackgroundTerminalsCleanResponse::default()
+}
+
+// ============================================================================
+// helpers
+// ============================================================================
+
+fn resolve_cwd(requested: Option<&str>) -> Result<PathBuf, ThreadError> {
+    match requested {
+        Some(path) if !path.is_empty() => Ok(PathBuf::from(path)),
+        _ => std::env::current_dir().map_err(|e| {
+            ThreadError::InvalidParams(format!("cwd not provided and bridge cwd unavailable: {e}"))
+        }),
+    }
+}
+
+fn resume_cwd_or_fallback(persisted: &str, thread_id: &str, trust_persisted_cwd: bool) -> PathBuf {
+    let original = PathBuf::from(persisted);
+    if trust_persisted_cwd || original.is_dir() {
+        return original;
+    }
+    let fallback = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/"));
+    tracing::warn!(
+        thread_id,
+        original = %original.display(),
+        fallback = %fallback.display(),
+        "persisted thread cwd is missing; falling back to home dir"
+    );
+    fallback
+}
+
+async fn transcript_turns(
+    state: &Arc<ConnectionState>,
+    path: &Path,
+) -> Result<Vec<p::Turn>, ThreadError> {
+    if state.trust_persisted_cwd() {
+        let text = read_transcript_via_launcher(state, path).await?;
+        return Ok(messages_text_to_turns(&text));
+    }
+    messages_to_turns(path).await.map_err(ThreadError::from)
+}
+
+async fn transcript_user_message_ids(
+    state: &Arc<ConnectionState>,
+    path: &Path,
+) -> Result<Vec<String>, ThreadError> {
+    if state.trust_persisted_cwd() {
+        let text = read_transcript_via_launcher(state, path).await?;
+        return Ok(list_user_message_ids_from_text(&text));
+    }
+    list_user_message_ids(path)
+        .await
+        .map_err(|e| ThreadError::ClaudeRpc(format!("reading transcript: {e:#}")))
+}
+
+async fn read_transcript_via_launcher(
+    state: &Arc<ConnectionState>,
+    path: &Path,
+) -> Result<String, ThreadError> {
+    let Some(launcher) = state.launcher() else {
+        return Err(ThreadError::ClaudeRpc(
+            "remote transcript read requested without a launcher".to_string(),
+        ));
+    };
+
+    let mut spec = ProcessSpec::new("cat");
+    spec.role = ProcessRole::ToolCommand;
+    spec.args.push(path.as_os_str().to_os_string());
+    spec.stdin = StdioMode::Null;
+    spec.stdout = StdioMode::Piped;
+    spec.stderr = StdioMode::Piped;
+
+    let mut child = launcher
+        .launch(spec)
+        .await
+        .map_err(|e| ThreadError::ClaudeRpc(format!("launch transcript read: {e}")))?;
+    let mut stdout = child
+        .take_stdout()
+        .ok_or_else(|| ThreadError::ClaudeRpc("transcript read stdout unavailable".to_string()))?;
+    let mut out = Vec::new();
+    stdout
+        .read_to_end(&mut out)
+        .await
+        .map_err(|e| ThreadError::ClaudeRpc(format!("read transcript stdout: {e}")))?;
+
+    let mut err = Vec::new();
+    if let Some(mut stderr) = child.take_stderr() {
+        stderr
+            .read_to_end(&mut err)
+            .await
+            .map_err(|e| ThreadError::ClaudeRpc(format!("read transcript stderr: {e}")))?;
+    }
+
+    let status = child
+        .wait()
+        .await
+        .map_err(|e| ThreadError::ClaudeRpc(format!("wait transcript read: {e}")))?;
+    if !status.success() {
+        let stderr = String::from_utf8_lossy(&err);
+        tracing::warn!(
+            path = %path.display(),
+            status = ?status,
+            stderr = %stderr.trim(),
+            "claude transcript read over launcher failed"
+        );
+        return Ok(String::new());
+    }
+
+    Ok(String::from_utf8_lossy(&out).into_owned())
+}
+
+fn now_unix_millis() -> i64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+fn thread_from_entry(entry: &IndexEntry) -> p::Thread {
+    crate::index::entry_to_thread(entry)
+}
+
+/// Default `permissionProfile` matching codex's `{type: "disabled"}` shape
+/// for threads with no named profile. claude doesn't expose a profile
+/// system; emitting null leaves codex clients rendering "unconfigured",
+/// which mismatches the rest of the spec.
+fn default_permission_profile() -> p::PermissionProfile {
+    serde_json::json!({ "type": "disabled" })
+}
+
+/// `serviceTier` is the OpenAI account tier flag (upstream schema enum is
+/// `"fast" | "flex" | null`). claude has no equivalent — `null` is the
+/// correct shape, and bridges should not invent an enum value the spec
+/// doesn't define.
+fn default_service_tier() -> p::ServiceTier {
+    serde_json::Value::Null
+}
+
+fn sandbox_value(mode: Option<p::SandboxMode>) -> p::SandboxPolicy {
+    match mode {
+        Some(p::SandboxMode::ReadOnly) => serde_json::json!({ "type": "readOnly" }),
+        Some(p::SandboxMode::DangerFullAccess) => {
+            serde_json::json!({ "type": "dangerFullAccess" })
+        }
+        Some(p::SandboxMode::WorkspaceWrite) | None => {
+            serde_json::json!({ "type": "workspaceWrite" })
+        }
+    }
+}
+
+fn parse_cwd_filter(value: &Option<serde_json::Value>) -> Option<Vec<String>> {
+    let v = value.as_ref()?;
+    match v {
+        serde_json::Value::String(s) => Some(vec![s.clone()]),
+        serde_json::Value::Array(arr) => Some(
+            arr.iter()
+                .filter_map(|x| x.as_str().map(str::to_string))
+                .collect(),
+        ),
+        _ => None,
+    }
+}
+
+fn effort_from_params(
+    additional: &std::collections::HashMap<String, serde_json::Value>,
+) -> Option<p::ReasoningEffort> {
+    additional.get("effort").and_then(parse_effort)
+}
+
+fn parse_effort(value: &serde_json::Value) -> Option<p::ReasoningEffort> {
+    match value.as_str()? {
+        "minimal" => Some(p::ReasoningEffort::Minimal),
+        "low" => Some(p::ReasoningEffort::Low),
+        "medium" => Some(p::ReasoningEffort::Medium),
+        "high" => Some(p::ReasoningEffort::High),
+        _ => None,
+    }
+}
+
+/// Mirror claude's on-disk session-file convention:
+/// `~/.claude/projects/<encoded-cwd>/<session_id>.jsonl`.
+fn claude_session_path_for(cwd: &std::path::Path, session_id: &str) -> PathBuf {
+    let encoded = encode_cwd(cwd);
+    let mut path =
+        crate::index::claude_projects_dir().unwrap_or_else(|| PathBuf::from(".claude/projects"));
+    path.push(encoded);
+    path.push(format!("{session_id}.jsonl"));
+    path
+}
+
+/// Encode a cwd the way claude does on disk:
+///  - canonicalize so macOS `/var/...` resolves to `/private/var/...` (claude
+///    does this on its side; without it, sessions written to a tempdir under
+///    `/var/folders/...` won't match the bridge's lookup path);
+///  - then replace every non-alphanumeric byte with `-` (claude's actual
+///    rule — `/T/.tmp` becomes `-T--tmp`, not `-T-.tmp`).
+fn encode_cwd(cwd: &std::path::Path) -> String {
+    let canonical = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+    let s = canonical.to_string_lossy();
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch);
+        } else {
+            out.push('-');
+        }
+    }
+    out
+}
+
+fn notification_frame(notif: p::ServerNotification) -> p::JsonRpcMessage {
+    let value = serde_json::to_value(&notif).expect("ServerNotification serializes");
+    let method = value
+        .get("method")
+        .and_then(|m| m.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let params = value.get("params").cloned();
+    p::JsonRpcMessage::Notification(p::JsonRpcNotification {
+        jsonrpc: p::JsonRpcVersion,
+        method,
+        params,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn encode_cwd_strips_slashes() {
+        assert_eq!(
+            encode_cwd(std::path::Path::new("/Users/me/dev/proj")),
+            "-Users-me-dev-proj"
+        );
+    }
+
+    #[test]
+    fn parse_cwd_filter_handles_string_array_null() {
+        use serde_json::json;
+        assert_eq!(
+            parse_cwd_filter(&Some(json!("/repo"))),
+            Some(vec!["/repo".to_string()])
+        );
+        assert_eq!(
+            parse_cwd_filter(&Some(json!(["/a", "/b"]))),
+            Some(vec!["/a".to_string(), "/b".to_string()])
+        );
+        assert_eq!(parse_cwd_filter(&None), None);
+        assert_eq!(parse_cwd_filter(&Some(json!(null))), None);
+    }
+
+    #[test]
+    fn sandbox_value_round_trips_each_mode() {
+        use serde_json::json;
+        assert_eq!(
+            sandbox_value(Some(p::SandboxMode::ReadOnly)),
+            json!({"type": "readOnly"})
+        );
+        assert_eq!(
+            sandbox_value(Some(p::SandboxMode::DangerFullAccess)),
+            json!({"type": "dangerFullAccess"})
+        );
+        assert_eq!(sandbox_value(None), json!({"type": "workspaceWrite"}));
+    }
+
+    #[test]
+    fn parse_effort_recognizes_codex_levels() {
+        use serde_json::json;
+        assert!(matches!(
+            parse_effort(&json!("minimal")),
+            Some(p::ReasoningEffort::Minimal)
+        ));
+        assert!(matches!(
+            parse_effort(&json!("high")),
+            Some(p::ReasoningEffort::High)
+        ));
+        assert!(parse_effort(&json!("xhigh")).is_none());
+        assert!(parse_effort(&json!(42)).is_none());
+    }
+
+    #[test]
+    fn rollback_rejects_zero_turns() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let err = handle_thread_rollback(
+                &dummy_state().await,
+                p::ThreadRollbackParams {
+                    thread_id: "t".into(),
+                    num_turns: 0,
+                },
+            )
+            .await
+            .unwrap_err();
+            assert!(matches!(err, ThreadError::InvalidParams(_)));
+            assert_eq!(err.rpc_code(), p::error_codes::INVALID_PARAMS);
+        });
+    }
+
+    #[test]
+    fn rollback_rejects_unknown_thread() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let err = handle_thread_rollback(
+                &dummy_state().await,
+                p::ThreadRollbackParams {
+                    thread_id: "ghost".into(),
+                    num_turns: 1,
+                },
+            )
+            .await
+            .unwrap_err();
+            assert!(matches!(err, ThreadError::NotFound(_)));
+            assert_eq!(err.rpc_code(), p::error_codes::INVALID_PARAMS);
+        });
+    }
+
+    async fn dummy_state() -> Arc<ConnectionState> {
+        let dir = tempfile::tempdir().unwrap();
+        let index = alleycat_bridge_core::ThreadIndex::<crate::index::ClaudeSessionRef>::open_at(
+            dir.path().join("t.json"),
+        )
+        .await
+        .unwrap();
+        std::mem::forget(dir);
+        let (state, _rx) = ConnectionState::for_test(
+            Arc::new(crate::pool::ClaudePool::new("/dev/null")),
+            index,
+            Default::default(),
+        );
+        state
+    }
+}

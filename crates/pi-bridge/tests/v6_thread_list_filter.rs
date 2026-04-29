@@ -21,7 +21,6 @@ use alleycat_pi_bridge::pool::PiPool;
 use alleycat_pi_bridge::state::{ConnectionState, ThreadDefaults};
 use serde_json::{Value, json};
 use tempfile::TempDir;
-use tokio::sync::mpsc;
 
 use support::{PiHomeFixture, fake_pi_path};
 
@@ -65,14 +64,9 @@ async fn build_state(home: &PiHomeFixture) -> Arc<ConnectionState> {
     // the persist on shutdown. Leak the guard for the test's lifetime.
     std::mem::forget(codex_home);
 
-    let (tx, _rx) = mpsc::unbounded_channel::<p::JsonRpcMessage>();
     let pool = Arc::new(PiPool::new(fake_pi_path()));
-    Arc::new(ConnectionState::new(
-        tx,
-        pool,
-        index,
-        ThreadDefaults::default(),
-    ))
+    let (state, _rx) = ConnectionState::for_test(pool, index, ThreadDefaults::default());
+    state
 }
 
 #[tokio::test]
@@ -146,4 +140,78 @@ async fn thread_list_cwd_filter_array_returns_subset() {
     let mut cwds: Vec<&str> = resp.data.iter().map(|t| t.cwd.as_str()).collect();
     cwds.sort();
     assert_eq!(cwds, vec![cwd_a, cwd_b]);
+}
+
+#[tokio::test]
+async fn thread_list_returns_backwards_cursor_when_data_present() {
+    let home = PiHomeFixture::new();
+    home.seed_session("e-a", "sess-a", &seed_entries("pi-a", "/work/a"));
+    home.seed_session("e-b", "sess-b", &seed_entries("pi-b", "/work/b"));
+
+    let state = build_state(&home).await;
+
+    let resp = handlers::thread::handle_thread_list(&state, p::ThreadListParams::default())
+        .await
+        .expect("thread/list");
+    assert!(
+        resp.backwards_cursor.is_some(),
+        "non-empty page should return a backwards_cursor"
+    );
+}
+
+#[tokio::test]
+async fn thread_list_archived_default_excludes_archived() {
+    use alleycat_pi_bridge::index::ThreadIndex;
+    let home = PiHomeFixture::new();
+    home.seed_session("e-a", "sess-a", &seed_entries("pi-a", "/work/a"));
+    home.seed_session("e-b", "sess-b", &seed_entries("pi-b", "/work/b"));
+
+    let codex_home = TempDir::new().unwrap();
+    let index = ThreadIndex::open(codex_home.path()).await.unwrap();
+    index
+        .hydrate_from_pi_dir(Some(&home.sessions_dir()))
+        .await
+        .unwrap();
+    std::mem::forget(codex_home);
+
+    // Find pi-b's thread id so we can archive it on the index directly.
+    let snapshot = index.snapshot().await;
+    let to_archive = snapshot
+        .iter()
+        .find(|e| e.cwd == "/work/b")
+        .expect("pi-b row")
+        .thread_id
+        .clone();
+    let _ = index.set_archived(&to_archive, true).await.unwrap();
+
+    let pool = std::sync::Arc::new(alleycat_pi_bridge::pool::PiPool::new(fake_pi_path()));
+    let (state, _rx) = alleycat_pi_bridge::state::ConnectionState::for_test(
+        pool,
+        index,
+        alleycat_pi_bridge::state::ThreadDefaults::default(),
+    );
+
+    // Default `archived` (None) → schema says non-archived only.
+    let resp = handlers::thread::handle_thread_list(&state, p::ThreadListParams::default())
+        .await
+        .expect("default thread/list");
+    let cwds: Vec<&str> = resp.data.iter().map(|t| t.cwd.as_str()).collect();
+    assert_eq!(cwds, vec!["/work/a"], "archived row leaked: {cwds:?}");
+
+    // archived=true → only the archived row.
+    let resp = handlers::thread::handle_thread_list(
+        &state,
+        p::ThreadListParams {
+            archived: Some(true),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("archived-only thread/list");
+    let cwds: Vec<&str> = resp.data.iter().map(|t| t.cwd.as_str()).collect();
+    assert_eq!(
+        cwds,
+        vec!["/work/b"],
+        "expected only archived row: {cwds:?}"
+    );
 }

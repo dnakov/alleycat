@@ -1,74 +1,67 @@
 //! Per-connection state.
 //!
-//! One `ConnectionState` exists per connected codex client (today: one stdio
-//! pair, but the design allows for multiplexed transports later). Handlers
-//! borrow it through `Arc<ConnectionState>`; mutable bits live behind their
-//! own locks rather than wrapping the whole struct in a `Mutex`, so a
-//! long-running turn does not block unrelated requests.
+//! `ConnectionState` is the per-stream facade that handlers borrow on every
+//! request. It pins the negotiated capabilities, the per-connection
+//! `ThreadDefaults`, and shared handles to the pi pool, thread index, and
+//! `ProcessLauncher`. Handlers never see `PiBridge` directly — `PiBridge`
+//! constructs a fresh `ConnectionState` per dispatch and threads it through.
+//!
+//! What used to be per-stream — the writer mpsc, the pending server-request
+//! table — has moved into [`bridge_core::session::Session`] so the
+//! producer-side state survives an iroh disconnect. `ConnectionState` now
+//! holds an `Arc<Session>` and delegates `send` / `register_pending_request` /
+//! `resolve_pending_request` / `cancel_all_pending_requests` to it.
 
-use std::collections::HashMap;
-use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::Mutex;
 
-use tokio::sync::Mutex as AsyncMutex;
-use tokio::sync::mpsc;
+use alleycat_bridge_core::ProcessLauncher;
+use alleycat_bridge_core::session::Session;
+use serde_json::Value;
 use tokio::sync::oneshot;
 
 use crate::codex_proto::{
     ApprovalsReviewer, AskForApproval, InitializeCapabilities, JsonRpcMessage, ReasoningEffort,
     RequestId, SandboxMode,
 };
+use crate::index::PiSessionRef;
 use crate::pool::PiPool;
 
 /// Per-connection bridge state. Cheap to clone: every field is either copy
 /// (small enums, atomics in the future) or `Arc`/`Mutex`-protected.
 pub struct ConnectionState {
-    /// Negotiated capabilities. Set once on `initialize`; subsequent reads
-    /// are lock-free via `ArcSwap` semantics simulated through `Mutex` for
-    /// simplicity. Replaced wholesale on the rare reconnect-style flow.
-    capabilities: Mutex<Capabilities>,
+    /// Default config the bridge applies to new threads. Shared via `Arc`
+    /// across the handlers in a single connection so writes from
+    /// `config/value/write` / `config/batchWrite` are visible to the next
+    /// `thread/start` regardless of which handler invocation locked it.
+    defaults: Arc<Mutex<ThreadDefaults>>,
 
-    /// Default config the bridge applies to new threads. Mirrors the keys
-    /// codex's `ThreadStartParams` accepts but with bridge defaults filled in.
-    /// Mutable so `config/value/write` and `config/batchWrite` can update it.
-    defaults: Mutex<ThreadDefaults>,
+    /// Daemon-lifetime session for this `(node_id, agent)` pair. Owns the
+    /// writer mpsc, replay ring, and pending server-request table. The
+    /// per-stream `ConnectionState` is constructed fresh on every iroh
+    /// stream attachment but the session it points at survives.
+    session: Arc<Session>,
 
-    /// Outbound notification sink — anything written here goes back to the
-    /// codex client as a JSON-RPC frame. Set up by main.rs once the writer
-    /// task is running.
-    notification_tx: mpsc::UnboundedSender<JsonRpcMessage>,
-
-    /// In-flight server→client requests we are waiting on. Keyed by the
-    /// request id we sent to the client; the oneshot resolves with the
-    /// raw JSON `result` body so handlers can deserialize into the specific
-    /// response type they expect.
-    pending_server_requests: AsyncMutex<HashMap<RequestId, PendingServerRequest>>,
-
-    /// Pi process pool. Concrete `Arc<PiPool>` rather than a trait object —
-    /// pi-runtime and handlers are tightly coupled within the same crate, and
-    /// the index team's `fake-pi` subprocess harness already gives tests a
-    /// real-process seam (better than a mock trait), so the trait abstraction
-    /// added churn without a real seam to defend.
+    /// Pi process pool.
     pi_pool: Arc<PiPool>,
 
-    /// Thread index handle (threads.json). Implemented by `crate::index::*`.
+    /// Thread index handle (threads.json).
     thread_index: Arc<dyn ThreadIndexHandle>,
+
+    /// Process launcher used by `command/exec` and the pool. Carries the
+    /// daemon's `LocalLauncher` (or, in Litter, an `SshLauncher`) without
+    /// the handlers needing to know which.
+    launcher: Arc<dyn ProcessLauncher>,
+
+    /// Trust indexed thread cwd values without checking local filesystem
+    /// existence. Embedders that run the agent somewhere else, like Litter's
+    /// SSH launcher, need the cwd to be validated by that remote process.
+    trust_persisted_cwd: bool,
 }
 
 /// Negotiated client capabilities. Defaults to "no opt-outs, no experimental
 /// API" so handlers can call `should_emit` even before `initialize` lands.
-#[derive(Debug, Clone, Default)]
-pub struct Capabilities {
-    pub experimental_api: bool,
-    /// Methods the client asked us to suppress for this connection. Stored as
-    /// a `HashSet` for O(1) `should_emit` checks.
-    pub opt_out_notification_methods: HashSet<String>,
-    /// Latest `clientInfo.name`/`title`/`version` triple, useful for logs.
-    pub client_name: Option<String>,
-    pub client_title: Option<String>,
-    pub client_version: Option<String>,
-}
+pub use alleycat_bridge_core::state::Capabilities;
 
 /// Bridge defaults for a new thread. These are seeded on construction and
 /// can be overridden per-`thread/start` request via `ThreadStartParams`.
@@ -85,14 +78,6 @@ pub struct ThreadDefaults {
     pub service_name: Option<String>,
 }
 
-/// Slot for one in-flight server→client request awaiting the client's reply.
-pub struct PendingServerRequest {
-    /// JSON-RPC method that was sent (for logs and timeout messages).
-    pub method: String,
-    /// Resolved with the `result` JSON value the client returned.
-    pub responder: oneshot::Sender<Result<serde_json::Value, ServerRequestError>>,
-}
-
 #[derive(Debug, Clone)]
 pub enum ServerRequestError {
     /// Client reported a JSON-RPC error.
@@ -103,62 +88,56 @@ pub enum ServerRequestError {
     TimedOut,
 }
 
-// === index handle trait ====================================================
-//
-// `state.rs` still uses a trait object for the thread index because the index
-// crate evolves independently and is touched by fewer call sites; the small
-// abstraction cost is worth it. The pi pool went the other way — see
-// `pi_pool` above.
+impl From<alleycat_bridge_core::state::ServerRequestError> for ServerRequestError {
+    fn from(value: alleycat_bridge_core::state::ServerRequestError) -> Self {
+        match value {
+            alleycat_bridge_core::state::ServerRequestError::Rpc(err) => Self::Rpc {
+                code: err.code,
+                message: err.message,
+            },
+            alleycat_bridge_core::state::ServerRequestError::ConnectionClosed => {
+                Self::ConnectionClosed
+            }
+            alleycat_bridge_core::state::ServerRequestError::TimedOut => Self::TimedOut,
+        }
+    }
+}
+
+// === index handle alias ===================================================
 
 pub use crate::index::{IndexEntry, ListFilter, ListPage, ListSort};
 
-/// Handler-facing surface of the thread index. The concrete implementation
-/// lives in [`crate::index::ThreadIndex`]; handlers and tests program against
-/// `Arc<dyn ThreadIndexHandle>` so an in-memory stub can stand in for the
-/// disk-backed store.
-///
-/// Note: `loaded_thread_ids` returns *every* thread id the index knows about
-/// (i.e. every pi session it has ingested). The `thread/loaded/list` codex
-/// method is about pi processes the bridge has actively spawned — that
-/// information lives on the pi pool. Handlers should intersect the two when
-/// producing the codex response.
-#[async_trait::async_trait]
-pub trait ThreadIndexHandle: Send + Sync + 'static {
-    async fn lookup(&self, thread_id: &str) -> Option<IndexEntry>;
-    async fn insert(&self, entry: IndexEntry) -> anyhow::Result<()>;
-    async fn set_archived(&self, thread_id: &str, archived: bool) -> anyhow::Result<bool>;
-    async fn set_name(&self, thread_id: &str, name: Option<String>) -> anyhow::Result<bool>;
-    async fn update_preview_and_updated_at(
-        &self,
-        thread_id: &str,
-        preview: String,
-        updated_at: chrono::DateTime<chrono::Utc>,
-    ) -> anyhow::Result<()>;
-    async fn list(
-        &self,
-        filter: &ListFilter,
-        sort: ListSort,
-        cursor: Option<&str>,
-        limit: Option<u32>,
-    ) -> anyhow::Result<ListPage>;
-    async fn loaded_thread_ids(&self) -> Vec<String>;
-}
+/// Handler-facing surface of the thread index. Marker trait that automatically
+/// extends `bridge_core::ThreadIndexHandle<PiSessionRef>` so existing
+/// `Arc<dyn ThreadIndexHandle>` callsites keep compiling. The blanket
+/// `impl<T: ?Sized + ...>` covers both concrete impls (`ThreadIndex<PiSessionRef>`)
+/// and the in-memory test stubs without forcing them to implement two traits.
+pub trait ThreadIndexHandle: alleycat_bridge_core::ThreadIndexHandle<PiSessionRef> {}
+impl<T: ?Sized + alleycat_bridge_core::ThreadIndexHandle<PiSessionRef>> ThreadIndexHandle for T {}
 
 impl ConnectionState {
     pub fn new(
-        notification_tx: mpsc::UnboundedSender<JsonRpcMessage>,
+        session: Arc<Session>,
         pi_pool: Arc<PiPool>,
         thread_index: Arc<dyn ThreadIndexHandle>,
-        defaults: ThreadDefaults,
+        defaults: Arc<Mutex<ThreadDefaults>>,
+        launcher: Arc<dyn ProcessLauncher>,
+        trust_persisted_cwd: bool,
     ) -> Self {
         Self {
-            capabilities: Mutex::new(Capabilities::default()),
-            defaults: Mutex::new(defaults),
-            notification_tx,
-            pending_server_requests: AsyncMutex::new(HashMap::new()),
+            defaults,
+            session,
             pi_pool,
             thread_index,
+            launcher,
+            trust_persisted_cwd,
         }
+    }
+
+    /// Underlying session — exposed for callers that need session-scoped
+    /// request id minting (see `approval::send_server_request`).
+    pub fn session(&self) -> &Arc<Session> {
+        &self.session
     }
 
     /// Replace the negotiated capabilities. Called from `handlers::lifecycle`
@@ -170,30 +149,27 @@ impl ConnectionState {
         client_version: Option<String>,
         caps: Option<&InitializeCapabilities>,
     ) {
-        let mut slot = self.capabilities.lock().unwrap();
-        slot.client_name = client_name;
-        slot.client_title = client_title;
-        slot.client_version = client_version;
-        slot.experimental_api = caps.is_some_and(|c| c.experimental_api);
-        slot.opt_out_notification_methods = caps
+        let opt_out = caps
             .and_then(|c| c.opt_out_notification_methods.as_ref())
             .map(|v| v.iter().cloned().collect())
             .unwrap_or_default();
+        self.session.set_capabilities(Capabilities {
+            experimental_api: caps.is_some_and(|c| c.experimental_api),
+            opt_out_notification_methods: opt_out,
+            client_name,
+            client_title,
+            client_version,
+        });
     }
 
     /// Snapshot the current capabilities. Cheap clone of a small struct.
     pub fn capabilities(&self) -> Capabilities {
-        self.capabilities.lock().unwrap().clone()
+        self.session.capabilities()
     }
 
     /// True if the connection has not opted out of `method`.
     pub fn should_emit(&self, method: &str) -> bool {
-        !self
-            .capabilities
-            .lock()
-            .unwrap()
-            .opt_out_notification_methods
-            .contains(method)
+        self.session.should_emit(method)
     }
 
     /// Snapshot the bridge thread defaults.
@@ -208,57 +184,72 @@ impl ConnectionState {
     }
 
     /// Send an outbound JSON-RPC frame (notification, response, or
-    /// server→client request) to the client. Returns `Err` only if the
-    /// writer task has already exited, which generally means the connection
-    /// is shutting down.
+    /// server→client request) to the client.
     pub fn send(&self, msg: JsonRpcMessage) -> Result<(), SendError> {
-        self.notification_tx
-            .send(msg)
-            .map_err(|_| SendError::ConnectionClosed)
+        match serde_json::to_value(&msg) {
+            Ok(value) => {
+                self.session.enqueue(value);
+                Ok(())
+            }
+            Err(_) => Err(SendError::ConnectionClosed),
+        }
     }
 
-    /// Register an in-flight server→client request. Returns a oneshot the
-    /// caller awaits for the client's response (or an error/timeout).
+    /// Register an in-flight server→client request.
     pub async fn register_pending_request(
         &self,
         request_id: RequestId,
         method: String,
-    ) -> oneshot::Receiver<Result<serde_json::Value, ServerRequestError>> {
+        params: Value,
+    ) -> oneshot::Receiver<Result<Value, ServerRequestError>> {
         let (tx, rx) = oneshot::channel();
-        self.pending_server_requests.lock().await.insert(
-            request_id,
-            PendingServerRequest {
-                method,
-                responder: tx,
-            },
-        );
+        let key = request_id.to_string();
+        let (core_tx, core_rx) =
+            oneshot::channel::<Result<Value, alleycat_bridge_core::state::ServerRequestError>>();
+        self.session.register_pending(key, method, params, core_tx);
+        tokio::spawn(async move {
+            let mapped = match core_rx.await {
+                Ok(Ok(v)) => Ok(v),
+                Ok(Err(e)) => Err(e.into()),
+                Err(_) => Err(ServerRequestError::ConnectionClosed),
+            };
+            let _ = tx.send(mapped);
+        });
         rx
     }
 
     /// Resolve an in-flight server→client request with the client's response.
-    /// Returns `false` if no matching request is pending (already resolved or
-    /// timed out).
     pub async fn resolve_pending_request(
         &self,
         request_id: &RequestId,
-        result: Result<serde_json::Value, ServerRequestError>,
+        result: Result<Value, ServerRequestError>,
     ) -> bool {
-        let Some(slot) = self.pending_server_requests.lock().await.remove(request_id) else {
-            return false;
+        let mapped: Result<Value, alleycat_bridge_core::state::ServerRequestError> = match result {
+            Ok(v) => Ok(v),
+            Err(ServerRequestError::Rpc { code, message }) => {
+                Err(alleycat_bridge_core::state::ServerRequestError::Rpc(
+                    alleycat_bridge_core::JsonRpcError {
+                        code,
+                        message,
+                        data: None,
+                    },
+                ))
+            }
+            Err(ServerRequestError::ConnectionClosed) => {
+                Err(alleycat_bridge_core::state::ServerRequestError::ConnectionClosed)
+            }
+            Err(ServerRequestError::TimedOut) => {
+                Err(alleycat_bridge_core::state::ServerRequestError::TimedOut)
+            }
         };
-        let _ = slot.responder.send(result);
-        true
+        self.session
+            .resolve_pending(&request_id.to_string(), mapped)
     }
 
     /// Cancel every outstanding server→client request, e.g. on connection
-    /// shutdown. Each waiting handler receives `ConnectionClosed`.
+    /// shutdown.
     pub async fn cancel_all_pending_requests(&self) {
-        let mut slot = self.pending_server_requests.lock().await;
-        for (_id, pending) in slot.drain() {
-            let _ = pending
-                .responder
-                .send(Err(ServerRequestError::ConnectionClosed));
-        }
+        self.session.cancel_all_pending();
     }
 
     pub fn pi_pool(&self) -> &Arc<PiPool> {
@@ -268,10 +259,45 @@ impl ConnectionState {
     pub fn thread_index(&self) -> &Arc<dyn ThreadIndexHandle> {
         &self.thread_index
     }
+
+    /// Process launcher used by `command/exec` and the pool.
+    pub fn launcher(&self) -> &Arc<dyn ProcessLauncher> {
+        &self.launcher
+    }
+
+    pub fn trust_persisted_cwd(&self) -> bool {
+        self.trust_persisted_cwd
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
 pub enum SendError {
     #[error("connection writer is closed")]
     ConnectionClosed,
+}
+
+impl ConnectionState {
+    /// Build a `ConnectionState` for tests, backed by an in-memory session
+    /// and a `LocalLauncher`.
+    pub fn for_test(
+        pi_pool: Arc<PiPool>,
+        thread_index: Arc<dyn ThreadIndexHandle>,
+        defaults: ThreadDefaults,
+    ) -> (
+        Arc<Self>,
+        tokio::sync::mpsc::UnboundedReceiver<alleycat_bridge_core::session::Sequenced>,
+    ) {
+        let session = Arc::new(Session::new("pi", "test".into(), 64, 1 << 20));
+        let attach = session.install_attachment(None);
+        let launcher: Arc<dyn ProcessLauncher> = Arc::new(alleycat_bridge_core::LocalLauncher);
+        let state = Arc::new(Self::new(
+            session,
+            pi_pool,
+            thread_index,
+            Arc::new(Mutex::new(defaults)),
+            launcher,
+            false,
+        ));
+        (state, attach.live_rx)
+    }
 }

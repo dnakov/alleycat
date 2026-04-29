@@ -41,6 +41,10 @@ pub struct ActiveTurn {
     /// message is observed. Used by T3/T4 to drive `item/started` /
     /// `item/agentMessage/delta` / `item/completed`.
     pub current_assistant_message_id: Option<String>,
+    /// Wall-clock seconds when the turn started. Captured at `turn/start`
+    /// so the `turn/completed` event (fired async by `session.idle`) can
+    /// report `startedAt`/`completedAt`/`durationMs` like codex does.
+    pub started_at: i64,
 }
 
 /// Codex `TokenUsageBreakdown` mirror — kept as plain i64 fields so we can
@@ -99,6 +103,15 @@ pub struct BridgeState {
     /// Cache of part kind keyed by part id, populated by `message.part.updated`
     /// and consumed by `message.part.delta` (T4) for routing.
     part_kind: Mutex<HashMap<String, PartKind>>,
+    /// Per-reasoning-part accumulated text. Drained when emitting the
+    /// matching `item/completed` Reasoning notification.
+    reasoning_text: Mutex<HashMap<String, String>>,
+    /// Reasoning part ids grouped by their parent assistant message id, in
+    /// order of first sighting. Populated when `message.part.updated` fires
+    /// for a reasoning part; consumed when `message.updated` for the parent
+    /// message reports completion (so we close out reasoning items in the
+    /// same lifecycle frame as the AgentMessage item).
+    reasoning_parts_by_message: Mutex<HashMap<String, Vec<String>>>,
 }
 
 impl BridgeState {
@@ -207,6 +220,41 @@ impl BridgeState {
             .get(part_id)
             .copied()
             .unwrap_or(PartKind::Other)
+    }
+
+    /// Append `delta` to the reasoning-part text accumulator for `part_id`.
+    pub fn append_reasoning_text(&self, part_id: &str, delta: &str) {
+        let mut map = self.reasoning_text.lock().unwrap();
+        let entry = map.entry(part_id.to_string()).or_default();
+        entry.push_str(delta);
+    }
+
+    /// Take the accumulated reasoning text for `part_id` and forget it.
+    pub fn take_reasoning_text(&self, part_id: &str) -> String {
+        self.reasoning_text
+            .lock()
+            .unwrap()
+            .remove(part_id)
+            .unwrap_or_default()
+    }
+
+    /// Register a reasoning `part_id` as belonging to assistant `message_id`,
+    /// preserving first-seen order.
+    pub fn register_reasoning_part(&self, message_id: &str, part_id: &str) {
+        let mut map = self.reasoning_parts_by_message.lock().unwrap();
+        let entry = map.entry(message_id.to_string()).or_default();
+        if !entry.iter().any(|id| id == part_id) {
+            entry.push(part_id.to_string());
+        }
+    }
+
+    /// Take the (ordered) reasoning part ids registered against `message_id`.
+    pub fn take_reasoning_parts(&self, message_id: &str) -> Vec<String> {
+        self.reasoning_parts_by_message
+            .lock()
+            .unwrap()
+            .remove(message_id)
+            .unwrap_or_default()
     }
 }
 

@@ -18,8 +18,8 @@ use serde_json::json;
 mod support;
 
 use support::{
-    FakeServerState, await_captured_body, bring_up_bridge,
-    read_until_server_request, send_server_response,
+    FakeServerState, await_captured_body, bring_up_bridge, read_until_server_request,
+    send_server_response,
 };
 
 #[tokio::test]
@@ -36,7 +36,10 @@ async fn question_asked_two_questions_round_trip() {
                 "time":{"created":1000,"updated":1000}
             }),
         );
-        st.route("GET /provider", json!({"all":[],"default":[],"connected":[]}));
+        st.route(
+            "GET /provider",
+            json!({"all":[],"default":[],"connected":[]}),
+        );
         st.route("POST /question/q_1/reply", json!({}));
     }
     let mut fx = bring_up_bridge("v6", Arc::clone(&state)).await;
@@ -130,7 +133,10 @@ async fn question_asked_missing_answer_pads_with_empty_array() {
                 "time":{"created":1000,"updated":1000}
             }),
         );
-        st.route("GET /provider", json!({"all":[],"default":[],"connected":[]}));
+        st.route(
+            "GET /provider",
+            json!({"all":[],"default":[],"connected":[]}),
+        );
         st.route("POST /question/q_2/reply", json!({}));
     }
     let mut fx = bring_up_bridge("v6-pad", Arc::clone(&state)).await;

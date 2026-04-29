@@ -60,7 +60,6 @@ use alleycat_pi_bridge::pool::PiPool;
 use alleycat_pi_bridge::state::{ConnectionState, ThreadDefaults, ThreadIndexHandle};
 use serde_json::{Value, json};
 use tempfile::TempDir;
-use tokio::sync::mpsc;
 use tokio::time::timeout;
 
 use support::{fake_pi_path, write_script};
@@ -111,16 +110,14 @@ async fn run_approval_scenario(decision: Value) -> ApprovalScenario {
     let index = ThreadIndex::open_at(index_dir.path().join("threads.json"))
         .await
         .expect("index open");
-    let (out_tx, out_rx) = mpsc::unbounded_channel::<p::JsonRpcMessage>();
-    let state = Arc::new(ConnectionState::new(
-        out_tx,
+    let (state, out_rx) = ConnectionState::for_test(
         pool.clone(),
         Arc::clone(&index) as Arc<dyn ThreadIndexHandle>,
         ThreadDefaults {
             approval_policy: Some(p::AskForApproval::OnRequest),
             ..Default::default()
         },
-    ));
+    );
 
     // Mint a thread + acquire a fake-pi process for it.
     let thread_id = format!("thr-{}", uuid::Uuid::now_v7());
@@ -135,8 +132,6 @@ async fn run_approval_scenario(decision: Value) -> ApprovalScenario {
     index
         .insert(IndexEntry {
             thread_id: thread_id.clone(),
-            pi_session_path: cwd.path().join("session.jsonl"),
-            pi_session_id: "pi-session-1".into(),
             cwd: cwd.path().to_string_lossy().into_owned(),
             name: None,
             preview: String::new(),
@@ -146,6 +141,10 @@ async fn run_approval_scenario(decision: Value) -> ApprovalScenario {
             forked_from_id: None,
             model_provider: "fake".into(),
             source: p::ThreadSourceKind::AppServer,
+            metadata: alleycat_pi_bridge::PiSessionRef {
+                pi_session_path: cwd.path().join("session.jsonl"),
+                pi_session_id: "pi-session-1".into(),
+            },
         })
         .await
         .expect("insert index row");
@@ -171,19 +170,15 @@ async fn run_approval_scenario(decision: Value) -> ApprovalScenario {
     //   replies via `state.resolve_pending_request(id, Ok({decision}))`.
     let state_for_responder = Arc::clone(&state);
     let decision_for_responder = decision.clone();
-    let frame_capture = Arc::new(tokio::sync::Mutex::new(Vec::<p::JsonRpcMessage>::new()));
+    let frame_capture = Arc::new(tokio::sync::Mutex::new(Vec::<serde_json::Value>::new()));
     let frame_capture_for_responder = Arc::clone(&frame_capture);
     let responder = tokio::spawn(async move {
         let mut rx = out_rx;
-        while let Some(frame) = rx.recv().await {
+        while let Some(seq) = rx.recv().await {
+            let value = seq.payload;
             // Snapshot every frame we see so the test can assert on the
             // notification stream after the turn ends.
-            frame_capture_for_responder.lock().await.push(frame.clone());
-
-            let value = match serde_json::to_value(&frame) {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
+            frame_capture_for_responder.lock().await.push(value.clone());
             // Notifications: check for turn/completed to exit early. The
             // test holds an `Arc<ConnectionState>` plus the pump holds
             // one — neither drops while we're awaiting `recv`, so we'd
@@ -230,7 +225,6 @@ async fn run_approval_scenario(decision: Value) -> ApprovalScenario {
         let captured = frames.lock().await.clone();
         let methods: Vec<String> = captured
             .iter()
-            .filter_map(|f| serde_json::to_value(f).ok())
             .filter_map(|v| v.get("method").and_then(|m| m.as_str()).map(str::to_string))
             .collect();
         eprintln!("v4_approval: turn/completed timeout. methods seen: {methods:?}");
@@ -265,25 +259,21 @@ struct ApprovalScenario {
     prompt_response: p::TurnStartResponse,
     /// Every JSON-RPC frame the bridge emitted on the outbound channel,
     /// in order.
-    frames: Vec<p::JsonRpcMessage>,
+    frames: Vec<serde_json::Value>,
     /// Newline-separated list of pi command types the fake-pi observed.
     command_log: String,
     saw_turn_completed: bool,
 }
 
 async fn wait_for_turn_completed(
-    frames: &Arc<tokio::sync::Mutex<Vec<p::JsonRpcMessage>>>,
+    frames: &Arc<tokio::sync::Mutex<Vec<serde_json::Value>>>,
     deadline: Duration,
 ) -> bool {
     let outcome = timeout(deadline, async {
         loop {
             {
                 let guard = frames.lock().await;
-                for frame in guard.iter() {
-                    let value = match serde_json::to_value(frame) {
-                        Ok(v) => v,
-                        Err(_) => continue,
-                    };
+                for value in guard.iter() {
                     if value.get("method") == Some(&json!("turn/completed")) {
                         return true;
                     }
@@ -300,10 +290,9 @@ fn pi_commands(log: &str) -> Vec<&str> {
     log.lines().filter(|l| !l.is_empty()).collect()
 }
 
-fn methods_seen(frames: &[p::JsonRpcMessage]) -> Vec<String> {
+fn methods_seen(frames: &[serde_json::Value]) -> Vec<String> {
     frames
         .iter()
-        .filter_map(|f| serde_json::to_value(f).ok())
         .filter_map(|v| v.get("method").and_then(|m| m.as_str()).map(str::to_string))
         .collect()
 }

@@ -19,8 +19,8 @@ use serde_json::{Value, json};
 mod support;
 
 use support::{
-    FakeServerState, await_captured_body, bring_up_bridge,
-    read_until_server_request, send_server_response,
+    FakeServerState, await_captured_body, bring_up_bridge, read_until_server_request,
+    send_server_response,
 };
 
 #[tokio::test]
@@ -37,7 +37,10 @@ async fn permission_asked_bash_routes_to_command_approval_and_replies_reject() {
                 "time":{"created":1000,"updated":1000}
             }),
         );
-        st.route("GET /provider", json!({"all":[],"default":[],"connected":[]}));
+        st.route(
+            "GET /provider",
+            json!({"all":[],"default":[],"connected":[]}),
+        );
         // Capture-only route — body is what we assert on.
         st.route("POST /permission/perm_1/reply", json!({}));
     }
@@ -109,7 +112,10 @@ async fn permission_asked_write_routes_to_file_change_approval_and_replies_alway
                 "time":{"created":1000,"updated":1000}
             }),
         );
-        st.route("GET /provider", json!({"all":[],"default":[],"connected":[]}));
+        st.route(
+            "GET /provider",
+            json!({"all":[],"default":[],"connected":[]}),
+        );
         st.route("POST /permission/perm_2/reply", json!({}));
     }
     let mut fx = bring_up_bridge("v4-fs", Arc::clone(&state)).await;
@@ -175,7 +181,10 @@ async fn permission_asked_accept_replies_once() {
                 "time":{"created":1000,"updated":1000}
             }),
         );
-        st.route("GET /provider", json!({"all":[],"default":[],"connected":[]}));
+        st.route(
+            "GET /provider",
+            json!({"all":[],"default":[],"connected":[]}),
+        );
         st.route("POST /permission/perm_3/reply", json!({}));
     }
     let mut fx = bring_up_bridge("v4-once", Arc::clone(&state)).await;

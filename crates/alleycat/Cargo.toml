@@ -3,20 +3,35 @@ name = "alleycat"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+description = "Iroh-backed daemon that multiplexes local coding agents (Codex, Pi, OpenCode, Claude) onto a single QUIC connection for paired clients."
+
+[package.metadata.wix]
+upgrade-guid = "E0126DB2-9ACB-4245-9B6A-A497BCFF90F9"
+path-guid = "A02D0DC0-0B03-4376-B2EA-4314A3DB1B33"
+license = false
+eula = false
 
 [[bin]]
 name = "alleycat"
 path = "src/main.rs"
 
 [dependencies]
-alleycat-bridge-core = { path = "../bridge-core" }
-alleycat-opencode-bridge = { path = "../opencode-bridge" }
-alleycat-pi-bridge = { path = "../pi-bridge" }
+alleycat-bridge-core = { workspace = true }
+alleycat-claude-bridge = { workspace = true }
+alleycat-opencode-bridge = { workspace = true }
+alleycat-pi-bridge = { workspace = true }
 anyhow.workspace = true
+arc-swap.workspace = true
+async-trait.workspace = true
 clap.workspace = true
 directories.workspace = true
 fd-lock.workspace = true
 hex.workspace = true
+hostname.workspace = true
 iroh.workspace = true
 qrcodegen = "1"
 rand.workspace = true
@@ -26,8 +41,15 @@ sha2.workspace = true
 tokio.workspace = true
 toml.workspace = true
 tracing.workspace = true
+tracing-appender.workspace = true
 tracing-subscriber.workspace = true
 which.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+[target.'cfg(target_os = "windows")'.dependencies]
+mslnk = "0.1"
 
 [dev-dependencies]
 tempfile.workspace = true

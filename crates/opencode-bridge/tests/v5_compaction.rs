@@ -61,7 +61,10 @@ async fn compact_start_calls_summarize_then_session_compacted_emits_thread_compa
     )
     .await;
     let compact_resp = read_until_response(&mut fx.read, 3).await;
-    assert!(compact_resp["result"].is_object(), "expected `{{}}` ack: {compact_resp:?}");
+    assert!(
+        compact_resp["result"].is_object(),
+        "expected `{{}}` ack: {compact_resp:?}"
+    );
 
     // Confirm summarize was called with the right payload.
     let body = await_captured_body(
@@ -80,7 +83,8 @@ async fn compact_start_calls_summarize_then_session_compacted_emits_thread_compa
         "type": "session.compacted",
         "properties": { "sessionID": "ses_v5" }
     }));
-    let notif = read_until_notification(&mut fx.read, "thread/compacted", Duration::from_secs(3)).await;
+    let notif =
+        read_until_notification(&mut fx.read, "thread/compacted", Duration::from_secs(3)).await;
     assert_eq!(notif["params"]["threadId"], thread_id);
 
     fx.shutdown().await;
@@ -108,13 +112,7 @@ async fn compact_start_with_no_explicit_model_uses_config_providers_default() {
     }
     let mut fx = bring_up_bridge("v5b", state.clone()).await;
 
-    send(
-        &mut fx.write,
-        2,
-        "thread/start",
-        json!({"cwd":"/tmp/v5"}),
-    )
-    .await;
+    send(&mut fx.write, 2, "thread/start", json!({"cwd":"/tmp/v5"})).await;
     let started = read_until_response(&mut fx.read, 2).await;
     let thread_id = started["result"]["thread"]["id"]
         .as_str()

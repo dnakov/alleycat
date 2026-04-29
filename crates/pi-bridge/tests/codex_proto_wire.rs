@@ -148,6 +148,7 @@ fn agent_message_delta_notification_method_name() {
         turn_id: "turn_1".to_string(),
         item_id: "item_1".to_string(),
         delta: "hi".to_string(),
+        parent_item_id: None,
     });
     let v = serde_json::to_value(&n).unwrap();
     assert_eq!(v.get("method").unwrap(), &json!("item/agentMessage/delta"),);
@@ -164,6 +165,7 @@ fn item_completed_notification_envelope() {
         },
         thread_id: "t".to_string(),
         turn_id: "u".to_string(),
+        parent_item_id: None,
     });
     let v = serde_json::to_value(&n).unwrap();
     assert_eq!(v.get("method").unwrap(), &json!("item/completed"));

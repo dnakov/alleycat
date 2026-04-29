@@ -23,8 +23,7 @@ type SseInjector = Arc<Mutex<Option<TcpStream>>>;
 
 #[tokio::test]
 async fn reasoning_text_delta_routes_to_reasoning_text_delta_topic() {
-    let (mut read, mut write, sse_injector, _state_dir, server_task) =
-        bring_up_bridge().await;
+    let (mut read, mut write, sse_injector, _state_dir, server_task) = bring_up_bridge().await;
     let thread_id = start_thread(&mut read, &mut write, "/tmp/opencode-v4").await;
     start_active_turn(&mut read, &mut write, &thread_id).await;
 
@@ -56,9 +55,16 @@ async fn reasoning_text_delta_routes_to_reasoning_text_delta_topic() {
             }
         }),
     );
-    let notif =
-        read_until_one_of(&mut read, &["item/reasoning/textDelta", "item/agentMessage/delta", "item/commandExecution/outputDelta"], Duration::from_secs(3))
-            .await;
+    let notif = read_until_one_of(
+        &mut read,
+        &[
+            "item/reasoning/textDelta",
+            "item/agentMessage/delta",
+            "item/commandExecution/outputDelta",
+        ],
+        Duration::from_secs(3),
+    )
+    .await;
     assert_eq!(
         notif["method"], "item/reasoning/textDelta",
         "reasoning deltas must use the reasoning topic; misroute regression detected"
@@ -73,8 +79,7 @@ async fn reasoning_text_delta_routes_to_reasoning_text_delta_topic() {
 
 #[tokio::test]
 async fn mcp_tool_output_delta_routes_to_mcp_progress() {
-    let (mut read, mut write, sse_injector, _state_dir, server_task) =
-        bring_up_bridge().await;
+    let (mut read, mut write, sse_injector, _state_dir, server_task) = bring_up_bridge().await;
     let thread_id = start_thread(&mut read, &mut write, "/tmp/opencode-v4-mcp").await;
     start_active_turn(&mut read, &mut write, &thread_id).await;
 
@@ -111,9 +116,15 @@ async fn mcp_tool_output_delta_routes_to_mcp_progress() {
             }
         }),
     );
-    let notif =
-        read_until_one_of(&mut read, &["item/mcpToolCall/progress", "item/commandExecution/outputDelta"], Duration::from_secs(3))
-            .await;
+    let notif = read_until_one_of(
+        &mut read,
+        &[
+            "item/mcpToolCall/progress",
+            "item/commandExecution/outputDelta",
+        ],
+        Duration::from_secs(3),
+    )
+    .await;
     assert_eq!(notif["method"], "item/mcpToolCall/progress");
     assert_eq!(notif["params"]["message"], "creating issue...");
 
@@ -123,8 +134,7 @@ async fn mcp_tool_output_delta_routes_to_mcp_progress() {
 
 #[tokio::test]
 async fn bash_tool_output_delta_still_routes_to_command_execution() {
-    let (mut read, mut write, sse_injector, _state_dir, server_task) =
-        bring_up_bridge().await;
+    let (mut read, mut write, sse_injector, _state_dir, server_task) = bring_up_bridge().await;
     let thread_id = start_thread(&mut read, &mut write, "/tmp/opencode-v4-bash").await;
     start_active_turn(&mut read, &mut write, &thread_id).await;
 
@@ -158,9 +168,12 @@ async fn bash_tool_output_delta_still_routes_to_command_execution() {
             }
         }),
     );
-    let notif =
-        read_until_notification(&mut read, "item/commandExecution/outputDelta", Duration::from_secs(3))
-            .await;
+    let notif = read_until_notification(
+        &mut read,
+        "item/commandExecution/outputDelta",
+        Duration::from_secs(3),
+    )
+    .await;
     assert_eq!(notif["params"]["delta"], "hello\n");
 
     drop(write);
@@ -169,8 +182,7 @@ async fn bash_tool_output_delta_still_routes_to_command_execution() {
 
 #[tokio::test]
 async fn apply_patch_tool_output_delta_routes_to_file_change() {
-    let (mut read, mut write, sse_injector, _state_dir, server_task) =
-        bring_up_bridge().await;
+    let (mut read, mut write, sse_injector, _state_dir, server_task) = bring_up_bridge().await;
     let thread_id = start_thread(&mut read, &mut write, "/tmp/opencode-v4-patch").await;
     start_active_turn(&mut read, &mut write, &thread_id).await;
 
@@ -204,9 +216,12 @@ async fn apply_patch_tool_output_delta_routes_to_file_change() {
             }
         }),
     );
-    let notif =
-        read_until_notification(&mut read, "item/fileChange/outputDelta", Duration::from_secs(3))
-            .await;
+    let notif = read_until_notification(
+        &mut read,
+        "item/fileChange/outputDelta",
+        Duration::from_secs(3),
+    )
+    .await;
     assert_eq!(notif["params"]["delta"], "applying patch...");
 
     drop(write);
@@ -346,10 +361,7 @@ async fn send_notification<W: tokio::io::AsyncWrite + Unpin>(
     writer.flush().await.unwrap();
 }
 
-async fn read_until_response<R: tokio::io::AsyncBufRead + Unpin>(
-    reader: &mut R,
-    id: i64,
-) -> Value {
+async fn read_until_response<R: tokio::io::AsyncBufRead + Unpin>(reader: &mut R, id: i64) -> Value {
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             let value: Value = read_json_line(reader).await.unwrap().unwrap();

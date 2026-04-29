@@ -60,7 +60,10 @@ async fn each_tool_kind_routes_to_its_codex_thread_item() {
 
     send(&mut fx.write, 2, "thread/list", json!({"cwd":"/tmp/v7"})).await;
     let list = read_until_response(&mut fx.read, 2).await;
-    let thread_id = list["result"]["data"][0]["id"].as_str().unwrap().to_string();
+    let thread_id = list["result"]["data"][0]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
 
     send(
         &mut fx.write,

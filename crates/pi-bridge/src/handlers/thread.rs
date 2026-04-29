@@ -38,9 +38,10 @@ use uuid::Uuid;
 use crate::codex_proto as p;
 use crate::codex_proto::{SessionSource, SortDirection, ThreadSourceKind};
 use crate::index::IndexEntry;
+use crate::index::{ListFilter, ListSort};
 use crate::pool::pi_protocol as pi;
 use crate::pool::{PiProcessHandle, PoolError};
-use crate::state::{ConnectionState, ListFilter, ListSort};
+use crate::state::ConnectionState;
 use crate::translate::items::translate_messages;
 
 /// Errors a `thread/*` handler can produce. Mapped onto JSON-RPC error
@@ -73,7 +74,12 @@ impl ThreadError {
     }
 
     fn pool(err: PoolError) -> Self {
-        Self::Pool(err.to_string())
+        // Use the alternate `:#` formatter so anyhow's full chain
+        // (e.g., "spawning /Users/.../pi: No such file or directory" instead
+        // of just "spawning /Users/.../pi") surfaces in JSON-RPC error
+        // payloads — otherwise the root cause is hidden behind anyhow's
+        // outermost context.
+        Self::Pool(format!("{err:#}"))
     }
 }
 
@@ -138,8 +144,6 @@ pub async fn handle_thread_start(
         .unwrap_or_else(|| "pi".to_string());
     let entry = IndexEntry {
         thread_id: thread_id.clone(),
-        pi_session_path: pi_session_path.clone(),
-        pi_session_id,
         cwd: cwd.to_string_lossy().into_owned(),
         name: params.service_name.clone(),
         preview: String::new(),
@@ -149,6 +153,10 @@ pub async fn handle_thread_start(
         forked_from_id: None,
         model_provider: model_provider.clone(),
         source: ThreadSourceKind::AppServer,
+        metadata: crate::index::PiSessionRef {
+            pi_session_path: pi_session_path.clone(),
+            pi_session_id,
+        },
     };
     state
         .thread_index()
@@ -156,11 +164,22 @@ pub async fn handle_thread_start(
         .await
         .map_err(ThreadError::from)?;
 
-    let model = params
-        .model
-        .clone()
-        .or_else(|| defaults.model.clone())
-        .unwrap_or_default();
+    // Emit `thread/started` so codex clients (which key UI state off this
+    // notification, not the thread/start response) can reflect the new
+    // thread immediately. Codex itself emits this from the app-server.
+    if state.should_emit("thread/started") {
+        let frame = notification_frame(p::ServerNotification::ThreadStarted(
+            p::ThreadStartedNotification {
+                thread: thread_from_entry(&entry),
+            },
+        ));
+        let _ = state.send(frame);
+    }
+
+    let model = match params.model.clone().or_else(|| defaults.model.clone()) {
+        Some(m) => m,
+        None => pi_current_model_id(&handle).await.unwrap_or_default(),
+    };
     let approval_policy = params
         .approval_policy
         .clone()
@@ -171,19 +190,26 @@ pub async fn handle_thread_start(
         .or(defaults.approvals_reviewer)
         .unwrap_or(p::ApprovalsReviewer::User);
     let sandbox = sandbox_value(params.sandbox.or(defaults.sandbox));
-    let reasoning_effort = params.additional.get("effort").and_then(parse_effort);
+    let reasoning_effort = params
+        .additional
+        .get("effort")
+        .and_then(parse_effort)
+        .or_else(|| Some(p::ReasoningEffort::High));
 
     Ok(p::ThreadStartResponse {
         thread: thread_from_entry(&entry),
         model,
         model_provider,
-        service_tier: None,
+        service_tier: Some(default_service_tier()),
         cwd: cwd.to_string_lossy().into_owned(),
         instruction_sources: Vec::new(),
         approval_policy,
         approvals_reviewer,
         sandbox,
-        permission_profile: params.permission_profile.clone(),
+        permission_profile: params
+            .permission_profile
+            .clone()
+            .or_else(|| Some(default_permission_profile())),
         reasoning_effort,
     })
 }
@@ -202,7 +228,7 @@ pub async fn handle_thread_resume(
         .await
         .ok_or_else(|| ThreadError::NotFound(params.thread_id.clone()))?;
 
-    let cwd = PathBuf::from(&entry.cwd);
+    let cwd = resume_cwd_or_fallback(&entry.cwd, &params.thread_id, state.trust_persisted_cwd());
     let handle = match state.pi_pool().get(&params.thread_id).await {
         Some(h) => h,
         None => state
@@ -217,7 +243,11 @@ pub async fn handle_thread_resume(
     let switch = handle
         .send_request(pi::RpcCommand::SwitchSession(pi::SwitchSessionCmd {
             id: None,
-            session_path: entry.pi_session_path.to_string_lossy().into_owned(),
+            session_path: entry
+                .metadata
+                .pi_session_path
+                .to_string_lossy()
+                .into_owned(),
         }))
         .await
         .map_err(|e| ThreadError::PiRpc(e.to_string()))?;
@@ -242,11 +272,10 @@ pub async fn handle_thread_resume(
     }
 
     let defaults = state.defaults();
-    let model = params
-        .model
-        .clone()
-        .or_else(|| defaults.model.clone())
-        .unwrap_or_default();
+    let model = match params.model.clone().or_else(|| defaults.model.clone()) {
+        Some(m) => m,
+        None => pi_current_model_id(&handle).await.unwrap_or_default(),
+    };
     let model_provider = params
         .model_provider
         .clone()
@@ -266,14 +295,21 @@ pub async fn handle_thread_resume(
         thread,
         model,
         model_provider,
-        service_tier: None,
+        service_tier: Some(default_service_tier()),
         cwd: entry.cwd.clone(),
         instruction_sources: Vec::new(),
         approval_policy,
         approvals_reviewer,
         sandbox,
-        permission_profile: params.permission_profile.clone(),
-        reasoning_effort: params.additional.get("effort").and_then(parse_effort),
+        permission_profile: params
+            .permission_profile
+            .clone()
+            .or_else(|| Some(default_permission_profile())),
+        reasoning_effort: params
+            .additional
+            .get("effort")
+            .and_then(parse_effort)
+            .or_else(|| Some(p::ReasoningEffort::High)),
     })
 }
 
@@ -304,7 +340,7 @@ pub async fn handle_thread_fork(
             .await
             .map_err(ThreadError::pool)?,
     };
-    switch_handle_to(&handle, &source.pi_session_path).await?;
+    switch_handle_to(&handle, &source.metadata.pi_session_path).await?;
 
     let entry_id = leaf_user_entry_id(&handle).await?;
     let fork_resp = handle
@@ -325,8 +361,6 @@ pub async fn handle_thread_fork(
     let now_ms = now_unix_millis();
     let entry = IndexEntry {
         thread_id: new_thread_id.clone(),
-        pi_session_path,
-        pi_session_id,
         cwd: source.cwd.clone(),
         name: source.name.clone(),
         preview: source.preview.clone(),
@@ -336,6 +370,10 @@ pub async fn handle_thread_fork(
         forked_from_id: Some(source.thread_id.clone()),
         model_provider: source.model_provider.clone(),
         source: ThreadSourceKind::AppServer,
+        metadata: crate::index::PiSessionRef {
+            pi_session_path,
+            pi_session_id,
+        },
     };
     state
         .thread_index()
@@ -541,7 +579,7 @@ pub async fn handle_thread_rollback(
             .await
             .map_err(ThreadError::pool)?,
     };
-    switch_handle_to(&handle, &entry.pi_session_path).await?;
+    switch_handle_to(&handle, &entry.metadata.pi_session_path).await?;
 
     // Walk pi's `get_fork_messages` (one entry per user message) backwards
     // and pick the entry id of the (n-th-from-end) user message. That
@@ -595,8 +633,8 @@ pub async fn handle_thread_rollback(
     // use the truncated history.
     let (pi_session_id, pi_session_path) = pi_session_identity(&handle).await?;
     let mut updated = entry.clone();
-    updated.pi_session_id = pi_session_id;
-    updated.pi_session_path = pi_session_path;
+    updated.metadata.pi_session_id = pi_session_id;
+    updated.metadata.pi_session_path = pi_session_path;
     updated.updated_at = now_unix_millis();
     state
         .thread_index()
@@ -617,30 +655,47 @@ pub async fn handle_thread_list(
     state: &Arc<ConnectionState>,
     params: p::ThreadListParams,
 ) -> Result<p::ThreadListResponse, ThreadError> {
+    // Per codex-rs `thread_list`: omitted `archived` means "non-archived
+    // only" (`unwrap_or(false)`), not "all". Bridge-core's `ListFilter` keeps
+    // `Option<bool>` so internal callers can ask for "all" if they need to;
+    // the wire-facing handler defaults to false.
+    let archived = Some(params.archived.unwrap_or(false));
     let filter = ListFilter {
-        archived: params.archived,
+        archived,
         cwds: parse_cwd_filter(&params.cwd),
         search_term: params.search_term.clone(),
         model_providers: params.model_providers.clone(),
         source_kinds: params.source_kinds.clone(),
     };
+    // Schema/codex-rs default is `created_at`. The bridge-core
+    // `ListSort::default()` is `updated_at`, kept for internal callers; the
+    // wire handler must align with the schema.
     let sort = ListSort {
-        key: params.sort_key.unwrap_or(p::ThreadSortKey::UpdatedAt),
+        key: params.sort_key.unwrap_or(p::ThreadSortKey::CreatedAt),
         direction: params.sort_direction.unwrap_or(SortDirection::Desc),
     };
+    let limit = alleycat_bridge_core::resolve_list_limit(params.limit);
+    // `use_state_db_only` is accepted but inherently true for this bridge:
+    // pi-bridge always lists from the threads.json index, and scan-and-repair
+    // hydration runs once at startup (see `index::open_and_hydrate`), not
+    // per-list. Honoring the false default would require a per-call rescan
+    // we deliberately skip to keep `thread/list` cheap.
+    let _ = params.use_state_db_only;
+
     let page = state
         .thread_index()
-        .list(&filter, sort, params.cursor.as_deref(), params.limit)
+        .list(&filter, sort, params.cursor.as_deref(), Some(limit))
         .await
         .map_err(ThreadError::from)?;
 
-    // Index always sets `ThreadStatus::NotLoaded` (see
-    // `IndexEntry::to_thread`). Enrich entries that pi has actually
-    // spawned right now so codex clients can render the correct badge
-    // without a follow-up `thread/loaded/list` call. We don't try to
-    // detect `Active{flags}` here — pi has no notion of "waiting on
-    // approval" we can sniff cheaply, and `WaitingOnUserInput` would
-    // need the approval registry from #18 which is per-turn-only.
+    let backwards_cursor = page
+        .data
+        .first()
+        .map(|e| alleycat_bridge_core::encode_backwards_cursor(e, sort));
+
+    // Enrich entries that pi has actually spawned right now so codex
+    // clients can render the correct badge without a follow-up
+    // `thread/loaded/list` call.
     let loaded: std::collections::HashSet<String> = state
         .pi_pool()
         .loaded_thread_ids()
@@ -651,7 +706,13 @@ pub async fn handle_thread_list(
     let data = page
         .data
         .into_iter()
-        .map(|mut t| {
+        .map(|entry| {
+            // For list responses we use the index's `to_thread`-equivalent
+            // free function, which leaves status at `NotLoaded` so the
+            // pool-membership check below can flip only the loaded ones to
+            // `Idle`. The handler-local `thread_from_entry` is for handlers
+            // (start/resume/read) that always return loaded threads.
+            let mut t = crate::index::thread_from_entry(&entry);
             if loaded.contains(&t.id) {
                 t.status = p::ThreadStatus::Idle;
             }
@@ -662,7 +723,7 @@ pub async fn handle_thread_list(
     Ok(p::ThreadListResponse {
         data,
         next_cursor: page.next_cursor,
-        backwards_cursor: None,
+        backwards_cursor,
     })
 }
 
@@ -707,19 +768,86 @@ pub async fn handle_thread_read(
         let handle = match state.pi_pool().get(&params.thread_id).await {
             Some(h) => h,
             None => {
-                let cwd = PathBuf::from(&entry.cwd);
+                let cwd = resume_cwd_or_fallback(
+                    &entry.cwd,
+                    &params.thread_id,
+                    state.trust_persisted_cwd(),
+                );
                 let h = state
                     .pi_pool()
                     .acquire_utility(Some(&cwd))
                     .await
                     .map_err(ThreadError::pool)?;
-                switch_handle_to(&h, &entry.pi_session_path).await?;
+                switch_handle_to(&h, &entry.metadata.pi_session_path).await?;
                 h
             }
         };
         thread.turns = fetch_turns(&handle).await?;
     }
     Ok(p::ThreadReadResponse { thread })
+}
+
+// ============================================================================
+// thread/turns/list
+// ============================================================================
+//
+// Pi's RPC has no native pagination — `get_messages` returns the full
+// transcript in one shot. Rather than fake a cursor, we return the whole
+// page once with `next_cursor: None` so the phone (which falls back to a
+// non-paginated read when it sees no cursor) gets the full list and stops
+// retrying. `sort_direction` is honored so the phone can request newest-first
+// without re-sorting client-side.
+
+pub async fn handle_thread_turns_list(
+    state: &Arc<ConnectionState>,
+    params: p::ThreadTurnsListParams,
+) -> Result<p::ThreadTurnsListResponse, ThreadError> {
+    // Honor a follow-up paginated call gracefully: any non-empty cursor is
+    // treated as "you've already seen the whole page, return empty" since we
+    // don't paginate.
+    if params.cursor.as_deref().is_some_and(|c| !c.is_empty()) {
+        return Ok(p::ThreadTurnsListResponse::default());
+    }
+
+    let entry = state
+        .thread_index()
+        .lookup(&params.thread_id)
+        .await
+        .ok_or_else(|| ThreadError::NotFound(params.thread_id.clone()))?;
+
+    let handle = match state.pi_pool().get(&params.thread_id).await {
+        Some(h) => h,
+        None => {
+            let cwd =
+                resume_cwd_or_fallback(&entry.cwd, &params.thread_id, state.trust_persisted_cwd());
+            let h = state
+                .pi_pool()
+                .acquire_utility(Some(&cwd))
+                .await
+                .map_err(ThreadError::pool)?;
+            switch_handle_to(&h, &entry.metadata.pi_session_path).await?;
+            h
+        }
+    };
+
+    let mut turns = fetch_turns(&handle).await?;
+    if matches!(
+        params.sort_direction.unwrap_or(SortDirection::Desc),
+        SortDirection::Desc
+    ) {
+        turns.reverse();
+    }
+    if let Some(limit) = params.limit
+        && (limit as usize) < turns.len()
+    {
+        turns.truncate(limit as usize);
+    }
+
+    Ok(p::ThreadTurnsListResponse {
+        data: turns,
+        next_cursor: None,
+        backwards_cursor: None,
+    })
 }
 
 // ============================================================================
@@ -748,6 +876,30 @@ fn resolve_cwd(requested: Option<&str>) -> Result<PathBuf, ThreadError> {
     }
 }
 
+/// Pi threads persist their original `cwd` in the index. Old threads created
+/// in `$TMPDIR` get cleaned up by macOS (and Linux's tmpfiles.d), and threads
+/// from other machines may point to project paths that don't exist locally.
+/// `Command::current_dir` returns ENOENT on spawn, surfaced as
+/// "spawning ...: No such file or directory" with no hint that the *project
+/// dir* — not the binary — is what's missing. Fall back to the home directory
+/// so old threads stay listable/readable rather than wedging the UI.
+fn resume_cwd_or_fallback(persisted: &str, thread_id: &str, trust_persisted_cwd: bool) -> PathBuf {
+    let original = PathBuf::from(persisted);
+    if trust_persisted_cwd || original.is_dir() {
+        return original;
+    }
+    let fallback = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/"));
+    tracing::warn!(
+        thread_id,
+        original = %original.display(),
+        fallback = %fallback.display(),
+        "persisted thread cwd is missing; falling back to home dir"
+    );
+    fallback
+}
+
 fn now_unix_millis() -> i64 {
     SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
@@ -765,7 +917,13 @@ fn thread_from_entry(entry: &IndexEntry) -> p::Thread {
         created_at: entry.created_at,
         updated_at: entry.updated_at,
         status: p::ThreadStatus::Idle,
-        path: Some(entry.pi_session_path.to_string_lossy().into_owned()),
+        path: Some(
+            entry
+                .metadata
+                .pi_session_path
+                .to_string_lossy()
+                .into_owned(),
+        ),
         cwd: entry.cwd.clone(),
         cli_version: format!("alleycat-pi-bridge/{}", env!("CARGO_PKG_VERSION")),
         source: source_kind_to_session_source(entry.source),
@@ -820,10 +978,12 @@ fn parse_cwd_filter(value: &Option<serde_json::Value>) -> Option<Vec<String>> {
 
 fn parse_effort(value: &serde_json::Value) -> Option<p::ReasoningEffort> {
     match value.as_str()? {
+        "none" => Some(p::ReasoningEffort::None),
         "minimal" => Some(p::ReasoningEffort::Minimal),
         "low" => Some(p::ReasoningEffort::Low),
         "medium" => Some(p::ReasoningEffort::Medium),
         "high" => Some(p::ReasoningEffort::High),
+        "xhigh" => Some(p::ReasoningEffort::XHigh),
         _ => None,
     }
 }
@@ -834,10 +994,12 @@ fn params_effort(params: &p::ThreadStartParams) -> Option<p::ReasoningEffort> {
 
 fn pi_thinking_level(effort: p::ReasoningEffort) -> pi::ThinkingLevel {
     match effort {
+        p::ReasoningEffort::None => pi::ThinkingLevel::Off,
         p::ReasoningEffort::Minimal => pi::ThinkingLevel::Minimal,
         p::ReasoningEffort::Low => pi::ThinkingLevel::Low,
         p::ReasoningEffort::Medium => pi::ThinkingLevel::Medium,
         p::ReasoningEffort::High => pi::ThinkingLevel::High,
+        p::ReasoningEffort::XHigh => pi::ThinkingLevel::Xhigh,
     }
 }
 
@@ -846,14 +1008,28 @@ async fn apply_model_override(
     model: &Option<String>,
     provider: &Option<String>,
 ) {
-    let (Some(model_id), Some(provider)) = (model, provider) else {
+    let Some(model) = model
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
         return;
+    };
+    let parsed = model.split_once('/').and_then(|(provider, model_id)| {
+        let provider = provider.trim();
+        let model_id = model_id.trim();
+        (!provider.is_empty() && !model_id.is_empty()).then_some((provider, model_id))
+    });
+    let (provider, model_id) = match (provider.as_deref(), parsed) {
+        (Some(provider), _) if !provider.trim().is_empty() => (provider.trim(), model),
+        (_, Some((provider, model_id))) => (provider, model_id),
+        _ => return,
     };
     let _ = handle
         .send_request(pi::RpcCommand::SetModel(pi::SetModelCmd {
             id: None,
-            provider: provider.clone(),
-            model_id: model_id.clone(),
+            provider: provider.to_string(),
+            model_id: model_id.to_string(),
         }))
         .await;
 }
@@ -896,6 +1072,21 @@ async fn pi_session_identity(
         .map(PathBuf::from)
         .ok_or_else(|| ThreadError::PiRpc("pi did not surface session_file".into()))?;
     Ok((state.session_id, session_path))
+}
+
+/// Ask pi which model it's currently running. Pi exposes the active model
+/// through `get_state`; falls back to `None` when pi can't surface one (e.g.
+/// fresh process before the first prompt).
+async fn pi_current_model_id(handle: &Arc<PiProcessHandle>) -> Option<String> {
+    let resp = handle
+        .send_request(pi::RpcCommand::GetState(pi::BareCmd::default()))
+        .await
+        .ok()?;
+    if !resp.success {
+        return None;
+    }
+    let state: pi::SessionState = serde_json::from_value(resp.data?).ok()?;
+    state.model.map(|m| m.id)
 }
 
 async fn switch_handle_to(
@@ -959,6 +1150,25 @@ async fn fetch_turns(handle: &Arc<PiProcessHandle>) -> Result<Vec<p::Turn>, Thre
     Ok(translate_messages(&data.messages))
 }
 
+/// Default `permissionProfile` value matching codex's stock emission when no
+/// named profile is configured. The bridge has no permission-profile system
+/// of its own — pi sandboxes via the spawned process's filesystem caps —
+/// but emitting `null` here makes codex clients render the thread as
+/// "unconfigured", which is wrong since the underlying agent does enforce
+/// some boundaries. `{type: "disabled"}` is codex's "no named profile, but
+/// the runtime is still doing its thing" shape.
+fn default_permission_profile() -> p::PermissionProfile {
+    serde_json::json!({ "type": "disabled" })
+}
+
+/// `serviceTier` is the OpenAI account tier flag. Upstream schema enum is
+/// `"fast" | "flex" | null` (per
+/// `codex-rs/app-server-protocol/schema/json/v2/ThreadResumeResponse.json`).
+/// pi has no notion of an OpenAI service tier — `null` is the correct shape.
+fn default_service_tier() -> p::ServiceTier {
+    serde_json::Value::Null
+}
+
 fn notification_frame(notif: p::ServerNotification) -> p::JsonRpcMessage {
     let value = serde_json::to_value(&notif).expect("ServerNotification serializes");
     let method = value
@@ -991,28 +1201,23 @@ mod tests {
 
     async fn dummy_state() -> (
         Arc<ConnectionState>,
-        mpsc::UnboundedReceiver<p::JsonRpcMessage>,
+        mpsc::UnboundedReceiver<alleycat_bridge_core::session::Sequenced>,
     ) {
-        let (tx, rx) = mpsc::unbounded_channel();
         let dir = tempfile::tempdir().unwrap();
         let index = crate::index::ThreadIndex::open_at(dir.path().join("threads.json"))
             .await
             .unwrap();
         std::mem::forget(dir);
-        let state = Arc::new(ConnectionState::new(
-            tx,
+        ConnectionState::for_test(
             Arc::new(crate::pool::PiPool::new("/dev/null")),
             index,
             Default::default(),
-        ));
-        (state, rx)
+        )
     }
 
     fn sample_entry(thread_id: &str) -> IndexEntry {
         IndexEntry {
             thread_id: thread_id.into(),
-            pi_session_path: "/tmp/pi/x.jsonl".into(),
-            pi_session_id: "pi-session-x".into(),
             cwd: "/repo".into(),
             name: None,
             preview: "first message".into(),
@@ -1022,6 +1227,10 @@ mod tests {
             forked_from_id: None,
             model_provider: "pi".into(),
             source: ThreadSourceKind::AppServer,
+            metadata: crate::index::PiSessionRef {
+                pi_session_path: "/tmp/pi/x.jsonl".into(),
+                pi_session_id: "pi-session-x".into(),
+            },
         }
     }
 
@@ -1045,7 +1254,7 @@ mod tests {
 
         // Drain and verify the notification frame routes thread/archived.
         let frame = rx.recv().await.unwrap();
-        let value = serde_json::to_value(&frame).unwrap();
+        let value = frame.payload;
         assert_eq!(value["method"], json!("thread/archived"));
         assert_eq!(value["params"]["threadId"], json!("t1"));
     }
@@ -1082,7 +1291,7 @@ mod tests {
         assert_eq!(resp.thread.id, "t2");
 
         let frame = rx.recv().await.unwrap();
-        let value = serde_json::to_value(&frame).unwrap();
+        let value = frame.payload;
         assert_eq!(value["method"], json!("thread/unarchived"));
     }
 
@@ -1107,7 +1316,7 @@ mod tests {
         assert_eq!(row.name.as_deref(), Some("My Thread"));
 
         let frame = rx.recv().await.unwrap();
-        let value = serde_json::to_value(&frame).unwrap();
+        let value = frame.payload;
         assert_eq!(value["method"], json!("thread/name/updated"));
         assert_eq!(value["params"]["threadName"], json!("My Thread"));
     }

@@ -1,0 +1,34 @@
+[package]
+name = "alleycat-bridge-conformance"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+name = "alleycat_bridge_conformance"
+path = "src/lib.rs"
+
+[dependencies]
+alleycat-codex-proto = { workspace = true }
+alleycat-bridge-core = { workspace = true }
+anyhow = { workspace = true }
+# Validates captured frames against the upstream codex-rs JSON schemas. The
+# local `codex-proto` mirror can drift; jsonschema is independent verification.
+jsonschema = "0.36"
+serde = { workspace = true }
+serde_json = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["io-util", "io-std", "macros", "net", "process", "rt-multi-thread", "sync", "time"] }
+tracing = { workspace = true }
+which = { workspace = true }
+
+[dev-dependencies]
+pretty_assertions = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
+
+# Note: we deliberately do NOT depend on the bridge crates here. Conformance
+# treats them as black-box external binaries; `tests/conformance.rs` shells
+# out to `cargo build --bin <name>` at test time. Decoupling the dep graph
+# means a WIP bridge that doesn't compile can't break this test suite from
+# running its other targets.

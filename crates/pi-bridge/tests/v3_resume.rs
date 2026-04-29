@@ -25,7 +25,6 @@ use alleycat_pi_bridge::pool::PiPool;
 use alleycat_pi_bridge::state::{ConnectionState, ThreadDefaults};
 use serde_json::{Value, json};
 use tempfile::TempDir;
-use tokio::sync::mpsc;
 
 use support::{PiHomeFixture, fake_pi_path};
 
@@ -76,19 +75,17 @@ async fn resume_after_state_drop_repopulates_turns_from_jsonl() {
     let codex_home = TempDir::new().unwrap();
 
     // ----- bridge boot #1: discover the seeded session via thread/list ----
-    let (tx1, _rx1) = mpsc::unbounded_channel::<p::JsonRpcMessage>();
     let index1 = ThreadIndex::open(codex_home.path()).await.unwrap();
     index1
         .hydrate_from_pi_dir(Some(&home.sessions_dir()))
         .await
         .unwrap();
     let pool1 = Arc::new(PiPool::new(fake_pi_path()));
-    let state1 = Arc::new(ConnectionState::new(
-        tx1,
+    let (state1, _rx1) = ConnectionState::for_test(
         pool1,
         Arc::clone(&index1) as Arc<dyn alleycat_pi_bridge::state::ThreadIndexHandle>,
         ThreadDefaults::default(),
-    ));
+    );
 
     let list_resp = handlers::thread::handle_thread_list(&state1, p::ThreadListParams::default())
         .await
@@ -115,18 +112,16 @@ async fn resume_after_state_drop_repopulates_turns_from_jsonl() {
     // this matrix will rely on this contract.
 
     // ----- bridge boot #2: a fresh state pointed at the same dirs --------
-    let (tx2, _rx2) = mpsc::unbounded_channel::<p::JsonRpcMessage>();
     let index2 = ThreadIndex::open(codex_home.path()).await.unwrap();
     // No hydration this round — the index should restore from threads.json
     // alone. Asserting that here would tighten the contract: the same row
     // survives a process restart without re-walking the disk.
     let pool2 = Arc::new(PiPool::new(fake_pi_path()));
-    let state2 = Arc::new(ConnectionState::new(
-        tx2,
+    let (state2, _rx2) = ConnectionState::for_test(
         pool2,
         Arc::clone(&index2) as Arc<dyn alleycat_pi_bridge::state::ThreadIndexHandle>,
         ThreadDefaults::default(),
-    ));
+    );
 
     // Sanity: the row survived the threads.json round-trip.
     let restored = state2.thread_index().lookup(&thread_id).await;

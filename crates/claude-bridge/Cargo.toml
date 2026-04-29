@@ -1,0 +1,65 @@
+[package]
+name = "alleycat-claude-bridge"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+description = "Codex app-server façade over `claude -p --output-format stream-json`, used by the alleycat daemon."
+
+[package.metadata.dist]
+dist = false
+
+[package.metadata.wix]
+upgrade-guid = "46CA6C7B-F3B8-4BCF-AE26-15E6F5D3EEED"
+path-guid = "3B9B3B48-84E8-45FA-8C36-3B0FDDFE67F6"
+license = false
+eula = false
+
+[[bin]]
+name = "alleycat-claude-bridge"
+path = "src/main.rs"
+
+# Test-only stand-in for `claude -p --output-format stream-json`. Reads user
+# envelopes on stdin and emits scripted system/stream_event/result lines on
+# stdout. Body lives in `tests/support/fake_claude.rs`; the smoke-tester
+# teammate fills it in for #6 — for #2 the file just needs to exist so the
+# crate compiles.
+[[bin]]
+name = "fake-claude"
+path = "tests/support/fake_claude.rs"
+
+[lib]
+name = "alleycat_claude_bridge"
+path = "src/lib.rs"
+
+[dependencies]
+alleycat-bridge-core = { workspace = true }
+alleycat-codex-proto = { workspace = true }
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+base64 = { workspace = true }
+chrono = { workspace = true }
+dashmap = "6"
+directories = { workspace = true }
+futures = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["io-std"] }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+uuid = { workspace = true }
+
+[features]
+# Mirrors pi-bridge's `test-helpers` feature: lets downstream test crates
+# build against `__test_dangling`-style helpers without going through
+# `#[cfg(test)]`-only items. Always on under `cargo test`.
+test-helpers = []
+
+[dev-dependencies]
+pretty_assertions = { workspace = true }
+tempfile = { workspace = true }

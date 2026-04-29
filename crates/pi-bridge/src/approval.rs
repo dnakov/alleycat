@@ -64,7 +64,6 @@ use std::time::Duration;
 
 use serde_json::Value;
 use thiserror::Error;
-use uuid::Uuid;
 
 use crate::codex_proto::common::AskForApproval;
 use crate::codex_proto::jsonrpc::{JsonRpcMessage, JsonRpcRequest, JsonRpcVersion, RequestId};
@@ -320,9 +319,13 @@ pub async fn send_server_request(
     params: Value,
     timeout: Option<Duration>,
 ) -> Result<Value, ApprovalError> {
-    let req_id = RequestId::String(Uuid::now_v7().to_string());
+    // Mint a session-scoped id so reattach-replay can rebuild the
+    // outstanding-prompt set deterministically. Falls back to a UUID
+    // in tests where the session disambiguator is the default empty one.
+    let req_id_str = state.session().next_request_id();
+    let req_id = RequestId::String(req_id_str);
     let rx = state
-        .register_pending_request(req_id.clone(), method.to_string())
+        .register_pending_request(req_id.clone(), method.to_string(), params.clone())
         .await;
 
     let frame = JsonRpcMessage::Request(JsonRpcRequest {
@@ -365,16 +368,13 @@ mod tests {
 
     fn dummy_state() -> (
         Arc<ConnectionState>,
-        mpsc::UnboundedReceiver<JsonRpcMessage>,
+        mpsc::UnboundedReceiver<alleycat_bridge_core::session::Sequenced>,
     ) {
-        let (tx, rx) = mpsc::unbounded_channel();
-        let s = Arc::new(ConnectionState::new(
-            tx,
+        ConnectionState::for_test(
             Arc::new(crate::pool::PiPool::new("/dev/null")),
             Arc::new(crate::index::testing::NoopThreadIndex),
             Default::default(),
-        ));
-        (s, rx)
+        )
     }
 
     #[test]
@@ -461,7 +461,7 @@ mod tests {
         // The request frame should appear on the outbound channel; pick
         // its id off so the test can synthesize a response.
         let msg = rx.recv().await.expect("frame on outbound channel");
-        let value = serde_json::to_value(&msg).unwrap();
+        let value = msg.payload;
         assert_eq!(
             value["method"],
             json!("item/commandExecution/requestApproval")
@@ -511,7 +511,7 @@ mod tests {
             .await
         });
         let msg = rx.recv().await.unwrap();
-        let value = serde_json::to_value(&msg).unwrap();
+        let value = msg.payload;
         let id_value = value.get("id").cloned().unwrap();
         let req_id: RequestId = serde_json::from_value(id_value).unwrap();
         state
@@ -545,7 +545,7 @@ mod tests {
             .await
         });
         let msg = rx.recv().await.unwrap();
-        let value = serde_json::to_value(&msg).unwrap();
+        let value = msg.payload;
         let id_value = value.get("id").cloned().unwrap();
         let req_id: RequestId = serde_json::from_value(id_value).unwrap();
         state

@@ -1,7 +1,10 @@
 [workspace]
 members = [
     "crates/alleycat",
+    "crates/bridge-conformance",
     "crates/bridge-core",
+    "crates/claude-bridge",
+    "crates/codex-proto",
     "crates/pi-bridge",
     "crates/opencode-bridge",
 ]
@@ -11,8 +14,17 @@ resolver = "3"
 edition = "2024"
 license = "GPL-3.0-only"
 version = "0.1.0"
+authors = ["The Alleycat Authors"]
+repository = "https://github.com/alleycat/alleycat"
+homepage = "https://github.com/alleycat/alleycat"
+readme = "README.md"
 
 [workspace.dependencies]
+alleycat-bridge-core = { path = "crates/bridge-core", version = "0.1" }
+alleycat-codex-proto = { path = "crates/codex-proto", version = "0.1" }
+alleycat-claude-bridge = { path = "crates/claude-bridge", version = "0.1" }
+alleycat-opencode-bridge = { path = "crates/opencode-bridge", version = "0.1" }
+alleycat-pi-bridge = { path = "crates/pi-bridge", version = "0.1" }
 anyhow = "1"
 arc-swap = "1"
 async-trait = "0.1"
@@ -49,3 +61,8 @@ tempfile = "3"
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "gzip"] }
 tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
 url = "2"
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"

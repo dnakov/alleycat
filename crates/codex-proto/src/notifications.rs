@@ -10,6 +10,7 @@ use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value;
 
+use super::account::RateLimitSnapshot;
 use super::common::{ThreadStatus, ThreadTokenUsage, TurnError};
 use super::items::{FileUpdateChange, ThreadItem};
 use super::jsonrpc::RequestId;
@@ -72,6 +73,12 @@ pub enum ServerNotification {
     FileChangePatchUpdated(FileChangePatchUpdatedNotification),
     #[serde(rename = "item/mcpToolCall/progress")]
     McpToolCallProgress(McpToolCallProgressNotification),
+    #[serde(rename = "mcpServer/startupStatus/updated")]
+    McpServerStatusUpdated(McpServerStatusUpdatedNotification),
+    #[serde(rename = "account/rateLimits/updated")]
+    AccountRateLimitsUpdated(AccountRateLimitsUpdatedNotification),
+    #[serde(rename = "item/dynamicToolCall/argumentsDelta")]
+    DynamicToolCallArgumentsDelta(DynamicToolCallArgumentsDeltaNotification),
     #[serde(rename = "thread/compacted")]
     ContextCompacted(ContextCompactedNotification),
     #[serde(rename = "model/rerouted")]
@@ -189,6 +196,8 @@ pub struct ItemStartedNotification {
     pub item: ThreadItem,
     pub thread_id: String,
     pub turn_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_item_id: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -197,6 +206,8 @@ pub struct ItemCompletedNotification {
     pub item: ThreadItem,
     pub thread_id: String,
     pub turn_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_item_id: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -206,6 +217,8 @@ pub struct AgentMessageDeltaNotification {
     pub turn_id: String,
     pub item_id: String,
     pub delta: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_item_id: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -216,6 +229,8 @@ pub struct ReasoningTextDeltaNotification {
     pub item_id: String,
     pub delta: String,
     pub content_index: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_item_id: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -226,6 +241,8 @@ pub struct ReasoningSummaryTextDeltaNotification {
     pub item_id: String,
     pub delta: String,
     pub summary_index: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_item_id: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -244,6 +261,8 @@ pub struct CommandExecutionOutputDeltaNotification {
     pub turn_id: String,
     pub item_id: String,
     pub delta: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_item_id: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -262,6 +281,8 @@ pub struct FileChangeOutputDeltaNotification {
     pub turn_id: String,
     pub item_id: String,
     pub delta: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_item_id: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -273,6 +294,36 @@ pub struct FileChangePatchUpdatedNotification {
     pub changes: Vec<FileUpdateChange>,
 }
 
+/// `mcpServer/startupStatus/updated` — fired by codex during turn startup
+/// while MCP servers are connecting. Mirror of
+/// codex-rs/app-server-protocol/src/protocol/v2.rs:6553.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct McpServerStatusUpdatedNotification {
+    pub name: String,
+    pub status: McpServerStartupState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// `account/rateLimits/updated` — fired by codex when rate-limit windows
+/// shift. Mirror of
+/// `~/dev/codex/codex-rs/app-server-protocol/src/protocol/v2.rs:7303`.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountRateLimitsUpdatedNotification {
+    pub rate_limits: RateLimitSnapshot,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum McpServerStartupState {
+    Starting,
+    Ready,
+    Failed,
+    Cancelled,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct McpToolCallProgressNotification {
@@ -280,6 +331,22 @@ pub struct McpToolCallProgressNotification {
     pub turn_id: String,
     pub item_id: String,
     pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_item_id: Option<String>,
+}
+
+/// `item/dynamicToolCall/argumentsDelta` — streamed input JSON for unclassified
+/// (non-MCP, non-builtin-shaped) tool calls. Used by claude-bridge to surface
+/// `Read`/`Glob`/`Grep`/`Task`/etc. argument streaming.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DynamicToolCallArgumentsDeltaNotification {
+    pub thread_id: String,
+    pub turn_id: String,
+    pub item_id: String,
+    pub delta: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_item_id: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]

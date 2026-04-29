@@ -121,9 +121,7 @@ mod tests {
     /// is sent on each new connection (one entry per connection); when the list
     /// is exhausted the listener stops accepting. Returns the base URL plus a
     /// counter that records how many `/event` requests were served.
-    fn start_fake_sse(
-        frames_per_conn: Vec<Vec<&'static str>>,
-    ) -> (String, Arc<AtomicUsize>) {
+    fn start_fake_sse(frames_per_conn: Vec<Vec<&'static str>>) -> (String, Arc<AtomicUsize>) {
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let addr = listener.local_addr().unwrap();
         let counter = Arc::new(AtomicUsize::new(0));
@@ -176,9 +174,8 @@ mod tests {
 
     #[tokio::test]
     async fn fan_out_delivers_event_to_each_subscriber_exactly_once() {
-        let (base_url, _) = start_fake_sse(vec![
-            vec![r#"{"type":"server.connected","properties":{}}"#],
-        ]);
+        let (base_url, _) =
+            start_fake_sse(vec![vec![r#"{"type":"server.connected","properties":{}}"#]]);
         let client = OpencodeClient::new(base_url, String::new());
         let consumer = SseConsumer::spawn(client);
         let mut a = consumer.subscribe();
@@ -193,8 +190,14 @@ mod tests {
             .expect("subscriber b timed out")
             .expect("subscriber b recv");
 
-        assert_eq!(event_a.get("type").and_then(Value::as_str), Some("server.connected"));
-        assert_eq!(event_b.get("type").and_then(Value::as_str), Some("server.connected"));
+        assert_eq!(
+            event_a.get("type").and_then(Value::as_str),
+            Some("server.connected")
+        );
+        assert_eq!(
+            event_b.get("type").and_then(Value::as_str),
+            Some("server.connected")
+        );
 
         // Each subscriber received exactly one event for that frame.
         assert!(a.try_recv().is_err());
@@ -215,13 +218,23 @@ mod tests {
             .await
             .expect("first event timed out")
             .expect("first event");
-        assert_eq!(first.get("type").and_then(Value::as_str), Some("server.connected"));
+        assert_eq!(
+            first.get("type").and_then(Value::as_str),
+            Some("server.connected")
+        );
 
         let second = tokio::time::timeout(Duration::from_secs(5), rx.recv())
             .await
             .expect("second event (after reconnect) timed out")
             .expect("second event");
-        assert_eq!(second.get("type").and_then(Value::as_str), Some("session.idle"));
-        assert!(counter.load(Ordering::SeqCst) >= 2, "expected at least two /event connections, got {}", counter.load(Ordering::SeqCst));
+        assert_eq!(
+            second.get("type").and_then(Value::as_str),
+            Some("session.idle")
+        );
+        assert!(
+            counter.load(Ordering::SeqCst) >= 2,
+            "expected at least two /event connections, got {}",
+            counter.load(Ordering::SeqCst)
+        );
     }
 }

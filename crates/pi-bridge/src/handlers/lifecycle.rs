@@ -58,8 +58,13 @@ pub fn handle_account_read(
     _state: &Arc<ConnectionState>,
     _params: p::GetAccountParams,
 ) -> p::GetAccountResponse {
+    // pi authenticates via per-provider API keys (OPENAI_API_KEY,
+    // ANTHROPIC_API_KEY, GROQ_API_KEY, ...). There's no chatgpt account
+    // identity to surface, but `Account::ApiKey {}` is the codex shape
+    // for "this client uses raw API keys" — emit it so codex clients
+    // don't render the user as "signed out".
     p::GetAccountResponse {
-        account: None,
+        account: Some(p::Account::ApiKey {}),
         requires_openai_auth: false,
     }
 }

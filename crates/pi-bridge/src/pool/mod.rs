@@ -27,6 +27,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use alleycat_bridge_core::{LocalLauncher, ProcessLauncher};
 use thiserror::Error;
 use tokio::sync::Mutex;
 use uuid::Uuid;
@@ -123,21 +124,49 @@ impl PoolInner {
 }
 
 /// Thread-safe pool of pi processes.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct PiPool {
     inner: Arc<Mutex<PoolInner>>,
     pi_bin: PathBuf,
+    launcher: Arc<dyn ProcessLauncher>,
+}
+
+impl std::fmt::Debug for PiPool {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PiPool")
+            .field("pi_bin", &self.pi_bin)
+            .finish_non_exhaustive()
+    }
 }
 
 impl PiPool {
-    /// Build a pool with default cap and idle TTL. `pi_bin` is the path to
-    /// the `pi-coding-agent` binary the pool will spawn.
+    /// Compatibility constructor: build a pool that uses `LocalLauncher`. Kept
+    /// so the daemon's existing `agents.rs` callsite (`PiPool::new(bin)`)
+    /// keeps compiling unchanged through the A2 → A5 sequence; A5 will
+    /// migrate that callsite to `PiBridge::builder().launcher(...)` and
+    /// drop this shim.
     pub fn new(pi_bin: impl Into<PathBuf>) -> Self {
-        Self::with_limits(pi_bin, DEFAULT_MAX_PROCESSES, DEFAULT_IDLE_TTL)
+        Self::with_launcher(pi_bin, Arc::new(LocalLauncher))
+    }
+
+    /// Build a pool that launches `pi-coding-agent` through `launcher` with
+    /// the default cap + idle TTL. Daemon path uses `Arc::new(LocalLauncher)`;
+    /// Litter substitutes `Arc::new(SshLauncher::new(...))`.
+    pub fn with_launcher(pi_bin: impl Into<PathBuf>, launcher: Arc<dyn ProcessLauncher>) -> Self {
+        Self::with_launcher_and_limits(pi_bin, launcher, DEFAULT_MAX_PROCESSES, DEFAULT_IDLE_TTL)
     }
 
     pub fn with_limits(
         pi_bin: impl Into<PathBuf>,
+        max_processes: usize,
+        idle_ttl: Duration,
+    ) -> Self {
+        Self::with_launcher_and_limits(pi_bin, Arc::new(LocalLauncher), max_processes, idle_ttl)
+    }
+
+    pub fn with_launcher_and_limits(
+        pi_bin: impl Into<PathBuf>,
+        launcher: Arc<dyn ProcessLauncher>,
         max_processes: usize,
         idle_ttl: Duration,
     ) -> Self {
@@ -149,12 +178,18 @@ impl PiPool {
                 idle_ttl,
             })),
             pi_bin: pi_bin.into(),
+            launcher,
         }
     }
 
     /// Path of the pi binary this pool spawns.
     pub fn pi_bin(&self) -> &Path {
         &self.pi_bin
+    }
+
+    /// Process launcher used to spawn pi children.
+    pub fn launcher(&self) -> &Arc<dyn ProcessLauncher> {
+        &self.launcher
     }
 
     /// Spawn a fresh pi process for a brand-new codex thread, mint a thread
@@ -381,7 +416,7 @@ impl PiPool {
             }
         }
 
-        let handle = PiProcessHandle::spawn(cwd, &self.pi_bin)
+        let handle = PiProcessHandle::launch_with(self.launcher.as_ref(), cwd, &self.pi_bin)
             .await
             .map_err(PoolError::Spawn)?;
         let handle = Arc::new(handle);

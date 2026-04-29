@@ -10,20 +10,22 @@
 //! `alleycat_pi_bridge::index::ThreadIndex::open_at(tempdir)` over copying
 //! `InMemoryThreadIndex` here too.
 
-use alleycat_pi_bridge::state::{IndexEntry, ListFilter, ListPage, ListSort, ThreadIndexHandle};
+use alleycat_bridge_core::{IndexEntry, ListFilter, ListPage, ListSort, ThreadIndexHandle};
+use alleycat_pi_bridge::PiSessionRef;
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 
-/// Silent no-op `ThreadIndexHandle`. Construct with `Arc::new(NoopThreadIndex)`.
+/// Silent no-op `ThreadIndexHandle<PiSessionRef>`. Construct with
+/// `Arc::new(NoopThreadIndex)`.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct NoopThreadIndex;
 
 #[async_trait::async_trait]
-impl ThreadIndexHandle for NoopThreadIndex {
-    async fn lookup(&self, _thread_id: &str) -> Option<IndexEntry> {
+impl ThreadIndexHandle<PiSessionRef> for NoopThreadIndex {
+    async fn lookup(&self, _thread_id: &str) -> Option<IndexEntry<PiSessionRef>> {
         None
     }
-    async fn insert(&self, _entry: IndexEntry) -> Result<()> {
+    async fn insert(&self, _entry: IndexEntry<PiSessionRef>) -> Result<()> {
         Ok(())
     }
     async fn set_archived(&self, _thread_id: &str, _archived: bool) -> Result<bool> {
@@ -46,7 +48,7 @@ impl ThreadIndexHandle for NoopThreadIndex {
         _sort: ListSort,
         _cursor: Option<&str>,
         _limit: Option<u32>,
-    ) -> Result<ListPage> {
+    ) -> Result<ListPage<PiSessionRef>> {
         Ok(ListPage {
             data: Vec::new(),
             next_cursor: None,

@@ -136,7 +136,10 @@ pub async fn handle_turn_start(
     state.pi_pool().mark_active(&params.thread_id).await;
 
     let started_at = now_unix_secs();
-    let turn = p::Turn {
+    // Codex shape: the `turn/start` *response* has `startedAt: null` (turn
+    // is in-progress; client doesn't need a wall-clock yet) but the
+    // `turn/started` *notification* carries the actual `startedAt`.
+    let turn_for_notif = p::Turn {
         id: turn_id.clone(),
         items: Vec::new(),
         status: p::TurnStatus::InProgress,
@@ -145,12 +148,45 @@ pub async fn handle_turn_start(
         completed_at: None,
         duration_ms: None,
     };
+    let mut turn = turn_for_notif.clone();
+    turn.started_at = None;
 
     if state.should_emit("turn/started") {
         let frame = notification_frame(p::ServerNotification::TurnStarted(
             p::TurnStartedNotification {
                 thread_id: params.thread_id.clone(),
-                turn: turn.clone(),
+                turn: turn_for_notif,
+            },
+        ));
+        let _ = state.send(frame);
+    }
+
+    // Echo the user input back as a userMessage item lifecycle, the way
+    // codex itself does (see app-server-protocol/src/protocol/v2.rs:5330).
+    // Clients render history from these item events; if we skip the echo,
+    // the user's prompt never shows up in `thread/read`.
+    let user_message_item = p::ThreadItem::UserMessage {
+        id: Uuid::now_v7().to_string(),
+        content: params.input.clone(),
+    };
+    if state.should_emit("item/started") {
+        let frame = notification_frame(p::ServerNotification::ItemStarted(
+            p::ItemStartedNotification {
+                item: user_message_item.clone(),
+                thread_id: params.thread_id.clone(),
+                turn_id: turn_id.clone(),
+                parent_item_id: None,
+            },
+        ));
+        let _ = state.send(frame);
+    }
+    if state.should_emit("item/completed") {
+        let frame = notification_frame(p::ServerNotification::ItemCompleted(
+            p::ItemCompletedNotification {
+                item: user_message_item,
+                thread_id: params.thread_id.clone(),
+                turn_id: turn_id.clone(),
+                parent_item_id: None,
             },
         ));
         let _ = state.send(frame);
@@ -318,18 +354,23 @@ fn clear_active_turn(thread_id: &str) {
 }
 
 async fn apply_overrides(handle: &Arc<PiProcessHandle>, params: &p::TurnStartParams) {
-    if let (Some(model_id), Some(provider)) = (&params.model, &params.model) {
-        // Pi's `set_model` expects both provider + modelId. When only
-        // `model` is supplied (no provider), we have to skip — the pi
-        // catalog is provider-keyed and a bare model id is ambiguous.
-        let _ = (model_id, provider);
+    if let Some((provider, model_id)) = params.model.as_deref().and_then(split_model_selection) {
+        let _ = handle
+            .send_request(pi::RpcCommand::SetModel(pi::SetModelCmd {
+                id: None,
+                provider: provider.to_string(),
+                model_id: model_id.to_string(),
+            }))
+            .await;
     }
     if let Some(effort) = params.effort {
         let level = match effort {
+            p::ReasoningEffort::None => pi::ThinkingLevel::Off,
             p::ReasoningEffort::Minimal => pi::ThinkingLevel::Minimal,
             p::ReasoningEffort::Low => pi::ThinkingLevel::Low,
             p::ReasoningEffort::Medium => pi::ThinkingLevel::Medium,
             p::ReasoningEffort::High => pi::ThinkingLevel::High,
+            p::ReasoningEffort::XHigh => pi::ThinkingLevel::Xhigh,
         };
         let _ = handle
             .send_request(pi::RpcCommand::SetThinkingLevel(pi::SetThinkingLevelCmd {
@@ -338,6 +379,13 @@ async fn apply_overrides(handle: &Arc<PiProcessHandle>, params: &p::TurnStartPar
             }))
             .await;
     }
+}
+
+fn split_model_selection(model: &str) -> Option<(&str, &str)> {
+    let (provider, model_id) = model.trim().split_once('/')?;
+    let provider = provider.trim();
+    let model_id = model_id.trim();
+    (!provider.is_empty() && !model_id.is_empty()).then_some((provider, model_id))
 }
 
 fn notification_frame(notif: p::ServerNotification) -> p::JsonRpcMessage {
@@ -549,12 +597,17 @@ fn state_should_emit(state: &Arc<ConnectionState>, notif: &p::ServerNotification
         p::ServerNotification::FileChangeOutputDelta(_) => "item/fileChange/outputDelta",
         p::ServerNotification::FileChangePatchUpdated(_) => "item/fileChange/patchUpdated",
         p::ServerNotification::McpToolCallProgress(_) => "item/mcpToolCall/progress",
+        p::ServerNotification::DynamicToolCallArgumentsDelta(_) => {
+            "item/dynamicToolCall/argumentsDelta"
+        }
         p::ServerNotification::ContextCompacted(_) => "thread/compacted",
         p::ServerNotification::ModelRerouted(_) => "model/rerouted",
         p::ServerNotification::Warning(_) => "warning",
         p::ServerNotification::ConfigWarning(_) => "configWarning",
         p::ServerNotification::DeprecationNotice(_) => "deprecationNotice",
         p::ServerNotification::ServerRequestResolved(_) => "serverRequest/resolved",
+        p::ServerNotification::McpServerStatusUpdated(_) => "mcpServer/startupStatus/updated",
+        p::ServerNotification::AccountRateLimitsUpdated(_) => "account/rateLimits/updated",
     };
     state.should_emit(method)
 }
@@ -701,21 +754,19 @@ async fn handle_extension_ui_request(args: &EventPumpArgs, req: &pi::ExtensionUi
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::sync::mpsc;
 
     async fn dummy_state() -> Arc<ConnectionState> {
-        let (tx, _rx) = mpsc::unbounded_channel();
         let dir = tempfile::tempdir().unwrap();
         let index = crate::index::ThreadIndex::open_at(dir.path().join("threads.json"))
             .await
             .unwrap();
         std::mem::forget(dir);
-        Arc::new(ConnectionState::new(
-            tx,
+        let (state, _rx) = ConnectionState::for_test(
             Arc::new(crate::pool::PiPool::new("/dev/null")),
             index,
             Default::default(),
-        ))
+        );
+        state
     }
 
     #[tokio::test]

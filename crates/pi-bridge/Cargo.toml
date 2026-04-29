@@ -3,6 +3,20 @@ name = "alleycat-pi-bridge"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+description = "Codex app-server façade over a `pi-coding-agent --mode rpc` process pool, used by the alleycat daemon."
+
+[package.metadata.dist]
+dist = false
+
+[package.metadata.wix]
+upgrade-guid = "2226CC1C-1185-432A-8108-2D030A149E7B"
+path-guid = "B3A615C4-26FB-4520-B259-2FA7DCA66C00"
+license = false
+eula = false
 
 [[bin]]
 name = "alleycat-pi-bridge"
@@ -20,11 +34,14 @@ name = "alleycat_pi_bridge"
 path = "src/lib.rs"
 
 [dependencies]
-alleycat-bridge-core = { path = "../bridge-core" }
+alleycat-bridge-core = { workspace = true }
+alleycat-codex-proto = { workspace = true }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 base64 = { workspace = true }
 chrono = { workspace = true }
+dashmap = "6"
+futures = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

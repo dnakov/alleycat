@@ -5,14 +5,17 @@ use serde::Serialize;
 use serde_json::Value;
 use std::collections::HashMap;
 
-/// `reasoning_effort` levels accepted by codex. Wire is camelCase.
+/// `reasoning_effort` levels accepted by codex. Wire is lowercase per
+/// codex-rs/protocol/src/openai_models.rs:41.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "lowercase")]
 pub enum ReasoningEffort {
+    None,
     Minimal,
     Low,
     Medium,
     High,
+    XHigh,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]

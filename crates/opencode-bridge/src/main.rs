@@ -1,8 +1,30 @@
-use std::sync::Arc;
+use std::ffi::OsString;
+use std::path::PathBuf;
 
-use alleycat_bridge_core::{ServerOptions, serve_unix};
+use alleycat_bridge_core::{ServerOptions, serve_stdio, serve_unix};
 use alleycat_opencode_bridge::OpencodeBridge;
-use alleycat_opencode_bridge::opencode_proc::OpencodeRuntime;
+
+enum Transport {
+    Socket(PathBuf),
+    Stdio,
+}
+
+fn transport_from_env_or_args() -> Transport {
+    if let Some(path) = std::env::var_os("ALLEYCAT_BRIDGE_SOCKET") {
+        return Transport::Socket(PathBuf::from(path));
+    }
+    let mut args = std::env::args_os().skip(1);
+    while let Some(arg) = args.next() {
+        if arg == OsString::from("--socket") {
+            if let Some(path) = args.next() {
+                return Transport::Socket(PathBuf::from(path));
+            }
+        } else if arg == OsString::from("--stdio") {
+            return Transport::Stdio;
+        }
+    }
+    Transport::Stdio
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -14,26 +36,19 @@ async fn main() -> anyhow::Result<()> {
         .with_writer(std::io::stderr)
         .init();
 
-    let socket = std::env::var_os("ALLEYCAT_BRIDGE_SOCKET")
-        .or_else(|| {
-            let mut args = std::env::args_os().skip(1);
-            while let Some(arg) = args.next() {
-                if arg == "--socket" {
-                    return args.next();
-                }
-            }
-            None
-        })
-        .ok_or_else(|| anyhow::anyhow!("missing --socket or ALLEYCAT_BRIDGE_SOCKET"))?;
+    let bridge = OpencodeBridge::builder().from_env().build().await?;
 
-    let runtime = OpencodeRuntime::start_from_env().await?;
-    let bridge = Arc::new(OpencodeBridge::new(runtime).await?);
-    serve_unix(
-        bridge,
-        ServerOptions {
-            socket_path: socket.into(),
-            unlink_stale: true,
-        },
-    )
-    .await
+    match transport_from_env_or_args() {
+        Transport::Socket(path) => {
+            serve_unix(
+                bridge,
+                ServerOptions {
+                    socket_path: path,
+                    unlink_stale: true,
+                },
+            )
+            .await
+        }
+        Transport::Stdio => serve_stdio(bridge).await,
+    }
 }

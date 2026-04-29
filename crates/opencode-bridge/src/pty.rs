@@ -15,6 +15,7 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use futures::{SinkExt, StreamExt};
 use serde_json::{Value, json};
@@ -23,6 +24,11 @@ use tokio_tungstenite::tungstenite::Message;
 use tracing::{debug, warn};
 
 use crate::opencode_client::OpencodeClient;
+
+/// After the PTY websocket closes, the matching `pty.exited` SSE event may
+/// still be in flight via opencode's bus → SSE pipeline. Wait this long
+/// before falling back to `-1`.
+const EXIT_GRACE_PERIOD: Duration = Duration::from_secs(2);
 
 /// Maximum number of streamed chunks buffered per process. Subscribers that
 /// fall behind will see broadcast::error::RecvError::Lagged frames; the SSE
@@ -105,9 +111,17 @@ impl PtyState {
             {
                 warn!(?error, pty_id = %process_for_task.pty_id, "pty websocket task ended with error");
             }
-            // If the websocket closed before SSE delivered an exit, fall back
-            // to exitCode -1 so the buffered caller does not hang forever.
+            // The websocket closes when opencode tears down the PTY — but the
+            // matching `pty.exited` SSE event (which carries the actual exit
+            // code) is published from a *different* effect and is racy. Wait
+            // a short window for `PtyState::finish` to take the sender from
+            // the SSE side; only fall back to -1 if it really didn't arrive.
+            tokio::time::sleep(EXIT_GRACE_PERIOD).await;
             if let Some(tx) = process_for_task.exit_tx.lock().unwrap().take() {
+                warn!(
+                    pty_id = %process_for_task.pty_id,
+                    "pty.exited SSE never arrived after websocket close; reporting exitCode=-1"
+                );
                 let _ = tx.send(-1);
             }
         });
@@ -264,11 +278,7 @@ impl PtyState {
     /// The returned handle lets the test push output into `output`/`stream_tx`
     /// and resolve the exit oneshot via `PtyState::finish`. The write channel
     /// is wired but its receiver is dropped — `process.write(...)` will fail.
-    pub(crate) fn register_for_test(
-        &self,
-        process_id: String,
-        pty_id: String,
-    ) -> Arc<PtyProcess> {
+    pub(crate) fn register_for_test(&self, process_id: String, pty_id: String) -> Arc<PtyProcess> {
         let (write_tx, write_rx) = mpsc::unbounded_channel::<WriteCommand>();
         drop(write_rx);
         let (exit_tx, exit_rx) = oneshot::channel::<i32>();

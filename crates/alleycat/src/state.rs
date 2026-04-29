@@ -43,6 +43,31 @@ pub async fn acquire_lock() -> anyhow::Result<RwLock<std::fs::File>> {
     .context("joining lock open task")?
 }
 
+/// Write the daemon's PID atomically. Used to surface a friendly hint when
+/// `acquire_lock()` finds the lock already held.
+pub fn write_pid_file() -> anyhow::Result<std::path::PathBuf> {
+    let path = paths::daemon_pid_file()?;
+    std::fs::write(&path, format!("{}\n", std::process::id()))
+        .with_context(|| format!("writing {}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    }
+    Ok(path)
+}
+
+/// Read the PID written by `write_pid_file`. Returns `None` if the file is
+/// missing or unparseable.
+pub fn read_pid_file() -> anyhow::Result<Option<u32>> {
+    let path = paths::daemon_pid_file()?;
+    match std::fs::read_to_string(&path) {
+        Ok(raw) => Ok(raw.trim().parse::<u32>().ok()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
 fn parse_secret_key(raw: &str) -> anyhow::Result<SecretKey> {
     let bytes = hex::decode(raw).context("host key must be 32 bytes of lowercase hex")?;
     let bytes: [u8; 32] = bytes

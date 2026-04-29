@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -14,6 +15,12 @@ use crate::state::{ActiveTurn, BridgeState};
 use crate::translate::{input::codex_input_to_parts, parts::message_to_turn_items};
 
 pub struct OpencodeBridge {
+    // Keep the runtime alive for the bridge's lifetime. Dropping it triggers
+    // `kill_on_drop` on the opencode child; if it dropped at the end of
+    // `new()` (the previous behavior, after partial-moving its fields) the
+    // child would be SIGKILL'd the instant the bridge was constructed and
+    // the SSE consumer would immediately error with "connection reset".
+    _runtime: OpencodeRuntime,
     client: OpencodeClient,
     index: Arc<ThreadIndex>,
     state: Arc<BridgeState>,
@@ -24,18 +31,34 @@ pub struct OpencodeBridge {
 impl OpencodeBridge {
     pub async fn new(runtime: OpencodeRuntime) -> anyhow::Result<Self> {
         let state_dir = std::env::var_os("ALLEYCAT_BRIDGE_STATE_DIR")
-            .map(std::path::PathBuf::from)
+            .map(PathBuf::from)
             .unwrap_or_else(|| std::env::temp_dir().join("alleycat-opencode-bridge"));
+        Self::new_with_state_dir(runtime, state_dir).await
+    }
+
+    pub async fn new_with_state_dir(
+        runtime: OpencodeRuntime,
+        state_dir: PathBuf,
+    ) -> anyhow::Result<Self> {
         let index = Arc::new(ThreadIndex::open(state_dir.join("threads.json")).await?);
-        let client = OpencodeClient::new(runtime.base_url, runtime.auth_token);
+        let client = OpencodeClient::new(runtime.base_url.clone(), runtime.auth_token.clone());
         let sse = SseConsumer::spawn(client.clone());
         Ok(Self {
+            _runtime: runtime,
             client,
             index,
             state: Arc::new(BridgeState::default()),
             pty: Arc::new(PtyState::new()),
             sse,
         })
+    }
+
+    /// Shape-parity entry point with `PiBridge::builder()` /
+    /// `ClaudeBridge::builder()`. Either feed it an already-constructed
+    /// `OpencodeRuntime` (e.g. `OpencodeRuntime::external(...)`) or call
+    /// `.from_env()` to defer construction until `build()`.
+    pub fn builder() -> OpencodeBridgeBuilder {
+        OpencodeBridgeBuilder::default()
     }
 
     /// Subscribe a per-connection task that translates SSE events into codex
@@ -63,9 +86,7 @@ impl OpencodeBridge {
                         crate::translate::events::route_event(rc, (*event).clone()).await;
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
-                        tracing::warn!(
-                            "opencode SSE subscriber lagged, skipped {skipped} events"
-                        );
+                        tracing::warn!("opencode SSE subscriber lagged, skipped {skipped} events");
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 }
@@ -113,7 +134,23 @@ impl OpencodeBridge {
             "instructionSources": [],
             "approvalPolicy": params.get("approvalPolicy").cloned().unwrap_or(json!("untrusted")),
             "approvalsReviewer": params.get("approvalsReviewer").cloned().unwrap_or(json!("user")),
-            "sandbox": {"mode":"workspace-write"}
+            // codex `SandboxPolicy` is tagged on `type` (e.g.
+            // `{type:"workspace-write"}`), not `mode`. See
+            // codex-rs/protocol/src/protocol.rs:SandboxPolicy.
+            "sandbox": {"type":"workspace-write"},
+            // Synthesize codex-default values for the optional config
+            // fields opencode doesn't model itself. Without these the
+            // wire shape diverges (codex emits content where bridges
+            // emit null), even though the fields ARE present.
+            "permissionProfile": params
+                .get("permissionProfile")
+                .cloned()
+                .unwrap_or_else(|| json!({"type": "disabled"})),
+            "reasoningEffort": params
+                .get("reasoningEffort")
+                .cloned()
+                .unwrap_or_else(|| json!("high")),
+            "serviceTier": json!("default"),
         }))
     }
 
@@ -133,6 +170,7 @@ impl OpencodeBridge {
             .unwrap_or_default();
         let parts = codex_input_to_parts(&input);
         let turn_id = format!("turn-{}", now_secs());
+        let turn_started_at = now_secs();
         self.state.set_active_turn(
             thread_id.to_string(),
             ActiveTurn {
@@ -143,9 +181,11 @@ impl OpencodeBridge {
                     .map(ToOwned::to_owned),
                 session_id: Some(binding.session_id.clone()),
                 current_assistant_message_id: None,
+                started_at: turn_started_at,
             },
         );
-        let turn = json!({"id":turn_id,"items":[],"status":"inProgress","startedAt":now_secs()});
+        let turn =
+            json!({"id":turn_id,"items":[],"status":"inProgress","startedAt":turn_started_at});
         let _ = ctx.notifier().send_notification(
             "turn/started",
             json!({"threadId":thread_id,"turn":turn.clone()}),
@@ -231,20 +271,8 @@ impl OpencodeBridge {
             .list_messages(&binding.session_id)
             .await
             .unwrap_or(Value::Array(Vec::new()));
-        let turns = messages_after
-            .as_array()
-            .cloned()
-            .unwrap_or_default()
-            .into_iter()
-            .map(|message| {
-                let id = message
-                    .pointer("/info/id")
-                    .and_then(Value::as_str)
-                    .unwrap_or("message")
-                    .to_string();
-                json!({"id":id,"items":message_to_turn_items(&message),"status":"completed"})
-            })
-            .collect::<Vec<_>>();
+        let turns =
+            collapse_messages_to_turns(messages_after.as_array().cloned().unwrap_or_default());
         let mut thread = binding_to_thread(&binding);
         thread["turns"] = json!(turns);
         Ok(json!({ "thread": thread }))
@@ -347,34 +375,177 @@ impl OpencodeBridge {
     }
 
     async fn handle_thread_list(&self, params: Value) -> Result<Value, JsonRpcError> {
-        let mut path = "/session".to_string();
+        // Parse the codex `ThreadListParams` shape. Opencode-bridge stays in
+        // raw-Value style (no `alleycat-codex-proto` dep) to match the rest of
+        // this file, but the filter/sort/pagination semantics mirror the
+        // typed handlers in pi/claude-bridge.
+        let cwd_filter = parse_cwd_filter_value(params.get("cwd"));
+        let search_term = params
+            .get("searchTerm")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        // Codex semantics: omitted `archived` means "non-archived only"
+        // (`unwrap_or(false)`), not "all".
+        let archived_filter = params
+            .get("archived")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let model_provider_filter: Option<Vec<String>> = string_array(params.get("modelProviders"));
+        let source_kind_filter: Option<Vec<String>> = string_array(params.get("sourceKinds"));
+        let sort_key = match params.get("sortKey").and_then(Value::as_str) {
+            Some("updated_at") => SortKey::UpdatedAt,
+            // Schema/codex-rs default is `created_at`.
+            _ => SortKey::CreatedAt,
+        };
+        let sort_descending = !matches!(
+            params.get("sortDirection").and_then(Value::as_str),
+            Some("asc")
+        );
+        let cursor = params
+            .get("cursor")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .and_then(decode_list_cursor);
+        let limit = alleycat_bridge_core::resolve_list_limit(
+            params
+                .get("limit")
+                .and_then(Value::as_u64)
+                .map(|v| v as u32),
+        ) as usize;
+        // `useStateDbOnly` is accepted but a no-op for opencode: the upstream
+        // HTTP API is the only state store we ever consult; there's no JSONL
+        // rollout to scan-and-repair from. Read it just to silence linters.
+        let _ = params.get("useStateDbOnly");
+
+        // Fetch from upstream. When the caller supplies a single-cwd filter
+        // we forward it as `directory=` so opencode does the narrowing
+        // server-side; for multi-cwd or no-cwd we fetch the whole list and
+        // apply the filter locally. `searchTerm` is similarly forwarded as
+        // `search=` when present (opencode does substring matching on the
+        // session title, which is roughly what the codex schema describes).
+        let upstream_directory = match cwd_filter.as_deref() {
+            Some([single]) => Some(single.clone()),
+            _ => None,
+        };
+        let mut upstream_path = "/session".to_string();
         let mut query = Vec::new();
-        if let Some(cwd) = params.get("cwd").and_then(Value::as_str) {
-            query.push(format!("directory={}", encode_query(cwd)));
+        if let Some(dir) = upstream_directory.as_deref() {
+            query.push(format!("directory={}", encode_query(dir)));
         }
-        if let Some(search) = params.get("searchTerm").and_then(Value::as_str) {
-            query.push(format!("search={}", encode_query(search)));
+        if let Some(term) = search_term.as_deref() {
+            query.push(format!("search={}", encode_query(term)));
         }
         if !query.is_empty() {
-            path.push('?');
-            path.push_str(&query.join("&"));
+            upstream_path.push('?');
+            upstream_path.push_str(&query.join("&"));
         }
         let sessions = self
             .client
-            .get(&path)
+            .get(&upstream_path)
             .await
             .map_err(|err| JsonRpcError::internal(format!("{err:#}")))?;
-        let array = sessions.as_array().cloned().unwrap_or_default();
-        let mut data = Vec::new();
-        for session in array {
+        let raw_sessions = sessions.as_array().cloned().unwrap_or_default();
+        let upstream_count = raw_sessions.len();
+
+        // Bind every fetched session into the local thread index so the
+        // synthesized thread ids stay stable across calls. Bindings carry the
+        // shape we need for local filter/sort.
+        let mut bindings = Vec::with_capacity(raw_sessions.len());
+        for session in raw_sessions {
             let binding = self
                 .index
                 .bind_session(&session)
                 .await
                 .map_err(|err| JsonRpcError::internal(format!("{err:#}")))?;
-            data.push(binding_to_thread(&binding));
+            bindings.push(binding);
         }
-        Ok(json!({"data":data,"nextCursor":null}))
+
+        // Local filtering for everything opencode's HTTP API can't express.
+        let term_lower = search_term.as_deref().map(str::to_lowercase);
+        let bindings: Vec<_> = bindings
+            .into_iter()
+            .filter(|b| b.archived == archived_filter)
+            .filter(|b| match cwd_filter.as_deref() {
+                Some(cwds) => cwds.iter().any(|c| c == &b.directory),
+                None => true,
+            })
+            .filter(|_b| match &model_provider_filter {
+                // Opencode session metadata doesn't carry a provider; the
+                // bridge tags every binding's wire `modelProvider` as
+                // "opencode". Match against that token.
+                Some(want) if !want.is_empty() => want.iter().any(|p| p == "opencode"),
+                _ => true,
+            })
+            .filter(|_b| match &source_kind_filter {
+                // Opencode is always sourced from the app-server; if the
+                // caller's filter excludes that, return nothing.
+                Some(want) if !want.is_empty() => {
+                    want.iter().any(|s| s == "appServer" || s == "app_server")
+                }
+                _ => true,
+            })
+            .filter(|b| match term_lower.as_deref() {
+                Some(needle) => {
+                    let in_preview = b.preview.to_lowercase().contains(needle);
+                    let in_name = b
+                        .name
+                        .as_deref()
+                        .map(|n| n.to_lowercase().contains(needle))
+                        .unwrap_or(false);
+                    in_preview || in_name
+                }
+                None => true,
+            })
+            .collect();
+
+        let mut bindings = bindings;
+        bindings.sort_by(|a, b| {
+            let (ak, bk) = match sort_key {
+                SortKey::CreatedAt => (a.created_at, b.created_at),
+                SortKey::UpdatedAt => (a.updated_at, b.updated_at),
+            };
+            let primary = ak.cmp(&bk);
+            let primary = if sort_descending {
+                primary.reverse()
+            } else {
+                primary
+            };
+            // Tiebreaker on thread_id keeps pagination deterministic across
+            // collisions on the timestamp axis — same rule bridge-core uses.
+            primary.then_with(|| a.thread_id.cmp(&b.thread_id))
+        });
+
+        let starting = match cursor {
+            Some(ref c) => bindings
+                .iter()
+                .position(|b| cursor_after_binding(b, c, sort_key, sort_descending))
+                .unwrap_or(bindings.len()),
+            None => 0,
+        };
+        let end = (starting + limit).min(bindings.len());
+        let page = &bindings[starting..end];
+
+        let next_cursor = if end < bindings.len() {
+            page.last().map(|b| encode_list_cursor(b, sort_key))
+        } else {
+            None
+        };
+        let backwards_cursor = page.first().map(|b| encode_list_cursor(b, sort_key));
+
+        let data: Vec<Value> = page.iter().map(binding_to_thread).collect();
+        tracing::info!(
+            params = %params,
+            opencode_path = %upstream_path,
+            upstream_count,
+            filtered = bindings.len(),
+            returned = data.len(),
+            "thread/list",
+        );
+        Ok(json!({
+            "data": data,
+            "nextCursor": next_cursor,
+            "backwardsCursor": backwards_cursor,
+        }))
     }
 
     async fn handle_thread_resume_or_read(
@@ -396,22 +567,83 @@ impl OpencodeBridge {
             .get(&format!("/session/{}/message", binding.session_id))
             .await
             .map_err(|err| JsonRpcError::internal(format!("{err:#}")))?;
-        let turns = messages
-            .as_array()
-            .cloned()
-            .unwrap_or_default()
-            .into_iter()
-            .map(|message| json!({"id":message.pointer("/info/id").and_then(Value::as_str).unwrap_or("message"),"items":message_to_turn_items(&message),"status":"completed"}))
-            .collect::<Vec<_>>();
+        let turns =
+            collapse_messages_to_turns(messages.as_array().cloned().unwrap_or_default());
         let mut thread = binding_to_thread(&binding);
         thread["turns"] = json!(turns);
         if method == "thread/read" {
-            Ok(json!({"thread":thread}))
+            Ok(json!({ "thread": thread }))
         } else {
-            Ok(
-                json!({"thread":thread,"model":"opencode","modelProvider":"opencode","cwd":binding.directory}),
-            )
+            // Match upstream `ThreadResumeResponse` exactly. Missing any
+            // required field (approvalPolicy, approvalsReviewer, sandbox,
+            // serviceTier, reasoningEffort) makes the phone reject the
+            // entire response with "deserialize typed RPC response: missing
+            // field …", which surfaces as a "Home Action Failed" alert and
+            // the thread won't open. Opencode has no notion of approvals
+            // or sandboxes, so we synthesize the most permissive defaults.
+            Ok(json!({
+                "thread": thread,
+                "model": "opencode",
+                "modelProvider": "opencode",
+                "serviceTier": "default",
+                "cwd": binding.directory,
+                "instructionSources": [],
+                "approvalPolicy": "on-request",
+                "approvalsReviewer": "user",
+                "sandbox": {"type": "dangerFullAccess"},
+                "permissionProfile": {"type": "disabled"},
+                "reasoningEffort": "high",
+            }))
         }
+    }
+
+    /// `thread/turns/list` — paginated turn-by-turn history for a single
+    /// thread. iOS uses this on thread open as the canonical way to hydrate
+    /// the conversation when a `thread/read` round-trip would be too big.
+    /// Upstream pagination is by `cursor` + `limit`; opencode has no native
+    /// per-message cursor, so we emit the full turn list in one page and
+    /// echo any non-empty cursor back as "no more results".
+    async fn handle_thread_turns_list(&self, params: Value) -> Result<Value, JsonRpcError> {
+        // Non-empty cursor means the client is asking for "next page" —
+        // we already returned everything in page 1, so report empty.
+        let cursor = params
+            .get("cursor")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty());
+        if cursor.is_some() {
+            return Ok(json!({
+                "data": [],
+                "nextCursor": null,
+                "backwardsCursor": null,
+            }));
+        }
+        let binding = binding_from_params(&self.index, &params)?;
+        let messages = self
+            .client
+            .get(&format!("/session/{}/message", binding.session_id))
+            .await
+            .map_err(|err| JsonRpcError::internal(format!("{err:#}")))?;
+        let mut turns =
+            collapse_messages_to_turns(messages.as_array().cloned().unwrap_or_default());
+        // Default sort direction is `desc` (newest first) per the codex
+        // wire spec — `ThreadSortKey::UpdatedAt` + `SortDirection::Desc`
+        // is the iOS hydration pattern.
+        let descending = params
+            .get("sortDirection")
+            .and_then(Value::as_str)
+            .map(|s| s == "desc")
+            .unwrap_or(true);
+        if descending {
+            turns.reverse();
+        }
+        if let Some(limit) = params.get("limit").and_then(Value::as_u64) {
+            turns.truncate(limit as usize);
+        }
+        Ok(json!({
+            "data": turns,
+            "nextCursor": null,
+            "backwardsCursor": null,
+        }))
     }
 
     async fn handle_thread_archive(&self, params: Value) -> Result<Value, JsonRpcError> {
@@ -500,7 +732,10 @@ impl Bridge for OpencodeBridge {
         match method {
             "thread/start" => self.handle_thread_start(params).await,
             "thread/list" => self.handle_thread_list(params).await,
-            "thread/resume" | "thread/read" => self.handle_thread_resume_or_read(method, params).await,
+            "thread/resume" | "thread/read" => {
+                self.handle_thread_resume_or_read(method, params).await
+            }
+            "thread/turns/list" => self.handle_thread_turns_list(params).await,
             "thread/archive" => self.handle_thread_archive(params).await,
             "thread/unarchive" => self.handle_thread_unarchive(params).await,
             "thread/name/set" => self.handle_thread_name_set(params).await,
@@ -558,11 +793,7 @@ impl OpencodeBridge {
     /// stdout via `command/exec/outputDelta`; opencode's PTY transport is
     /// inherently a single combined stream, so streaming chunks are emitted
     /// with `stream:"stdout"`. `stderr` in the final response is always empty.
-    async fn handle_command_exec(
-        &self,
-        ctx: &Conn,
-        params: Value,
-    ) -> Result<Value, JsonRpcError> {
+    async fn handle_command_exec(&self, ctx: &Conn, params: Value) -> Result<Value, JsonRpcError> {
         let command = params
             .get("command")
             .and_then(Value::as_array)
@@ -701,10 +932,7 @@ impl OpencodeBridge {
         Ok(json!({}))
     }
 
-    async fn handle_command_exec_terminate(
-        &self,
-        params: Value,
-    ) -> Result<Value, JsonRpcError> {
+    async fn handle_command_exec_terminate(&self, params: Value) -> Result<Value, JsonRpcError> {
         let process_id = params
             .get("processId")
             .and_then(Value::as_str)
@@ -720,10 +948,7 @@ impl OpencodeBridge {
         Ok(json!({}))
     }
 
-    async fn handle_command_exec_resize(
-        &self,
-        params: Value,
-    ) -> Result<Value, JsonRpcError> {
+    async fn handle_command_exec_resize(&self, params: Value) -> Result<Value, JsonRpcError> {
         let process_id = params
             .get("processId")
             .and_then(Value::as_str)
@@ -749,6 +974,51 @@ impl OpencodeBridge {
             .await
             .map_err(|err| JsonRpcError::internal(format!("{err:#}")))?;
         Ok(json!({}))
+    }
+}
+
+/// Either an explicit runtime or a deferred env-driven one. The deferred form
+/// only spawns/probes the opencode backend at `build()` time, so callers can
+/// configure env vars right up to the moment the bridge starts.
+enum RuntimeSource {
+    Explicit(OpencodeRuntime),
+    FromEnv,
+}
+
+#[derive(Default)]
+pub struct OpencodeBridgeBuilder {
+    runtime: Option<RuntimeSource>,
+    state_dir: Option<PathBuf>,
+}
+
+impl OpencodeBridgeBuilder {
+    pub fn runtime(mut self, runtime: OpencodeRuntime) -> Self {
+        self.runtime = Some(RuntimeSource::Explicit(runtime));
+        self
+    }
+
+    /// Defer runtime construction until `build()`; reads the same env vars
+    /// `OpencodeRuntime::start_from_env` honors today.
+    pub fn from_env(mut self) -> Self {
+        self.runtime = Some(RuntimeSource::FromEnv);
+        self
+    }
+
+    pub fn state_dir(mut self, state_dir: impl Into<PathBuf>) -> Self {
+        self.state_dir = Some(state_dir.into());
+        self
+    }
+
+    pub async fn build(self) -> anyhow::Result<Arc<OpencodeBridge>> {
+        let runtime = match self.runtime {
+            Some(RuntimeSource::Explicit(rt)) => rt,
+            Some(RuntimeSource::FromEnv) | None => OpencodeRuntime::start_from_env().await?,
+        };
+        let bridge = match self.state_dir {
+            Some(state_dir) => OpencodeBridge::new_with_state_dir(runtime, state_dir).await?,
+            None => OpencodeBridge::new(runtime).await?,
+        };
+        Ok(Arc::new(bridge))
     }
 }
 
@@ -833,6 +1103,158 @@ fn flatten_models(providers: Value) -> Vec<Value> {
         .collect()
 }
 
+/// Group an ordered list of opencode messages into codex-shape `Turn`s.
+///
+/// Codex models a turn as "one user prompt + the assistant's full response"
+/// — a single `Turn` in `thread/read.turns[]` contains both the
+/// `userMessage` item and every assistant-side item (reasoning, tool calls,
+/// agentMessage) that came back. Opencode stores each as a separate
+/// `Message` row, so we walk the array and fold consecutive
+/// `role: "assistant"` messages into the preceding `role: "user"` turn.
+///
+/// Timing collapses too: the turn's `startedAt` is the user message's
+/// `info.time.created`; `completedAt` is the LAST assistant message's
+/// `info.time.completed` (or the user's `time.created` if no assistant
+/// followed yet, marking the turn `inProgress`).
+fn collapse_messages_to_turns(messages: Vec<Value>) -> Vec<Value> {
+    let mut turns: Vec<Value> = Vec::new();
+    for message in messages {
+        let role = message
+            .pointer("/info/role")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        if role == "user" {
+            turns.push(turn_from_user_message(&message));
+        } else if let Some(turn) = turns.last_mut() {
+            // Fold this assistant message into the most recent user-anchored
+            // turn. We append items, refresh completedAt/durationMs/status,
+            // and surface any per-message error.
+            fold_assistant_into_turn(turn, &message);
+        } else {
+            // Stand-alone assistant message with no prior user (shouldn't
+            // happen in normal opencode sessions, but keep the data rather
+            // than silently dropping). Emit it as its own turn.
+            turns.push(turn_from_assistant_only(&message));
+        }
+    }
+    turns
+}
+
+fn turn_from_user_message(message: &Value) -> Value {
+    let id = message
+        .pointer("/info/id")
+        .and_then(Value::as_str)
+        .unwrap_or("message")
+        .to_string();
+    let started_at = message
+        .pointer("/info/time/created")
+        .and_then(Value::as_i64);
+    // User-role messages aren't "running" work; opencode stores them
+    // synchronously and never writes `time.completed`. Anchor them to the
+    // user's `time.created` so the wire shape stays non-null until an
+    // assistant message folds in and refreshes the completion fields.
+    let items = message_to_turn_items(message);
+    json!({
+        "id": id,
+        "items": items,
+        // Without an assistant follow-up the turn is genuinely in-progress
+        // from codex's perspective — the user just sent a prompt and is
+        // waiting for the model. fold_assistant_into_turn() bumps this to
+        // "completed" once the first assistant message arrives.
+        "status": "inProgress",
+        "error": Value::Null,
+        "startedAt": started_at,
+        "completedAt": Value::Null,
+        "durationMs": Value::Null,
+    })
+}
+
+fn turn_from_assistant_only(message: &Value) -> Value {
+    let id = message
+        .pointer("/info/id")
+        .and_then(Value::as_str)
+        .unwrap_or("message")
+        .to_string();
+    let started_at = message
+        .pointer("/info/time/created")
+        .and_then(Value::as_i64);
+    let completed_at = message
+        .pointer("/info/time/completed")
+        .and_then(Value::as_i64);
+    let duration_ms = match (started_at, completed_at) {
+        (Some(s), Some(c)) if c >= s => Some(c - s),
+        _ => None,
+    };
+    json!({
+        "id": id,
+        "items": message_to_turn_items(message),
+        "status": if completed_at.is_some() { "completed" } else { "inProgress" },
+        "error": opencode_message_error(message),
+        "startedAt": started_at,
+        "completedAt": completed_at,
+        "durationMs": duration_ms,
+    })
+}
+
+fn fold_assistant_into_turn(turn: &mut Value, message: &Value) {
+    // Append the assistant's items to the existing turn's `items` array.
+    if let Some(items) = turn.get_mut("items").and_then(Value::as_array_mut) {
+        for item in message_to_turn_items(message) {
+            items.push(item);
+        }
+    }
+    // Refresh completion timing from this assistant message. We want the
+    // LAST assistant message's completion time, so always overwrite (later
+    // assistants supersede earlier ones).
+    let completed_at = message
+        .pointer("/info/time/completed")
+        .and_then(Value::as_i64);
+    let started_at = turn.get("startedAt").and_then(Value::as_i64);
+    let duration_ms = match (started_at, completed_at) {
+        (Some(s), Some(c)) if c >= s => Some(c - s),
+        _ => None,
+    };
+    if let Some(slot) = turn.get_mut("completedAt") {
+        *slot = json!(completed_at);
+    }
+    if let Some(slot) = turn.get_mut("durationMs") {
+        *slot = json!(duration_ms);
+    }
+    if let Some(slot) = turn.get_mut("status") {
+        *slot = json!(if completed_at.is_some() {
+            "completed"
+        } else {
+            "inProgress"
+        });
+    }
+    // Surface a per-turn error if this assistant message reported one.
+    // Earlier-message errors stay (we only overwrite if the new one is
+    // non-null), so a successful assistant after a failed retry doesn't
+    // mask the failure history.
+    if let Some(err) = opencode_message_error(message) {
+        if let Some(slot) = turn.get_mut("error") {
+            *slot = err;
+        }
+    }
+}
+
+fn opencode_message_error(message: &Value) -> Option<Value> {
+    let err = message.pointer("/info/error")?;
+    let msg = err
+        .pointer("/data/message")
+        .and_then(Value::as_str)
+        .or_else(|| err.get("message").and_then(Value::as_str))
+        .unwrap_or_default();
+    if msg.is_empty() {
+        return None;
+    }
+    let code = err.get("name").and_then(Value::as_str);
+    Some(json!({
+        "message": msg,
+        "code": code,
+    }))
+}
+
 fn now_secs() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -842,4 +1264,92 @@ fn now_secs() -> i64 {
 
 fn encode_query(value: &str) -> String {
     url::form_urlencoded::byte_serialize(value.as_bytes()).collect()
+}
+
+#[derive(Debug, Clone, Copy)]
+enum SortKey {
+    CreatedAt,
+    UpdatedAt,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct ListCursorPayload {
+    /// `created_at` or `updated_at` depending on the sort key the cursor
+    /// was minted with.
+    ts: i64,
+    id: String,
+}
+
+/// `cwd` may be a JSON string, a JSON array of strings, or absent. Any other
+/// shape is treated as no filter (rather than an error) for parity with the
+/// pi/claude `parse_cwd_filter` helper.
+fn parse_cwd_filter_value(value: Option<&Value>) -> Option<Vec<String>> {
+    let v = value?;
+    match v {
+        Value::String(s) => Some(vec![s.clone()]),
+        Value::Array(arr) => Some(
+            arr.iter()
+                .filter_map(|x| x.as_str().map(str::to_string))
+                .collect(),
+        ),
+        _ => None,
+    }
+}
+
+/// Read a JSON `Value` as `Option<Vec<String>>`: `null`/missing → `None`,
+/// non-array → `None`, otherwise the string-typed elements.
+fn string_array(value: Option<&Value>) -> Option<Vec<String>> {
+    let arr = value?.as_array()?;
+    Some(
+        arr.iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect(),
+    )
+}
+
+fn encode_list_cursor(binding: &OpencodeBinding, key: SortKey) -> String {
+    use base64::Engine;
+    let ts = match key {
+        SortKey::CreatedAt => binding.created_at,
+        SortKey::UpdatedAt => binding.updated_at,
+    };
+    let payload = ListCursorPayload {
+        ts,
+        id: binding.thread_id.clone(),
+    };
+    let json = serde_json::to_vec(&payload).expect("ListCursorPayload always serializes");
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(json)
+}
+
+fn decode_list_cursor(raw: &str) -> Option<ListCursorPayload> {
+    use base64::Engine;
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(raw)
+        .ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+fn cursor_after_binding(
+    binding: &OpencodeBinding,
+    cursor: &ListCursorPayload,
+    key: SortKey,
+    descending: bool,
+) -> bool {
+    let entry_ts = match key {
+        SortKey::CreatedAt => binding.created_at,
+        SortKey::UpdatedAt => binding.updated_at,
+    };
+    let primary = entry_ts.cmp(&cursor.ts);
+    let primary = if descending {
+        primary.reverse()
+    } else {
+        primary
+    };
+    match primary {
+        std::cmp::Ordering::Greater => true,
+        std::cmp::Ordering::Less => false,
+        std::cmp::Ordering::Equal => {
+            binding.thread_id.cmp(&cursor.id) == std::cmp::Ordering::Greater
+        }
+    }
 }

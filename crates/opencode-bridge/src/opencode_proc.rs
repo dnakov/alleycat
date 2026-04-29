@@ -35,10 +35,16 @@ impl OpencodeRuntime {
             Ok("auto") | Err(_) => pick_port()?,
             Ok(value) => value.parse::<u16>()?,
         };
-        let auth_token = match std::env::var("OPENCODE_BRIDGE_AUTH_TOKEN").as_deref() {
-            Ok("auto") | Err(_) => random_token(),
-            Ok(value) => value.to_string(),
+        // `--auth-token` was removed from `opencode serve` in 1.3.x and
+        // passing it makes the binary print usage and exit immediately. Only
+        // forward an explicit override; otherwise leave it off and treat the
+        // server as unauthenticated (`OpencodeClient` skips the query param
+        // when `auth_token` is empty).
+        let explicit_auth_token = match std::env::var("OPENCODE_BRIDGE_AUTH_TOKEN").as_deref() {
+            Ok("auto") | Ok("") | Err(_) => None,
+            Ok(value) => Some(value.to_string()),
         };
+        let auth_token = explicit_auth_token.clone().unwrap_or_default();
         let extra_args = std::env::var("OPENCODE_BRIDGE_EXTRA_ARGS")
             .ok()
             .map(|raw| {
@@ -52,11 +58,13 @@ impl OpencodeRuntime {
         command
             .args(extra_args)
             .arg(format!("--port={port}"))
-            .arg(format!("--auth-token={auth_token}"))
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::inherit())
             .kill_on_drop(true);
+        if let Some(token) = explicit_auth_token.as_deref() {
+            command.arg(format!("--auth-token={token}"));
+        }
         let child = command.spawn()?;
         let base_url = format!("http://127.0.0.1:{port}");
         wait_until_healthy(&base_url, READINESS_TIMEOUT).await?;
@@ -100,8 +108,25 @@ fn pick_port() -> anyhow::Result<u16> {
     Ok(listener.local_addr()?.port())
 }
 
+#[allow(dead_code)]
 fn random_token() -> String {
     let mut bytes = [0u8; 32];
     rand::rngs::OsRng.fill_bytes(&mut bytes);
     hex::encode(bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn external_constructor_stores_fields_and_spawns_no_child() {
+        let runtime = OpencodeRuntime::external(
+            "http://example.test:1234".to_string(),
+            "tok-abc".to_string(),
+        );
+        assert_eq!(runtime.base_url, "http://example.test:1234");
+        assert_eq!(runtime.auth_token, "tok-abc");
+        assert!(runtime._child.is_none());
+    }
 }

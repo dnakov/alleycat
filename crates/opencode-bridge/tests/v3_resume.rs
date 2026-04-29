@@ -64,7 +64,10 @@ async fn thread_resume_then_read_returns_persisted_turns() {
     )
     .await;
     let resume = read_until_response(&mut fx.read, 3).await;
-    assert_eq!(resume["result"]["thread"]["id"].as_str(), Some(thread_id.as_str()));
+    assert_eq!(
+        resume["result"]["thread"]["id"].as_str(),
+        Some(thread_id.as_str())
+    );
     assert_eq!(resume["result"]["cwd"], "/tmp/v3r");
     let turns = resume["result"]["thread"]["turns"]
         .as_array()
@@ -83,9 +86,7 @@ async fn thread_resume_then_read_returns_persisted_turns() {
     )
     .await;
     let read = read_until_response(&mut fx.read, 4).await;
-    let turns = read["result"]["thread"]["turns"]
-        .as_array()
-        .expect("turns");
+    let turns = read["result"]["thread"]["turns"].as_array().expect("turns");
     assert_eq!(turns.len(), 2);
     let user_items = turns[0]["items"].as_array().expect("user items");
     // T12 routes role=user text parts to `agentMessage` only when the part

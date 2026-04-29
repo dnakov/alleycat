@@ -71,7 +71,10 @@ async fn step_finish_emits_thread_token_usage_updated() {
     assert_eq!(first["params"]["tokenUsage"]["total"]["totalTokens"], 100);
     assert_eq!(first["params"]["tokenUsage"]["total"]["inputTokens"], 60);
     assert_eq!(first["params"]["tokenUsage"]["total"]["outputTokens"], 40);
-    assert_eq!(first["params"]["tokenUsage"]["total"]["cachedInputTokens"], 10);
+    assert_eq!(
+        first["params"]["tokenUsage"]["total"]["cachedInputTokens"],
+        10
+    );
     assert_eq!(first["params"]["tokenUsage"]["last"]["totalTokens"], 100);
 
     // Second step-finish — totals accumulate, `last` reflects the just-finished step.
@@ -102,7 +105,10 @@ async fn step_finish_emits_thread_token_usage_updated() {
     assert_eq!(second["params"]["tokenUsage"]["total"]["totalTokens"], 130);
     assert_eq!(second["params"]["tokenUsage"]["total"]["inputTokens"], 65);
     assert_eq!(second["params"]["tokenUsage"]["total"]["outputTokens"], 65);
-    assert_eq!(second["params"]["tokenUsage"]["total"]["cachedInputTokens"], 12);
+    assert_eq!(
+        second["params"]["tokenUsage"]["total"]["cachedInputTokens"],
+        12
+    );
     assert_eq!(second["params"]["tokenUsage"]["last"]["totalTokens"], 30);
     assert_eq!(second["params"]["tokenUsage"]["last"]["inputTokens"], 5);
 

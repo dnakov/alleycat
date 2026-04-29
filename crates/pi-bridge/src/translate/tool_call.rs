@@ -8,16 +8,22 @@
 //! Codex models tool calls with several `ThreadItem` variants
 //! (`app-server-protocol/src/protocol/v2.rs:5327`):
 //!
-//! | pi tool name             | codex `ThreadItem` kind |
-//! |--------------------------|-------------------------|
-//! | `bash`                   | `CommandExecution`      |
-//! | `write`, `edit`          | `FileChange`            |
-//! | `<server>__<tool>` (MCP) | `McpToolCall`           |
-//! | anything else            | `DynamicToolCall`       |
+//! | pi tool name             | codex `ThreadItem` kind                              |
+//! |--------------------------|------------------------------------------------------|
+//! | `bash`                   | `CommandExecution`                                   |
+//! | `write`, `edit`          | `FileChange`                                         |
+//! | `read`                   | `CommandExecution` (read action)                     |
+//! | `grep`                   | `CommandExecution` (search action)                   |
+//! | `ls`, `find`             | `CommandExecution` (list_files action)               |
+//! | `<server>__<tool>` (MCP) | `McpToolCall`                                        |
+//! | anything else            | `DynamicToolCall`                                    |
 //!
-//! `read`, `grep`, `ls`, `find` are read-only inspection tools and have no
-//! file-mutation surface in codex; they fall through to `DynamicToolCall`
-//! (codex's catch-all for unknown agent tools).
+//! `multi_tool_use.parallel` is NOT a wire-level pi tool name — it's an
+//! OpenAI-side optimization the model uses to bundle several function calls
+//! into a single assistant turn. By the time pi forwards events to the
+//! bridge, the wrapper has been flattened: each child shows up as its own
+//! `ToolExecutionStart`/`End` with its real tool name (`bash`, `read`, ...).
+//! No special handling needed here.
 //!
 //! The MCP convention `<server>__<tool>` matches pi's MCP bridge naming
 //! (double-underscore separator). When matching, we also accept the
@@ -38,6 +44,18 @@ pub enum CodexToolKind {
     /// Pi MCP bridge tool call. The original pi name was `<server>__<tool>`
     /// and is split on the first `__` separator.
     Mcp { server: String, tool: String },
+
+    /// Pi `read` — codex `ThreadItem::CommandExecution` with a `read`
+    /// command action; the file body lands in `aggregated_output`.
+    ExplorationRead,
+
+    /// Pi `grep` — codex `ThreadItem::CommandExecution` with a `search`
+    /// command action.
+    ExplorationSearch,
+
+    /// Pi `ls` / `find` — codex `ThreadItem::CommandExecution` with a
+    /// `list_files` command action.
+    ExplorationList,
 
     /// Anything else — codex `ThreadItem::DynamicToolCall`. The optional
     /// `namespace` is the substring before the first `__` if present (so the
@@ -75,9 +93,14 @@ pub fn classify(tool_name: &str) -> CodexToolKind {
             tool: tool.to_string(),
         };
     }
-    CodexToolKind::Dynamic {
-        namespace: None,
-        tool: tool_name.to_string(),
+    match tool_name {
+        "read" => CodexToolKind::ExplorationRead,
+        "grep" => CodexToolKind::ExplorationSearch,
+        "ls" | "find" => CodexToolKind::ExplorationList,
+        _ => CodexToolKind::Dynamic {
+            namespace: None,
+            tool: tool_name.to_string(),
+        },
     }
 }
 
@@ -110,16 +133,35 @@ mod tests {
     }
 
     #[test]
-    fn read_grep_ls_find_are_dynamic() {
-        for name in ["read", "grep", "ls", "find"] {
-            assert_eq!(
-                classify(name),
-                CodexToolKind::Dynamic {
-                    namespace: None,
-                    tool: name.to_string()
-                },
-                "{name} should be dynamic"
-            );
+    fn read_is_exploration_read() {
+        assert_eq!(classify("read"), CodexToolKind::ExplorationRead);
+    }
+
+    #[test]
+    fn grep_is_exploration_search() {
+        assert_eq!(classify("grep"), CodexToolKind::ExplorationSearch);
+    }
+
+    #[test]
+    fn ls_and_find_are_exploration_list() {
+        assert_eq!(classify("ls"), CodexToolKind::ExplorationList);
+        assert_eq!(classify("find"), CodexToolKind::ExplorationList);
+    }
+
+    #[test]
+    fn unknown_tools_fall_through_to_dynamic() {
+        // `multi_tool_use.parallel` should never appear at this layer — pi
+        // flattens it at the wire level — but if some upstream change ever
+        // surfaces it, the catch-all preserves it as a Dynamic card so wire
+        // drift stays visible rather than silently misclassified.
+        for name in ["multi_tool_use.parallel", "custom_tool", "rg", "cat"] {
+            match classify(name) {
+                CodexToolKind::Dynamic { namespace, tool } => {
+                    assert_eq!(namespace, None);
+                    assert_eq!(tool, name);
+                }
+                other => panic!("expected dynamic for {name}, got {other:?}"),
+            }
         }
     }
 

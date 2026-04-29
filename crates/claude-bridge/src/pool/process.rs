@@ -1,0 +1,941 @@
+//! `ClaudeProcessHandle` — spawns one `claude -p ...` subprocess bound to a
+//! specific cwd + thread_id and exposes a writer mpsc + broadcast event
+//! channel API on top of its line-delimited JSON stdio.
+//!
+//! Wire model (live probe documented in `claude_protocol.rs`):
+//!
+//! - bridge → claude: one JSON object per stdin line, shaped as
+//!   [`ClaudeInbound`] (`{type:"user", message:{...}}`).
+//! - claude → bridge: one JSON object per stdout line, deserialized to
+//!   [`ClaudeOutbound`] and broadcast as a [`ClaudeEvent`].
+//!
+//! Two background tasks per process, mirroring `pi-bridge/src/pool/process.rs`:
+//!
+//! - **writer** drains a `mpsc::UnboundedReceiver<String>` and writes each
+//!   already-serialized JSON line to claude's stdin, terminating with `\n`.
+//! - **reader** reads claude's stdout line-by-line, deserializes each line as
+//!   [`ClaudeOutbound`], captures the very first `system/init` payload to a
+//!   one-shot init slot (waking [`ClaudeProcessHandle::wait_for_init`]), and
+//!   broadcasts every event to all subscribers.
+//!
+//! The init readiness gate is the bridge's signal that the child is fully up.
+//! Without it, an early user message racing with claude's startup would be
+//! silently swallowed (claude buffers stdin but only starts the streaming
+//! turn loop after init publishes).
+//!
+//! Both halves shut down cleanly when stdin is closed (claude exits on EOF +
+//! a writable input format), or the [`ClaudeProcessHandle`] is dropped
+//! (`kill_on_drop(true)` plus the abort cleanup in [`TaskSet::drop`]).
+
+use std::collections::HashMap;
+use std::ffi::OsString;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Duration;
+
+use alleycat_bridge_core::{
+    ChildProcess, ChildStderr, ChildStdin, ChildStdout, ProcessLauncher, ProcessRole, ProcessSpec,
+    StdioMode,
+};
+use anyhow::{Context, Result, anyhow};
+use thiserror::Error;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::sync::{Mutex, Notify, broadcast, mpsc, oneshot};
+use tokio::task::JoinHandle;
+use tokio::time::timeout;
+use uuid::Uuid;
+
+use super::claude_protocol::{
+    ClaudeEvent, ClaudeInbound, ClaudeOutbound, ControlRequestBody, ControlRequestEnvelope,
+    ControlResponseBody, SystemEvent, SystemInit,
+};
+
+/// How many events to buffer before slow subscribers start losing events
+/// (broadcast::Receiver returns `Lagged(n)` past this watermark). Claude can
+/// emit content_block_delta lines at sub-millisecond cadence during streaming
+/// (text + thinking interleaved), so this needs headroom.
+const EVENT_CHANNEL_CAPACITY: usize = 1024;
+
+/// Default timeout the bridge gives claude to publish its first
+/// `system/init` line. Cold start is ~3s in the live probe; warm cache is
+/// ~1.3s. 30s leaves headroom for slow disks / first-time MCP server scans
+/// without hanging connection setup forever.
+pub const DEFAULT_INIT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Spawn-time configuration. The bridge mints `thread_id` (the codex thread
+/// id, used as claude's `--session-id`) and `cwd`; everything else is
+/// optional and overrideable per-thread via `ThreadStartParams` / defaults.
+#[derive(Debug, Clone)]
+pub struct ClaudeSpawnConfig {
+    /// UUIDv7 used as both codex `thread_id` and claude `--session-id`.
+    pub thread_id: String,
+    /// Bound via `Command::current_dir` AND `--add-dir`. Both are set for
+    /// belt-and-suspenders: `current_dir` is what claude actually uses for
+    /// relative paths; `--add-dir` keeps the wire log readable.
+    pub cwd: PathBuf,
+    /// Path of the `claude` binary to spawn. Set from
+    /// `CLAUDE_BRIDGE_CLAUDE_BIN` or `which claude`.
+    pub claude_bin: PathBuf,
+    /// Optional model override (`--model <s>`). Accepts the alias forms
+    /// `opus` / `sonnet` / `haiku` claude understands directly.
+    pub model: Option<String>,
+    /// Optional `--append-system-prompt <s>`.
+    pub append_system_prompt: Option<String>,
+    /// True for `thread/resume`: spawn with `--resume <thread_id>` so claude
+    /// rehydrates the on-disk JSONL transcript.
+    pub resume: bool,
+    /// When true, spawn with `--dangerously-skip-permissions` (matches the
+    /// user's local `claude` shell alias; every tool call auto-approves).
+    /// When false, spawn with `--permission-prompt-tool stdio` so claude
+    /// asks the bridge for tool permission via inbound
+    /// `control_request{subtype:"can_use_tool"}` and the bridge in turn
+    /// surfaces a codex `item/{...}/requestApproval` to the connected client.
+    /// Default flipped in [`super::PoolPolicy`] / `host.toml`.
+    pub bypass_permissions: bool,
+}
+
+#[derive(Debug, Error)]
+pub enum ClaudeProcessError {
+    #[error("claude process exited before publishing system/init")]
+    InitTimeout,
+
+    #[error("failed to write user envelope to claude stdin: {0}")]
+    WriterClosed(String),
+
+    #[error("control request `{request_id}` timed out after {elapsed:?}")]
+    ControlTimeout {
+        request_id: String,
+        elapsed: Duration,
+    },
+
+    #[error(
+        "control request `{request_id}` was cancelled (process exited or response routed elsewhere)"
+    )]
+    ControlCancelled { request_id: String },
+
+    #[error("control request `{request_id}` failed: {message}")]
+    ControlError { request_id: String, message: String },
+
+    #[error(transparent)]
+    Json(#[from] serde_json::Error),
+
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+}
+
+/// Handle to a single live `claude -p` subprocess. Cloning via `Arc` shares
+/// the writer mpsc + broadcast event sender + init slot, so multiple bridge
+/// callers (one per active turn or utility query) can drive the same claude
+/// session through separate `Arc<ClaudeProcessHandle>`s.
+#[derive(Debug)]
+pub struct ClaudeProcessHandle {
+    cwd: PathBuf,
+    claude_bin: PathBuf,
+    thread_id: String,
+    pid: Option<u32>,
+    /// Sender end of the writer mpsc — closing this is the signal to the
+    /// writer task to drop claude's stdin (which makes claude exit cleanly).
+    writer_tx: mpsc::UnboundedSender<String>,
+    /// Broadcast end for events. Cloned via `subscribe_events()`.
+    events_tx: broadcast::Sender<ClaudeEvent>,
+    /// Init readiness slot. Set by the reader task when the first
+    /// `system/init` line lands; `wait_for_init` reads it back.
+    init_slot: Arc<InitSlot>,
+    /// In-flight `control_request` envelopes awaiting a matching
+    /// `control_response`. Keyed by the `request_id` we sent. The reader task
+    /// peels each `control_response` out, looks up the entry, and resolves
+    /// the oneshot. Cancelled entries (timeout / process exit) are dropped.
+    pending_controls: Arc<Mutex<HashMap<String, oneshot::Sender<ControlResponseBody>>>>,
+    /// Per-handle live runtime config — model / thinking-tokens budget /
+    /// permission mode currently applied to the child process. Mutated only
+    /// after a successful `set_*` control_request, so `apply_runtime_overrides`
+    /// can diff and skip no-op writes (avoids burning a request RTT per turn
+    /// when nothing changes).
+    runtime_state: Arc<Mutex<RuntimeState>>,
+    /// Background tasks. Held so they keep running for the handle's lifetime
+    /// and abort cleanly on drop.
+    _tasks: Arc<TaskSet>,
+}
+
+/// Tokio doesn't have a "watch with no current value" type that fits this
+/// pattern cleanly, so we pair a `Notify` with a `Mutex<Option<SystemInit>>`.
+/// The reader task `notify_one`s after writing the slot; `wait_for_init`
+/// loops on `notified()` until the slot is populated (so a `wait` issued
+/// *after* init has already landed still returns immediately).
+#[derive(Debug, Default)]
+struct InitSlot {
+    notify: Notify,
+    payload: Mutex<Option<SystemInit>>,
+}
+
+/// Mirror of the runtime config currently applied to the child process. Any
+/// field set to `Some(_)` here means the bridge has confirmed claude is
+/// running with that value (either via spawn args or a successful set_*
+/// control_request). `None` means "we never told claude to apply this", which
+/// claude takes as its compiled-in default.
+#[derive(Debug, Default)]
+struct RuntimeState {
+    model: Option<String>,
+    thinking_tokens: Option<u32>,
+    permission_mode: Option<String>,
+}
+
+struct TaskSet {
+    writer: Mutex<Option<JoinHandle<()>>>,
+    reader: Mutex<Option<JoinHandle<()>>>,
+    stderr: Mutex<Option<JoinHandle<()>>>,
+    /// The owning Child handle. Held so the kernel doesn't reap claude
+    /// before our reader sees EOF; explicit shutdown goes through
+    /// `shutdown()` which kills the child if needed.
+    child: Mutex<Option<Box<dyn ChildProcess>>>,
+}
+
+impl std::fmt::Debug for TaskSet {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TaskSet").finish_non_exhaustive()
+    }
+}
+
+impl Drop for TaskSet {
+    fn drop(&mut self) {
+        // Best-effort cleanup mirroring pi-bridge/process.rs:106-124.
+        if let Some(h) = self.writer.try_lock().ok().and_then(|mut g| g.take()) {
+            h.abort();
+        }
+        if let Some(h) = self.reader.try_lock().ok().and_then(|mut g| g.take()) {
+            h.abort();
+        }
+        if let Some(h) = self.stderr.try_lock().ok().and_then(|mut g| g.take()) {
+            h.abort();
+        }
+        // Drop the child — `LocalLauncher` sets `kill_on_drop(true)`, and
+        // alternative launchers are responsible for their own reap-on-drop
+        // semantics.
+        if let Some(_child) = self.child.try_lock().ok().and_then(|mut g| g.take()) {}
+    }
+}
+
+impl ClaudeProcessHandle {
+    /// Spawn `claude -p ...` per `config` using the default
+    /// [`alleycat_bridge_core::LocalLauncher`]. Convenience wrapper over
+    /// [`Self::launch_with`] for callers that don't need a custom launcher.
+    pub async fn spawn(config: ClaudeSpawnConfig) -> Result<Self> {
+        let launcher: Arc<dyn ProcessLauncher> = Arc::new(alleycat_bridge_core::LocalLauncher);
+        Self::launch_with(launcher, config).await
+    }
+
+    /// Spawn `claude -p ...` per `config` via the supplied [`ProcessLauncher`].
+    /// The returned handle is ready to accept `subscribe_events()` /
+    /// `send_user_envelope()` calls immediately, but callers MUST `await
+    /// wait_for_init(...)` before sending the first user envelope so claude
+    /// has finished publishing its `system/init` and is consuming stdin.
+    pub async fn launch_with(
+        launcher: Arc<dyn ProcessLauncher>,
+        config: ClaudeSpawnConfig,
+    ) -> Result<Self> {
+        let ClaudeSpawnConfig {
+            thread_id,
+            cwd,
+            claude_bin,
+            model,
+            append_system_prompt,
+            resume,
+            bypass_permissions,
+        } = config;
+
+        let mut args: Vec<OsString> = Vec::new();
+        args.push("-p".into());
+        args.push("--input-format".into());
+        args.push("stream-json".into());
+        args.push("--output-format".into());
+        args.push("stream-json".into());
+        args.push("--include-partial-messages".into());
+        args.push("--verbose".into());
+        if bypass_permissions {
+            args.push("--dangerously-skip-permissions".into());
+        } else {
+            // HITL mode: claude emits inbound control_request{can_use_tool}
+            // over stdout for every tool call; the bridge responds via
+            // outbound control_response{...{behavior:"allow"|"deny"}}.
+            args.push("--permission-prompt-tool".into());
+            args.push("stdio".into());
+        }
+        args.push("--add-dir".into());
+        args.push(cwd.clone().into_os_string());
+        // `--session-id` and `--resume` are mutually exclusive on the
+        // claude CLI: `--session-id` creates a new session with that id,
+        // `--resume` opens the existing one. Passing both together makes
+        // claude accept the session but silently swallow stdin from then
+        // on (observed in conformance reproductions: every turn/start
+        // hits the bridge but never produces an assistant reply).
+        if resume {
+            args.push("--resume".into());
+            args.push(thread_id.clone().into());
+        } else {
+            args.push("--session-id".into());
+            args.push(thread_id.clone().into());
+        }
+        if let Some(m) = model.as_deref() {
+            args.push("--model".into());
+            args.push(m.into());
+        }
+        if let Some(prompt) = append_system_prompt.as_deref() {
+            args.push("--append-system-prompt".into());
+            args.push(prompt.into());
+        }
+
+        let spec = ProcessSpec {
+            role: ProcessRole::Agent,
+            program: claude_bin.clone(),
+            args,
+            cwd: Some(cwd.clone()),
+            env: Vec::new(),
+            stdin: StdioMode::Piped,
+            stdout: StdioMode::Piped,
+            stderr: StdioMode::Piped,
+        };
+        let mut child = launcher.launch(spec).await.with_context(|| {
+            format!(
+                "spawning {} (cwd={}, cwd_exists={}, claude_bin_exists={})",
+                claude_bin.display(),
+                cwd.display(),
+                cwd.is_dir(),
+                claude_bin.exists()
+            )
+        })?;
+
+        let pid = child.id();
+        let stdin = child
+            .take_stdin()
+            .ok_or_else(|| anyhow!("claude child has no stdin pipe"))?;
+        let stdout = child
+            .take_stdout()
+            .ok_or_else(|| anyhow!("claude child has no stdout pipe"))?;
+        let stderr = child
+            .take_stderr()
+            .ok_or_else(|| anyhow!("claude child has no stderr pipe"))?;
+
+        let (writer_tx, writer_rx) = mpsc::unbounded_channel::<String>();
+        let (events_tx, _events_rx) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
+        let init_slot: Arc<InitSlot> = Arc::new(InitSlot::default());
+        let pending_controls: Arc<Mutex<HashMap<String, oneshot::Sender<ControlResponseBody>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        // Seed runtime_state with whatever was passed at spawn — claude reads
+        // `--model <m>` directly so we know that value is live without ever
+        // sending set_model. Thinking tokens / permission mode have no
+        // corresponding spawn flags in our wrapper, so they stay None until
+        // the first apply_runtime_overrides call sets them.
+        let runtime_state = Arc::new(Mutex::new(RuntimeState {
+            model: model.clone(),
+            thinking_tokens: None,
+            permission_mode: None,
+        }));
+
+        let writer = tokio::spawn(writer_task(stdin, writer_rx));
+        let reader = tokio::spawn(reader_task(
+            stdout,
+            init_slot.clone(),
+            events_tx.clone(),
+            pending_controls.clone(),
+        ));
+        let stderr_handle = tokio::spawn(stderr_task(stderr, pid));
+
+        let tasks = Arc::new(TaskSet {
+            writer: Mutex::new(Some(writer)),
+            reader: Mutex::new(Some(reader)),
+            stderr: Mutex::new(Some(stderr_handle)),
+            child: Mutex::new(Some(child)),
+        });
+
+        Ok(Self {
+            cwd,
+            claude_bin,
+            thread_id,
+            pid,
+            writer_tx,
+            events_tx,
+            init_slot,
+            pending_controls,
+            runtime_state,
+            _tasks: tasks,
+        })
+    }
+
+    /// Working directory claude was bound to at spawn time.
+    pub fn cwd(&self) -> &Path {
+        &self.cwd
+    }
+
+    /// Path of the claude binary spawned for this handle.
+    pub fn claude_bin(&self) -> &Path {
+        &self.claude_bin
+    }
+
+    /// Codex thread id == claude session id this handle was spawned for.
+    pub fn thread_id(&self) -> &str {
+        &self.thread_id
+    }
+
+    /// OS process id (when the spawn surfaced one).
+    pub fn pid(&self) -> Option<u32> {
+        self.pid
+    }
+
+    /// Subscribe to the broadcast event channel. New subscribers see only
+    /// events emitted *after* they subscribe. Per-turn translator state is
+    /// kept on the bridge side, not replayed by the pool.
+    pub fn subscribe_events(&self) -> broadcast::Receiver<ClaudeEvent> {
+        self.events_tx.subscribe()
+    }
+
+    /// Wait until claude has emitted its `system/init` line, returning a
+    /// clone of the captured payload. If init has already landed, returns
+    /// immediately.
+    ///
+    /// Errors with [`ClaudeProcessError::InitTimeout`] if `deadline` elapses
+    /// before init lands (in which case the caller should consider the
+    /// child unhealthy and tear it down via `shutdown()`).
+    pub async fn wait_for_init(
+        &self,
+        deadline: Duration,
+    ) -> Result<SystemInit, ClaudeProcessError> {
+        // Fast path: init already captured.
+        if let Some(payload) = self.init_slot.payload.lock().await.clone() {
+            return Ok(payload);
+        }
+        // Slow path: register interest, then re-check (avoids a TOCTOU race
+        // between the early peek and the actual `notified()` await).
+        let wait_loop = async {
+            loop {
+                let notified = self.init_slot.notify.notified();
+                if let Some(payload) = self.init_slot.payload.lock().await.clone() {
+                    return Ok::<_, ClaudeProcessError>(payload);
+                }
+                notified.await;
+                if let Some(payload) = self.init_slot.payload.lock().await.clone() {
+                    return Ok(payload);
+                }
+            }
+        };
+        match timeout(deadline, wait_loop).await {
+            Ok(result) => result,
+            Err(_) => Err(ClaudeProcessError::InitTimeout),
+        }
+    }
+
+    /// Send a single line (caller-serialized JSON) to claude's stdin. Used
+    /// by `turn::handle_turn_start` / `turn/steer` to push a user envelope.
+    /// Lines do not include the trailing newline — the writer task adds it.
+    pub fn send_line(&self, line: String) -> Result<(), ClaudeProcessError> {
+        self.writer_tx
+            .send(line)
+            .map_err(|e| ClaudeProcessError::WriterClosed(e.to_string()))
+    }
+
+    /// Convenience: serialize `value` to a single JSON line and queue it on
+    /// the writer.
+    pub fn send_serialized<T: serde::Serialize>(
+        &self,
+        value: &T,
+    ) -> Result<(), ClaudeProcessError> {
+        let line = serde_json::to_string(value)?;
+        self.send_line(line)
+    }
+
+    /// Send a typed `control_request` and await the matching
+    /// `control_response`. Mints a UUID for the request id, registers a
+    /// pending oneshot, writes the envelope, and waits up to `deadline`.
+    ///
+    /// Returns the success body (with any subtype-specific extras), or one of:
+    /// - [`ClaudeProcessError::ControlError`] when claude replies with
+    ///   `subtype:"error"`.
+    /// - [`ClaudeProcessError::ControlTimeout`] when `deadline` elapses.
+    /// - [`ClaudeProcessError::ControlCancelled`] when the process exits or
+    ///   the response gets routed to a different waiter.
+    /// - [`ClaudeProcessError::WriterClosed`] when stdin is gone before the
+    ///   envelope could be written.
+    ///
+    /// Used by `turn/interrupt`, `thread/rollback`, and the runtime config
+    /// setters (`set_model`, `set_permission_mode`, `set_max_thinking_tokens`).
+    pub async fn request_control(
+        &self,
+        request: ControlRequestBody,
+        deadline: Duration,
+    ) -> Result<ControlResponseBody, ClaudeProcessError> {
+        let request_id = Uuid::now_v7().to_string();
+        let (tx, rx) = oneshot::channel();
+        {
+            let mut pending = self.pending_controls.lock().await;
+            pending.insert(request_id.clone(), tx);
+        }
+        let envelope = ClaudeInbound::ControlRequest(ControlRequestEnvelope {
+            request_id: request_id.clone(),
+            request,
+        });
+        if let Err(err) = self.send_serialized(&envelope) {
+            // Pull the slot back so we don't leak a sender.
+            let mut pending = self.pending_controls.lock().await;
+            pending.remove(&request_id);
+            return Err(err);
+        }
+        match timeout(deadline, rx).await {
+            Ok(Ok(body)) => match body {
+                ControlResponseBody::Success { response } => {
+                    Ok(ControlResponseBody::Success { response })
+                }
+                ControlResponseBody::Error { error } => Err(ClaudeProcessError::ControlError {
+                    request_id,
+                    message: error,
+                }),
+            },
+            Ok(Err(_)) => Err(ClaudeProcessError::ControlCancelled { request_id }),
+            Err(_) => {
+                // Reclaim the slot so a late response doesn't sit in the map.
+                let mut pending = self.pending_controls.lock().await;
+                pending.remove(&request_id);
+                Err(ClaudeProcessError::ControlTimeout {
+                    request_id,
+                    elapsed: deadline,
+                })
+            }
+        }
+    }
+
+    /// Apply per-turn runtime overrides via `control_request` setters and
+    /// remember what was applied so subsequent calls only dispatch the diff.
+    ///
+    /// `None` means "leave the current value alone" (do not dispatch);
+    /// `Some(_)` means "ensure claude is running with this value" (dispatch
+    /// only if it differs from the cached state).
+    ///
+    /// On any setter failure the runtime cache is NOT updated, so a retry
+    /// will re-attempt rather than silently ignore the override. Errors are
+    /// returned as-is from `request_control`.
+    pub async fn apply_runtime_overrides(
+        &self,
+        model: Option<&str>,
+        thinking_tokens: Option<u32>,
+        permission_mode: Option<&str>,
+        deadline: Duration,
+    ) -> Result<(), ClaudeProcessError> {
+        if let Some(want) = model {
+            let need_dispatch = {
+                let guard = self.runtime_state.lock().await;
+                guard.model.as_deref() != Some(want)
+            };
+            if need_dispatch {
+                self.request_control(
+                    ControlRequestBody::SetModel {
+                        model: want.to_string(),
+                    },
+                    deadline,
+                )
+                .await?;
+                let mut guard = self.runtime_state.lock().await;
+                guard.model = Some(want.to_string());
+            }
+        }
+        if let Some(want) = thinking_tokens {
+            let need_dispatch = {
+                let guard = self.runtime_state.lock().await;
+                guard.thinking_tokens != Some(want)
+            };
+            if need_dispatch {
+                self.request_control(
+                    ControlRequestBody::SetMaxThinkingTokens { tokens: want },
+                    deadline,
+                )
+                .await?;
+                let mut guard = self.runtime_state.lock().await;
+                guard.thinking_tokens = Some(want);
+            }
+        }
+        if let Some(want) = permission_mode {
+            let need_dispatch = {
+                let guard = self.runtime_state.lock().await;
+                guard.permission_mode.as_deref() != Some(want)
+            };
+            if need_dispatch {
+                self.request_control(
+                    ControlRequestBody::SetPermissionMode {
+                        mode: want.to_string(),
+                    },
+                    deadline,
+                )
+                .await?;
+                let mut guard = self.runtime_state.lock().await;
+                guard.permission_mode = Some(want.to_string());
+            }
+        }
+        Ok(())
+    }
+
+    /// Snapshot the runtime cache. Cheap clone of three small Options. Useful
+    /// for diagnostics and tests.
+    pub async fn runtime_snapshot(&self) -> (Option<String>, Option<u32>, Option<String>) {
+        let guard = self.runtime_state.lock().await;
+        (
+            guard.model.clone(),
+            guard.thinking_tokens,
+            guard.permission_mode.clone(),
+        )
+    }
+
+    /// Close stdin to signal a clean shutdown, then wait for claude to exit
+    /// and reap the child. Idempotent.
+    pub async fn shutdown(&self) {
+        // Aborting the writer task drops its `ChildStdin`, which closes
+        // claude's stdin pipe and causes a clean exit.
+        if let Some(handle) = self._tasks.writer.lock().await.take() {
+            handle.abort();
+        }
+        if let Some(handle) = self._tasks.stderr.lock().await.take() {
+            handle.abort();
+        }
+        if let Some(mut child) = self._tasks.child.lock().await.take() {
+            // kill is a no-op if the child has already exited via stdin EOF.
+            // We still call it as a safety net for stuck children.
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+        }
+        if let Some(handle) = self._tasks.reader.lock().await.take() {
+            handle.abort();
+        }
+    }
+}
+
+async fn writer_task(mut stdin: ChildStdin, mut rx: mpsc::UnboundedReceiver<String>) {
+    while let Some(mut line) = rx.recv().await {
+        line.push('\n');
+        if let Err(err) = stdin.write_all(line.as_bytes()).await {
+            tracing::warn!(?err, "claude writer task: stdin write failed; exiting");
+            break;
+        }
+        if let Err(err) = stdin.flush().await {
+            tracing::warn!(?err, "claude writer task: stdin flush failed; exiting");
+            break;
+        }
+    }
+    // Dropping `stdin` here closes claude's input pipe, prompting it to exit.
+}
+
+async fn reader_task(
+    stdout: ChildStdout,
+    init_slot: Arc<InitSlot>,
+    events_tx: broadcast::Sender<ClaudeEvent>,
+    pending_controls: Arc<Mutex<HashMap<String, oneshot::Sender<ControlResponseBody>>>>,
+) {
+    let reader = BufReader::new(stdout);
+    let mut lines = reader.lines();
+    loop {
+        let line = match lines.next_line().await {
+            Ok(Some(line)) => line,
+            Ok(None) => {
+                tracing::debug!("claude reader task: stdout closed");
+                break;
+            }
+            Err(err) => {
+                tracing::warn!(?err, "claude reader task: read error; exiting");
+                break;
+            }
+        };
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<ClaudeOutbound>(trimmed) {
+            Ok(payload) => {
+                // Capture init the first time we see it. Subsequent inits
+                // (claude does not emit them today, but if a future version
+                // re-publishes after a model swap we want the latest) replace
+                // the slot — translator subscribers see the broadcast either
+                // way.
+                if let ClaudeOutbound::System(SystemEvent::Init(ref init_payload)) = payload {
+                    let mut slot = init_slot.payload.lock().await;
+                    *slot = Some((**init_payload).clone());
+                    drop(slot);
+                    init_slot.notify.notify_waiters();
+                }
+                // Route control_responses to their pending waiter before
+                // broadcasting. `request_id` lives nested inside the outer
+                // `response` per the SDK's wire shape. The translator silently
+                // drops the broadcast copy (KeepAlive-style), so missing the
+                // route doesn't cause a crash — but waiters will time out.
+                if let ClaudeOutbound::ControlResponse(ref env) = payload {
+                    let request_id = env.response.request_id().to_string();
+                    let waiter = {
+                        let mut pending = pending_controls.lock().await;
+                        pending.remove(&request_id)
+                    };
+                    if let Some(tx) = waiter {
+                        let _ = tx.send(ControlResponseBody::from_inner(env.response.clone()));
+                    } else {
+                        tracing::debug!(
+                            %request_id,
+                            "control_response had no matching pending waiter (timed out or stray)"
+                        );
+                    }
+                }
+                let event = ClaudeEvent::new(payload);
+                // `send` returns Err when there are no subscribers; that's
+                // normal early in startup and not a fault.
+                let _ = events_tx.send(event);
+            }
+            Err(err) => {
+                tracing::warn!(?err, line = %trimmed, "claude reader task: failed to parse line");
+            }
+        }
+    }
+    // Process exit drains every waiter so they error with ControlCancelled
+    // instead of hanging on the deadline.
+    let mut pending = pending_controls.lock().await;
+    pending.clear();
+}
+
+async fn stderr_task(stderr: ChildStderr, pid: Option<u32>) {
+    let reader = BufReader::new(stderr);
+    let mut lines = reader.lines();
+    while let Ok(Some(line)) = lines.next_line().await {
+        // Claude prints diagnostic chatter to stderr; surface it through
+        // tracing so debug builds get it without polluting the codex
+        // JSON-RPC channel.
+        tracing::debug!(?pid, "claude stderr: {line}");
+    }
+}
+
+#[cfg(any(test, feature = "test-helpers"))]
+impl ClaudeProcessHandle {
+    /// Build a [`ClaudeProcessHandle`] that is *not* attached to any
+    /// subprocess. Used by `pool` unit tests that exercise pool bookkeeping
+    /// without needing a real claude child. Sending lines or waiting for
+    /// init against a dangling handle will hang or error; tests must not
+    /// call `send_line` / `wait_for_init` on a dangling handle.
+    pub fn __test_dangling(
+        writer_tx: mpsc::UnboundedSender<String>,
+        events_tx: broadcast::Sender<ClaudeEvent>,
+        cwd: PathBuf,
+    ) -> Self {
+        Self {
+            cwd,
+            claude_bin: PathBuf::from("/dev/null"),
+            thread_id: "test-thread".into(),
+            pid: None,
+            writer_tx,
+            events_tx,
+            init_slot: Arc::new(InitSlot::default()),
+            pending_controls: Arc::new(Mutex::new(HashMap::new())),
+            runtime_state: Arc::new(Mutex::new(RuntimeState::default())),
+            _tasks: Arc::new(TaskSet {
+                writer: Mutex::new(None),
+                reader: Mutex::new(None),
+                stderr: Mutex::new(None),
+                child: Mutex::new(None),
+            }),
+        }
+    }
+
+    /// Test-only handle to the pending-controls table so the request_control
+    /// tests below can simulate the reader resolving a waiter.
+    #[cfg(test)]
+    fn pending_controls_handle(
+        &self,
+    ) -> Arc<Mutex<HashMap<String, oneshot::Sender<ControlResponseBody>>>> {
+        self.pending_controls.clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pool::claude_protocol::SystemInit;
+
+    #[tokio::test]
+    async fn wait_for_init_returns_immediately_when_already_set() {
+        let (writer_tx, _writer_rx) = mpsc::unbounded_channel::<String>();
+        let (events_tx, _events_rx) = broadcast::channel(8);
+        let handle =
+            ClaudeProcessHandle::__test_dangling(writer_tx, events_tx, PathBuf::from("/tmp"));
+        // Pre-populate the init slot.
+        let init = SystemInit {
+            session_id: "s1".into(),
+            cwd: "/tmp".into(),
+            model: "haiku".into(),
+            tools: vec![],
+            mcp_servers: vec![],
+            slash_commands: vec![],
+            agents: vec![],
+            skills: vec![],
+            permission_mode: None,
+            api_key_source: None,
+            claude_code_version: None,
+            output_style: None,
+            uuid: None,
+            extra: Default::default(),
+        };
+        *handle.init_slot.payload.lock().await = Some(init.clone());
+        // Tiny deadline — should return well before it elapses.
+        let got = handle
+            .wait_for_init(Duration::from_millis(50))
+            .await
+            .expect("init");
+        assert_eq!(got.session_id, "s1");
+    }
+
+    #[tokio::test]
+    async fn wait_for_init_times_out_when_never_set() {
+        let (writer_tx, _writer_rx) = mpsc::unbounded_channel::<String>();
+        let (events_tx, _events_rx) = broadcast::channel(8);
+        let handle =
+            ClaudeProcessHandle::__test_dangling(writer_tx, events_tx, PathBuf::from("/tmp"));
+        let result = handle.wait_for_init(Duration::from_millis(50)).await;
+        assert!(matches!(result, Err(ClaudeProcessError::InitTimeout)));
+    }
+
+    #[tokio::test]
+    async fn request_control_resolves_when_reader_routes_success() {
+        let (writer_tx, mut writer_rx) = mpsc::unbounded_channel::<String>();
+        let (events_tx, _events_rx) = broadcast::channel(8);
+        let handle = Arc::new(ClaudeProcessHandle::__test_dangling(
+            writer_tx,
+            events_tx,
+            PathBuf::from("/tmp"),
+        ));
+        let pending = handle.pending_controls_handle();
+        let h2 = Arc::clone(&handle);
+        let task = tokio::spawn(async move {
+            h2.request_control(ControlRequestBody::Interrupt, Duration::from_secs(2))
+                .await
+        });
+        // Drain the queued envelope and extract its request_id.
+        let line = writer_rx.recv().await.expect("writer line");
+        let parsed: serde_json::Value = serde_json::from_str(&line).expect("json");
+        let request_id = parsed["request_id"]
+            .as_str()
+            .expect("request_id")
+            .to_string();
+        assert_eq!(parsed["type"], "control_request");
+        assert_eq!(parsed["request"]["subtype"], "interrupt");
+        // Simulate the reader routing the matching control_response.
+        let waiter = {
+            let mut p = pending.lock().await;
+            p.remove(&request_id).expect("waiter must be registered")
+        };
+        waiter
+            .send(ControlResponseBody::Success { response: None })
+            .unwrap();
+        let body = task.await.expect("join").expect("ok");
+        assert!(matches!(body, ControlResponseBody::Success { .. }));
+    }
+
+    #[tokio::test]
+    async fn request_control_propagates_error_subtype() {
+        let (writer_tx, mut writer_rx) = mpsc::unbounded_channel::<String>();
+        let (events_tx, _events_rx) = broadcast::channel(8);
+        let handle = Arc::new(ClaudeProcessHandle::__test_dangling(
+            writer_tx,
+            events_tx,
+            PathBuf::from("/tmp"),
+        ));
+        let pending = handle.pending_controls_handle();
+        let h2 = Arc::clone(&handle);
+        let task = tokio::spawn(async move {
+            h2.request_control(
+                ControlRequestBody::SetModel {
+                    model: "ghost".into(),
+                },
+                Duration::from_secs(2),
+            )
+            .await
+        });
+        let line = writer_rx.recv().await.expect("writer line");
+        let parsed: serde_json::Value = serde_json::from_str(&line).expect("json");
+        let request_id = parsed["request_id"].as_str().unwrap().to_string();
+        let waiter = pending.lock().await.remove(&request_id).unwrap();
+        waiter
+            .send(ControlResponseBody::Error {
+                error: "no such model: ghost".into(),
+            })
+            .unwrap();
+        let err = task.await.expect("join").expect_err("error expected");
+        match err {
+            ClaudeProcessError::ControlError { message, .. } => {
+                assert_eq!(message, "no such model: ghost")
+            }
+            other => panic!("expected ControlError, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn request_control_times_out_and_reclaims_slot() {
+        let (writer_tx, mut writer_rx) = mpsc::unbounded_channel::<String>();
+        let (events_tx, _events_rx) = broadcast::channel(8);
+        let handle = Arc::new(ClaudeProcessHandle::__test_dangling(
+            writer_tx,
+            events_tx,
+            PathBuf::from("/tmp"),
+        ));
+        let pending = handle.pending_controls_handle();
+        let h2 = Arc::clone(&handle);
+        let task = tokio::spawn(async move {
+            h2.request_control(ControlRequestBody::Interrupt, Duration::from_millis(60))
+                .await
+        });
+        // Consume the queued line so the channel doesn't back up.
+        let _ = writer_rx.recv().await.unwrap();
+        let err = task.await.expect("join").expect_err("timeout expected");
+        assert!(matches!(err, ClaudeProcessError::ControlTimeout { .. }));
+        // Slot must be reclaimed so a stray late response doesn't sit in the
+        // map.
+        assert!(pending.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn request_control_errors_when_writer_closed() {
+        let (writer_tx, writer_rx) = mpsc::unbounded_channel::<String>();
+        let (events_tx, _events_rx) = broadcast::channel(8);
+        // Drop the receiver so the writer side reports closed on send.
+        drop(writer_rx);
+        let handle =
+            ClaudeProcessHandle::__test_dangling(writer_tx, events_tx, PathBuf::from("/tmp"));
+        let err = handle
+            .request_control(ControlRequestBody::Interrupt, Duration::from_secs(1))
+            .await
+            .expect_err("writer closed");
+        assert!(matches!(err, ClaudeProcessError::WriterClosed(_)));
+    }
+
+    #[tokio::test]
+    async fn wait_for_init_unblocks_when_slot_populated_after_subscribe() {
+        let (writer_tx, _writer_rx) = mpsc::unbounded_channel::<String>();
+        let (events_tx, _events_rx) = broadcast::channel(8);
+        let handle = Arc::new(ClaudeProcessHandle::__test_dangling(
+            writer_tx,
+            events_tx,
+            PathBuf::from("/tmp"),
+        ));
+        let h2 = Arc::clone(&handle);
+        let waiter = tokio::spawn(async move { h2.wait_for_init(Duration::from_secs(2)).await });
+        // Yield, then publish.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let init = SystemInit {
+            session_id: "s2".into(),
+            cwd: "/tmp".into(),
+            model: "sonnet".into(),
+            tools: vec![],
+            mcp_servers: vec![],
+            slash_commands: vec![],
+            agents: vec![],
+            skills: vec![],
+            permission_mode: None,
+            api_key_source: None,
+            claude_code_version: None,
+            output_style: None,
+            uuid: None,
+            extra: Default::default(),
+        };
+        *handle.init_slot.payload.lock().await = Some(init);
+        handle.init_slot.notify.notify_waiters();
+        let got = waiter.await.expect("join").expect("init");
+        assert_eq!(got.session_id, "s2");
+    }
+}

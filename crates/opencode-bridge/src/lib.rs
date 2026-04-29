@@ -8,4 +8,5 @@ pub mod sse;
 pub mod state;
 pub mod translate;
 
-pub use handlers::OpencodeBridge;
+pub use handlers::{OpencodeBridge, OpencodeBridgeBuilder};
+pub use opencode_proc::OpencodeRuntime;

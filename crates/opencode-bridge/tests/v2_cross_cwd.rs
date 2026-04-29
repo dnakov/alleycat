@@ -10,9 +10,7 @@ mod support;
 use std::time::Duration;
 
 use serde_json::{Value, json};
-use support::{
-    FakeServerState, await_captured_body, bring_up_bridge, read_until_response, send,
-};
+use support::{FakeServerState, await_captured_body, bring_up_bridge, read_until_response, send};
 
 #[tokio::test]
 async fn two_threads_in_different_cwds_remain_separate() {
@@ -94,7 +92,10 @@ async fn two_threads_in_different_cwds_remain_separate() {
         .expect("thread b id")
         .to_string();
     assert_eq!(started_b["result"]["cwd"], "/tmp/b");
-    assert_ne!(thread_a, thread_b, "distinct cwds must mint distinct threads");
+    assert_ne!(
+        thread_a, thread_b,
+        "distinct cwds must mint distinct threads"
+    );
 
     // thread/list { cwd:/tmp/a } → only ses_a appears.
     send(&mut fx.write, 4, "thread/list", json!({"cwd":"/tmp/a"})).await;
@@ -126,17 +127,19 @@ async fn two_threads_in_different_cwds_remain_separate() {
     // post-filtered locally) by inspecting the captured request paths.
     let seen = fx.seen();
     assert!(
-        seen.iter().any(|line| line.contains("GET /session?directory=%2Ftmp%2Fa")),
+        seen.iter()
+            .any(|line| line.contains("GET /session?directory=%2Ftmp%2Fa")),
         "expected /tmp/a directory filter on upstream GET /session: {seen:?}"
     );
     assert!(
-        seen.iter().any(|line| line.contains("GET /session?directory=%2Ftmp%2Fb")),
+        seen.iter()
+            .any(|line| line.contains("GET /session?directory=%2Ftmp%2Fb")),
         "expected /tmp/b directory filter on upstream GET /session: {seen:?}"
     );
 
     // Drain any queued response bodies just to keep the mutex's `bodies` map
     // honest in case future assertions rely on its contents — best-effort.
-    let _: Value = await_captured_body(&fx.state, "POST /session?", Duration::from_millis(200))
-        .await;
+    let _: Value =
+        await_captured_body(&fx.state, "POST /session?", Duration::from_millis(200)).await;
     fx.shutdown().await;
 }
