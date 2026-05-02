@@ -99,6 +99,7 @@ impl EventTranslatorState {
             PiEvent::TurnStart => Vec::new(),
             PiEvent::AgentEnd { .. } => self.translate_agent_end(),
             PiEvent::TurnEnd { .. } => Vec::new(),
+            PiEvent::ThinkingLevelChanged { .. } => Vec::new(),
 
             PiEvent::MessageStart { message } => match message {
                 AgentMessage::Assistant(a) => self.translate_message_start(a),
