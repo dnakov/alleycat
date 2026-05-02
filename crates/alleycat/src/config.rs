@@ -77,6 +77,7 @@ impl Default for AgentsConfig {
 #[serde(default)]
 pub struct CodexAgentConfig {
     pub enabled: bool,
+    pub bin: String,
     pub host: String,
     pub port: u16,
 }
@@ -85,6 +86,7 @@ impl Default for CodexAgentConfig {
     fn default() -> Self {
         Self {
             enabled: true,
+            bin: "codex".to_string(),
             host: "127.0.0.1".to_string(),
             port: 8390,
         }
@@ -243,6 +245,7 @@ mod tests {
     fn default_config_routes_codex_to_local_app_server() {
         let config = HostConfig::default();
         assert!(config.agents.codex.enabled);
+        assert_eq!(config.agents.codex.bin, "codex");
         assert_eq!(config.agents.codex.host, "127.0.0.1");
         assert_eq!(config.agents.codex.port, 8390);
         assert!(config.agents.pi.enabled);

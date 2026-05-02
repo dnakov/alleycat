@@ -1,7 +1,8 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::process::Stdio;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use alleycat_bridge_core::session::{Session, SessionRegistry, SessionRegistryConfig};
 use alleycat_bridge_core::{Bridge, Conn, JsonRpcError, LocalLauncher};
@@ -12,16 +13,19 @@ use anyhow::{Context, anyhow};
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use serde_json::Value;
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, BufReader};
 use tokio::net::TcpStream;
-use tokio::sync::OnceCell;
+use tokio::process::{Child, Command};
+use tokio::sync::{Mutex, OnceCell};
+use tracing::warn;
 
 use crate::config::HostConfig;
 use crate::protocol::{AgentInfo, AgentWire};
 use crate::stream::IrohStream;
 
 /// Stable identifier for a JSON-RPC bridge agent. Codex is intentionally
-/// excluded — it's a transparent TCP byte-pump, not a `Bridge` impl.
+/// excluded — the daemon runs a single shared `codex app-server` in
+/// websocket-listen mode and byte-pumps each iroh stream straight to it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum AgentKind {
     Pi,
@@ -37,6 +41,11 @@ pub struct AgentManager {
     /// child + opens an SSE subscription; we don't want to pay that cost on
     /// daemon startup if no client ever asks for opencode.
     opencode_bridge: Arc<OnceCell<Arc<OpencodeBridge>>>,
+    /// One shared `codex app-server --listen ws://...` for the daemon
+    /// lifetime, lazy-spawned on first `connect`. Codex multiplexes
+    /// conversations internally, so each iroh stream is its own websocket
+    /// client and the child stays up across client disconnects.
+    codex_child: Arc<Mutex<Option<Child>>>,
     session_registry: Arc<SessionRegistry>,
     /// Held to keep the registry's reaper alive for the daemon lifetime.
     _reaper_handle: Arc<tokio::task::JoinHandle<()>>,
@@ -98,6 +107,7 @@ impl AgentManager {
             config,
             bridges,
             opencode_bridge: Arc::new(OnceCell::new()),
+            codex_child: Arc::new(Mutex::new(None)),
             session_registry,
             _reaper_handle: reaper_handle,
         })
@@ -113,7 +123,7 @@ impl AgentManager {
                 name: "codex".to_string(),
                 display_name: "Codex".to_string(),
                 wire: AgentWire::Websocket,
-                available: self.codex_available().await,
+                available: self.codex_available(),
             },
             AgentInfo {
                 name: "pi".to_string(),
@@ -146,11 +156,11 @@ impl AgentManager {
         last_seen: Option<u64>,
     ) -> anyhow::Result<()> {
         match agent {
-            // Codex doesn't participate in the JSON-RPC replay scheme — it's
-            // a transparent TCP byte-pump to the codex app-server, which has
-            // its own resume semantics (SQLite session store). The session
-            // is held just so the registry's accounting stays uniform; its
-            // ring stays empty.
+            // Codex doesn't participate in the JSON-RPC replay scheme —
+            // each iroh stream is a fresh websocket client to the shared
+            // codex app-server, and codex has its own resume semantics
+            // (SQLite session store). The session is held just so the
+            // registry's accounting stays uniform; its ring stays empty.
             "codex" => {
                 let _ = (session, last_seen);
                 self.serve_codex(stream).await
@@ -218,19 +228,90 @@ impl AgentManager {
     }
 
     async fn serve_codex(&self, mut iroh_stream: IrohStream) -> anyhow::Result<()> {
-        let cfg = self.config.load();
-        let codex = &cfg.agents.codex;
-        if !codex.enabled {
-            return Err(anyhow!("codex agent is disabled"));
-        }
-        let host = codex.host.clone();
-        let port = codex.port;
-        drop(cfg);
+        let (host, port) = self.ensure_codex_running().await?;
         let mut tcp = TcpStream::connect((host.as_str(), port))
             .await
-            .with_context(|| format!("connecting to Codex at {host}:{port}"))?;
+            .with_context(|| format!("connecting to codex app-server at {host}:{port}"))?;
         let _ = tokio::io::copy_bidirectional(&mut iroh_stream, &mut tcp).await;
         Ok(())
+    }
+
+    /// Ensures *something* is listening on the configured codex websocket
+    /// address. If an externally-managed codex (or a previously-spawned
+    /// child) is already accepting connections, we use it as-is and skip
+    /// spawning. Otherwise we spawn `<bin> app-server --listen ws://...`
+    /// and wait for the port to bind. Returns `(host, port)` for the
+    /// byte-pump to dial.
+    async fn ensure_codex_running(&self) -> anyhow::Result<(String, u16)> {
+        let (bin, host, port) = {
+            let cfg = self.config.load();
+            if !cfg.agents.codex.enabled {
+                return Err(anyhow!("codex agent is disabled"));
+            }
+            (
+                cfg.agents.codex.bin.clone(),
+                cfg.agents.codex.host.clone(),
+                cfg.agents.codex.port,
+            )
+        };
+
+        // Fast path: port is already accepting connections.
+        if TcpStream::connect((host.as_str(), port)).await.is_ok() {
+            return Ok((host, port));
+        }
+
+        let mut guard = self.codex_child.lock().await;
+
+        // Re-probe under the lock so concurrent first-connects don't both
+        // try to spawn.
+        if TcpStream::connect((host.as_str(), port)).await.is_ok() {
+            return Ok((host, port));
+        }
+
+        let child_alive = matches!(
+            guard.as_mut().map(Child::try_wait),
+            Some(Ok(None))
+        );
+        if !child_alive {
+            let listen = format!("ws://{host}:{port}");
+            let mut child = Command::new(&bin)
+                .arg("app-server")
+                .arg("--listen")
+                .arg(&listen)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped())
+                .kill_on_drop(true)
+                .spawn()
+                .with_context(|| format!("spawning `{bin} app-server --listen {listen}`"))?;
+
+            if let Some(stderr) = child.stderr.take() {
+                tokio::spawn(async move {
+                    let mut lines = BufReader::new(stderr).lines();
+                    while let Ok(Some(line)) = lines.next_line().await {
+                        warn!(target: "codex", "{line}");
+                    }
+                });
+            }
+
+            *guard = Some(child);
+        }
+        drop(guard);
+
+        // Poll the listener until it accepts a connection. Codex usually
+        // binds within a few hundred milliseconds; 5s is generous.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if TcpStream::connect((host.as_str(), port)).await.is_ok() {
+                return Ok((host, port));
+            }
+            if Instant::now() >= deadline {
+                return Err(anyhow!(
+                    "codex app-server did not start listening on {host}:{port} within 5s"
+                ));
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
     }
 
     async fn opencode_bridge_arc(&self) -> anyhow::Result<Arc<OpencodeBridge>> {
@@ -261,17 +342,9 @@ impl AgentManager {
         Ok(Arc::clone(bridge))
     }
 
-    async fn codex_available(&self) -> bool {
+    fn codex_available(&self) -> bool {
         let cfg = self.config.load();
-        let codex = &cfg.agents.codex;
-        if !codex.enabled {
-            return false;
-        }
-        let addr = (codex.host.clone(), codex.port);
-        drop(cfg);
-        tokio::time::timeout(Duration::from_millis(250), TcpStream::connect(addr))
-            .await
-            .is_ok_and(|result| result.is_ok())
+        cfg.agents.codex.enabled && which::which(&cfg.agents.codex.bin).is_ok()
     }
 
     fn pi_available(&self) -> bool {

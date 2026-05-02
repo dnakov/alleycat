@@ -36,7 +36,7 @@ The daemon spawns external coding-agent CLIs on demand — install whichever one
 | `claude` | `npm install -g @anthropic-ai/claude-code` (or `bun install -g @anthropic-ai/claude-code`). Then `claude /login` once. |
 | `opencode` | See [opencode docs](https://opencode.ai). |
 | `pi-coding-agent` | See pi-mono docs. |
-| `codex` | BYO `codex app-server` listening on `127.0.0.1:8390` (configurable). |
+| `codex` | Install the `codex` CLI ([codex docs](https://github.com/openai/codex)). The daemon spawns `codex app-server` on demand. |
 
 ## Commands
 
@@ -58,7 +58,7 @@ The daemon talks to the CLI over a Unix domain socket on macOS/Linux and a per-u
 
 | Agent | Spawned by daemon? | How |
 |---|---|---|
-| `codex` | No — BYO | Raw TCP proxy to `127.0.0.1:8390` (configurable). You run `codex app-server` yourself. |
+| `codex` | Yes, one shared backend | Lazy spawn of `codex app-server --listen ws://<host>:<port>` on first `connect`. The child is kept alive for the daemon lifetime; each iroh stream becomes a fresh websocket client and conversations persist independently of any single client. |
 | `pi` | Yes, per codex thread | `PiPool` spawns `pi-coding-agent --mode rpc` on demand, bounded at 16 processes with a 10-minute idle reap and LRU eviction. |
 | `opencode` | Yes, one shared backend | Lazy spawn of `opencode serve --port=auto --auth-token=auto` on first connect, gated on `/global/health`. Or set `OPENCODE_BRIDGE_BACKEND_URL` to point at an existing instance. |
 | `claude` | Yes, per codex thread | `ClaudePool` spawns `claude -p --input-format stream-json --output-format stream-json --session-id <thread_id> --dangerously-skip-permissions` on demand. Same 16-cap, 10-minute idle reap, LRU eviction as pi. Sessions resume on next access via `--resume <thread_id>`. |
@@ -90,7 +90,7 @@ or
 {"op": "connect", "v": 1, "token": "...", "agent": "codex"}
 ```
 
-The daemon answers with `{ok, agents?, error?}`. On `connect`, after the response the stream becomes the agent's native wire — raw codex app-server bytes for `codex`, JSON-RPC over JSONL for `pi`, `opencode`, and `claude`.
+The daemon answers with `{ok, agents?, error?}`. On `connect`, after the response the stream becomes the agent's native wire — websocket frames for `codex` (the daemon proxies straight to the shared `codex app-server` listener), JSON-RPC over JSONL for `pi`, `opencode`, and `claude`.
 
 ## Configuration
 
@@ -102,6 +102,7 @@ token = "..."          # 32 bytes hex; rotate via `alleycat rotate`
 
 [agents.codex]
 enabled = true
+bin = "codex"
 host = "127.0.0.1"
 port = 8390
 
@@ -118,7 +119,7 @@ enabled = true
 bin = "claude"
 ```
 
-Reload swaps config that's read per-request (token, agent enable flags, codex host/port). Pi's `bin` and OpenCode's `bin`/runtime port are pinned at first construction; changing those still requires `alleycat stop` + `serve`.
+Reload swaps config that's read per-request (token, agent enable flags). Codex's `bin`/`host`/`port`, pi's `bin`, and OpenCode's `bin`/runtime port are pinned at first spawn; changing those requires `alleycat stop` + `serve`.
 
 ## File layout
 
@@ -136,8 +137,7 @@ The Unix control socket falls through `XDG_RUNTIME_DIR` → state dir → `TMPDI
 
 ## Notes
 
-- Codex is intentionally BYO: the daemon assumes you already have `codex app-server` listening on `agents.codex.host:port`.
-- Pi, OpenCode, and Claude children inherit `kill_on_drop` semantics, so they exit when the daemon does.
+- Codex, Pi, OpenCode, and Claude children inherit `kill_on_drop` semantics, so they exit when the daemon does.
 - `alleycat stop` shuts the iroh endpoint and the daemon process; launchd / systemd will restart it under their normal supervision.
 
 ## Building from source
