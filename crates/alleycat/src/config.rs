@@ -104,7 +104,7 @@ impl Default for PiAgentConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            bin: "pi-coding-agent".to_string(),
+            bin: "pi".to_string(),
         }
     }
 }

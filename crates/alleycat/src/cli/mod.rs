@@ -10,6 +10,7 @@ use crate::ipc;
 
 pub mod agents;
 pub mod logs;
+pub mod onboarding;
 pub mod pair;
 pub mod probe;
 pub mod reload;
@@ -20,9 +21,10 @@ pub mod stop;
 /// Send a single request to the daemon and read back the response.
 /// Errors with a friendly hint if the daemon is not running.
 pub async fn send(req: Request) -> anyhow::Result<Response> {
-    let mut stream = ipc::connect().await.with_context(
-        || "daemon not running. start it with `alleycat serve` or `alleycat install`.",
-    )?;
+    let mut stream = ipc::connect().await.with_context(|| {
+        let name = crate::binary_name();
+        format!("daemon not running. start it with `{name} serve` or `{name} install`.")
+    })?;
     write_json_frame(&mut stream, &req)
         .await
         .context("writing control request")?;

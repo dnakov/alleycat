@@ -8,12 +8,13 @@ repository.workspace = true
 homepage.workspace = true
 readme.workspace = true
 description = "Iroh-backed daemon that multiplexes local coding agents (Codex, Pi, OpenCode, Claude) onto a single QUIC connection for paired clients."
+# Distribution happens via the `kittylitter` wrapper crate in the litter
+# repo; this crate is consumed only as a git dep.
+publish = false
 
-[package.metadata.wix]
-upgrade-guid = "E0126DB2-9ACB-4245-9B6A-A497BCFF90F9"
-path-guid = "A02D0DC0-0B03-4376-B2EA-4314A3DB1B33"
-license = false
-eula = false
+[lib]
+name = "alleycat"
+path = "src/lib.rs"
 
 [[bin]]
 name = "alleycat"

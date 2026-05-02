@@ -21,18 +21,14 @@ use std::path::PathBuf;
 use anyhow::{Context, anyhow};
 use directories::{BaseDirs, ProjectDirs};
 
-const QUALIFIER: &str = "dev";
-const ORGANIZATION: &str = "Alleycat";
-const APPLICATION: &str = "alleycat";
-
-/// macOS bundle-style identifier derived from the qualifier/org/app triple.
-const PROJECT_ID: &str = "dev.Alleycat.alleycat";
-
-/// Reverse-DNS label used for the launchd Label and plist filename.
-const LAUNCHD_LABEL: &str = "dev.alleycat.alleycat";
+// Bundle identifiers come from the [`crate::App`] the binary supplies; the
+// alleycat library doesn't know whether it's being shipped as `kittylitter`,
+// `alleycat`, or anything else. See `crate::App` for the defaults used when
+// no `App` has been registered (tests, doc snippets).
 
 fn project_dirs() -> anyhow::Result<ProjectDirs> {
-    ProjectDirs::from(QUALIFIER, ORGANIZATION, APPLICATION)
+    let app = crate::app();
+    ProjectDirs::from(app.qualifier, app.organization, app.application)
         .ok_or_else(|| anyhow!("could not determine project directories (no $HOME?)"))
 }
 
@@ -69,7 +65,7 @@ pub fn state_dir() -> anyhow::Result<PathBuf> {
         let state = base
             .state_dir()
             .ok_or_else(|| anyhow!("no XDG state dir on this Linux system"))?;
-        state.join(APPLICATION)
+        state.join(crate::app().application)
     } else if cfg!(target_os = "windows") {
         dirs.data_local_dir().to_path_buf()
     } else {
@@ -85,7 +81,11 @@ pub fn log_dir() -> anyhow::Result<PathBuf> {
     #[cfg(target_os = "macos")]
     {
         let base = base_dirs()?;
-        path = base.home_dir().join("Library/Logs").join(PROJECT_ID);
+        let app = crate::app();
+        path = base
+            .home_dir()
+            .join("Library/Logs")
+            .join(format!("{}.{}.{}", app.qualifier, app.organization, app.application));
     }
     #[cfg(target_os = "linux")]
     {
@@ -169,7 +169,7 @@ pub fn control_socket_path() -> anyhow::Result<PathBuf> {
 /// First candidate whose `<dir>/control.sock` fits in `SUN_PATH_MAX` wins.
 #[cfg(unix)]
 fn control_socket_dir(user: &str) -> anyhow::Result<PathBuf> {
-    let segment = format!("alleycat-{user}");
+    let segment = format!("{app}-{user}", app = crate::app().application);
     let mut candidates: Vec<PathBuf> = Vec::new();
 
     #[cfg(target_os = "linux")]
@@ -213,7 +213,7 @@ pub fn control_pipe_name() -> anyhow::Result<String> {
         let base = base_dirs()?;
         let home = base.home_dir().to_string_lossy().to_string();
         let hash = short_user_hash(&home);
-        Ok(format!(r"\\.\pipe\alleycat-control-{hash}"))
+        Ok(format!(r"\\.\pipe\{app}-control-{hash}", app = crate::app().application))
     }
     #[cfg(not(windows))]
     {
@@ -237,7 +237,7 @@ pub fn launchd_plist_path() -> anyhow::Result<PathBuf> {
         Ok(base
             .home_dir()
             .join("Library/LaunchAgents")
-            .join(format!("{LAUNCHD_LABEL}.plist")))
+            .join(format!("{label}.plist", label = crate::app().label)))
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -255,7 +255,7 @@ pub fn systemd_unit_path() -> anyhow::Result<PathBuf> {
             .config_dir()
             .join("systemd")
             .join("user")
-            .join(format!("{APPLICATION}.service")))
+            .join(format!("{app}.service", app = crate::app().application)))
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -272,7 +272,7 @@ pub fn windows_startup_lnk_path() -> anyhow::Result<PathBuf> {
         Ok(base
             .config_dir()
             .join(r"Microsoft\Windows\Start Menu\Programs\Startup")
-            .join("alleycat.lnk"))
+            .join(format!("{app}.lnk", app = crate::app().application)))
     }
     #[cfg(not(windows))]
     {
@@ -288,7 +288,7 @@ pub fn xdg_autostart_path() -> anyhow::Result<PathBuf> {
     Ok(base
         .config_dir()
         .join("autostart")
-        .join(format!("{APPLICATION}.desktop")))
+        .join(format!("{app}.desktop", app = crate::app().application)))
 }
 
 #[cfg(test)]

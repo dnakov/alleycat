@@ -45,9 +45,10 @@ pub async fn run() -> anyhow::Result<()> {
 fn warn_if_autostart_installed() {
     match service::is_installed() {
         Ok(true) => {
+            let name = crate::binary_name();
             eprintln!(
                 "note: autostart is installed; the daemon will be restarted by the OS. \
-                 run `alleycat uninstall` to disable autostart."
+                 run `{name} uninstall` to disable autostart."
             );
         }
         Ok(false) | Err(_) => {}

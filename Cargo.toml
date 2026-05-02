@@ -15,8 +15,8 @@ edition = "2024"
 license = "GPL-3.0-only"
 version = "0.1.0"
 authors = ["The Alleycat Authors"]
-repository = "https://github.com/alleycat/alleycat"
-homepage = "https://github.com/alleycat/alleycat"
+repository = "https://github.com/dnakov/alleycat"
+homepage = "https://github.com/dnakov/alleycat"
 readme = "README.md"
 
 [workspace.dependencies]

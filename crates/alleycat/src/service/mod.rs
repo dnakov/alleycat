@@ -15,9 +15,11 @@ mod macos;
 mod windows;
 
 /// Reverse-DNS service label, matched by `paths::launchd_plist_path()` and
-/// the systemd unit filename. Stable across releases.
+/// the systemd unit filename. Comes from the [`crate::App`] the binary
+/// supplied at startup (e.g. `com.sigkitten.kittylitter` for the shipped
+/// kittylitter wrapper, `dev.alleycat.alleycat` for the dev binary).
 pub fn service_label() -> &'static str {
-    "dev.alleycat.alleycat"
+    crate::app().label
 }
 
 /// Subcommand the autostart entry invokes on the `alleycat` binary.

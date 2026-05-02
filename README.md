@@ -6,18 +6,16 @@ Iroh-backed bridge that multiplexes a few local coding agents — Codex, Pi, Ope
 
 ## Install
 
-Pick the channel you already use. The shipped command is always `alleycat`.
+Prebuilt binaries are published from the [`kittylitter`](https://github.com/dnakov/litter) project, which packages this daemon for end users. Both `alleycat` and `kittylitter` end up on `PATH` after install (MSI is the one exception — it installs only `alleycat.exe`).
 
 | Platform | Install |
 |---|---|
-| macOS (Homebrew) | `brew install alleycat/tap/alleycat` |
-| macOS / Linux (shell) | `curl -sSf https://github.com/alleycat/alleycat/releases/latest/download/alleycat-installer.sh \| sh` |
-| Windows (PowerShell) | `irm https://github.com/alleycat/alleycat/releases/latest/download/alleycat-installer.ps1 \| iex` |
-| Windows (MSI) | Download `.msi` from the [latest release](https://github.com/alleycat/alleycat/releases/latest) |
-| npm / bun | `npm install -g alley-cat` &nbsp;or&nbsp; `bunx alley-cat` |
-| Rust | `cargo install alleycat` |
-
-> The npm package is named `alley-cat` because `alleycat` is taken on the registry; the installed binary is still `alleycat`.
+| macOS (Homebrew) | `brew install dnakov/homebrew-tap/kittylitter` |
+| macOS / Linux (shell) | `curl -sSf https://github.com/dnakov/litter/releases/latest/download/kittylitter-installer.sh \| sh` |
+| Windows (PowerShell) | `irm https://github.com/dnakov/litter/releases/latest/download/kittylitter-installer.ps1 \| iex` |
+| Windows (MSI) | Download `.msi` from the [latest litter release](https://github.com/dnakov/litter/releases/latest) |
+| npm / bun | `npm install -g kittylitter` &nbsp;or&nbsp; `bunx kittylitter` |
+| From source | `cargo install --path crates/alleycat` (this repo) |
 
 ## First run
 
@@ -35,7 +33,7 @@ The daemon spawns external coding-agent CLIs on demand — install whichever one
 |---|---|
 | `claude` | `npm install -g @anthropic-ai/claude-code` (or `bun install -g @anthropic-ai/claude-code`). Then `claude /login` once. |
 | `opencode` | See [opencode docs](https://opencode.ai). |
-| `pi-coding-agent` | See pi-mono docs. |
+| `pi` | See pi-mono docs. |
 | `codex` | Install the `codex` CLI ([codex docs](https://github.com/openai/codex)). The daemon spawns `codex app-server` on demand. |
 
 ## Commands
@@ -59,7 +57,7 @@ The daemon talks to the CLI over a Unix domain socket on macOS/Linux and a per-u
 | Agent | Spawned by daemon? | How |
 |---|---|---|
 | `codex` | Yes, one shared backend | Lazy spawn of `codex app-server --listen ws://<host>:<port>` on first `connect`. The child is kept alive for the daemon lifetime; each iroh stream becomes a fresh websocket client and conversations persist independently of any single client. |
-| `pi` | Yes, per codex thread | `PiPool` spawns `pi-coding-agent --mode rpc` on demand, bounded at 16 processes with a 10-minute idle reap and LRU eviction. |
+| `pi` | Yes, per codex thread | `PiPool` spawns `pi --mode rpc` on demand, bounded at 16 processes with a 10-minute idle reap and LRU eviction. |
 | `opencode` | Yes, one shared backend | Lazy spawn of `opencode serve --port=auto --auth-token=auto` on first connect, gated on `/global/health`. Or set `OPENCODE_BRIDGE_BACKEND_URL` to point at an existing instance. |
 | `claude` | Yes, per codex thread | `ClaudePool` spawns `claude -p --input-format stream-json --output-format stream-json --session-id <thread_id> --dangerously-skip-permissions` on demand. Same 16-cap, 10-minute idle reap, LRU eviction as pi. Sessions resume on next access via `--resume <thread_id>`. |
 
@@ -108,7 +106,7 @@ port = 8390
 
 [agents.pi]
 enabled = true
-bin = "pi-coding-agent"
+bin = "pi"
 
 [agents.opencode]
 enabled = true
@@ -158,4 +156,4 @@ The workspace has six crates:
 - `crates/opencode-bridge` — single shared `opencode serve` backend wrapped in the same JSON-RPC surface.
 - `crates/claude-bridge` — `claude -p --output-format stream-json` process pool wrapped in the same JSON-RPC surface (one claude process per codex thread).
 
-Releases are produced by [`dist`](https://github.com/axodotdev/cargo-dist) — see `dist-workspace.toml` and `.github/workflows/release.yml`. To cut a release: bump `version` in the root `Cargo.toml`, tag `vX.Y.Z`, push. The workflow builds all six platform tarballs, signs + notarizes the macOS binaries (if `APPLE_*` secrets are set), and publishes the Homebrew formula and npm package.
+Releases are produced from the [`litter`](https://github.com/dnakov/litter) repo, which carries this repo as a submodule under `shared/third_party/alleycat` and runs [`dist`](https://github.com/axodotdev/cargo-dist) against it to build the six platform tarballs and publish the `kittylitter` Homebrew + npm packages. To cut a release: bump `version` in the root `Cargo.toml` here, push, then bump the submodule pin in litter and tag `vX.Y.Z` there.

@@ -30,7 +30,7 @@ pub async fn run(args: StatusArgs) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    println!("alleycat daemon");
+    println!("{} daemon", crate::binary_name());
     println!("  pid:               {}", info.pid);
     println!("  node id:           {}", info.node_id);
     println!("  token (sha256/16): {}", info.token_short);

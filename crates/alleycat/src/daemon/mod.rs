@@ -39,13 +39,13 @@ pub async fn run() -> anyhow::Result<()> {
     let mut lock = state::acquire_lock().await.context("acquiring lock file")?;
     let _lock_guard = lock.try_write().map_err(|_| {
         let pid_hint = state::read_pid_file().unwrap_or(None);
+        let name = crate::binary_name();
         match pid_hint {
             Some(pid) => anyhow!(
-                "another alleycat daemon is already running (pid {pid}). \
-                 use `alleycat stop` first."
+                "another {name} daemon is already running (pid {pid}). use `{name} stop` first."
             ),
             None => {
-                anyhow!("another alleycat daemon is already running. use `alleycat stop` first.")
+                anyhow!("another {name} daemon is already running. use `{name} stop` first.")
             }
         }
     })?;
