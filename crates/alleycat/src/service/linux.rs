@@ -15,9 +15,10 @@ pub(super) fn install() -> anyhow::Result<()> {
 
     if has_systemd_user() {
         let unit_path = paths::systemd_unit_path()?;
+        let unit_name = systemd_unit_name(&unit_path)?;
         write_systemd_unit(&unit_path, &exe, inherit_path.as_deref())?;
         run_systemctl(&["--user", "daemon-reload"])?;
-        run_systemctl(&["--user", "enable", "--now", "alleycat"])?;
+        run_systemctl(&["--user", "enable", "--now", &unit_name])?;
         eprintln!(
             "Hint: to start the daemon at boot rather than at login, run:\n  \
              loginctl enable-linger $USER\n\
@@ -43,10 +44,12 @@ pub(super) fn install() -> anyhow::Result<()> {
 }
 
 pub(super) fn uninstall() -> anyhow::Result<()> {
-    if has_systemd_user() {
-        let _ = run_systemctl(&["--user", "disable", "--now", "alleycat"]);
-    }
     let unit_path = paths::systemd_unit_path()?;
+    if has_systemd_user() {
+        if let Ok(unit_name) = systemd_unit_name(&unit_path) {
+            let _ = run_systemctl(&["--user", "disable", "--now", &unit_name]);
+        }
+    }
     if unit_path.exists() {
         std::fs::remove_file(&unit_path)
             .with_context(|| format!("removing {}", unit_path.display()))?;
@@ -60,6 +63,15 @@ pub(super) fn uninstall() -> anyhow::Result<()> {
         let _ = run_systemctl(&["--user", "daemon-reload"]);
     }
     Ok(())
+}
+
+pub(super) fn is_installed() -> anyhow::Result<bool> {
+    let unit_path = paths::systemd_unit_path()?;
+    if unit_path.exists() && has_systemd_user() {
+        let unit_name = systemd_unit_name(&unit_path)?;
+        return Ok(systemd_unit_is_enabled(&unit_name));
+    }
+    Ok(paths::xdg_autostart_path()?.exists())
 }
 
 pub(super) fn write_systemd_unit(
@@ -149,6 +161,22 @@ fn has_xdg_session() -> bool {
             .unwrap_or(false)
 }
 
+fn systemd_unit_name(unit_path: &Path) -> anyhow::Result<String> {
+    unit_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(str::to_owned)
+        .ok_or_else(|| anyhow!("invalid systemd unit path {}", unit_path.display()))
+}
+
+fn systemd_unit_is_enabled(unit_name: &str) -> bool {
+    Command::new("systemctl")
+        .args(["--user", "is-enabled", unit_name])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
 fn run_systemctl(args: &[&str]) -> anyhow::Result<()> {
     let status = Command::new("systemctl")
         .args(args)
@@ -226,5 +254,14 @@ mod tests {
         assert!(body.contains("[Desktop Entry]"));
         assert!(body.contains("Type=Application"));
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn systemd_unit_name_uses_actual_packaged_unit_filename() {
+        let unit = PathBuf::from("/home/me/.config/systemd/user/kittylitter.service");
+        assert_eq!(
+            systemd_unit_name(&unit).expect("unit name"),
+            "kittylitter.service"
+        );
     }
 }

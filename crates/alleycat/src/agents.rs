@@ -17,20 +17,36 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, BufReader};
 use tokio::net::TcpStream;
 use tokio::process::{Child, Command};
 use tokio::sync::{Mutex, OnceCell};
-use tracing::warn;
+use tracing::{info, warn};
 
 use crate::config::HostConfig;
 use crate::protocol::{AgentInfo, AgentWire};
 use crate::stream::IrohStream;
 
 /// Stable identifier for a JSON-RPC bridge agent. Codex is intentionally
-/// excluded — the daemon runs a single shared `codex app-server` in
-/// websocket-listen mode and byte-pumps each iroh stream straight to it.
+/// excluded — the daemon talks to it directly (either over a shared
+/// websocket-listen child or one stdio child per iroh stream, depending on
+/// which mode the local codex binary supports).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum AgentKind {
     Pi,
     Claude,
     Opencode,
+}
+
+/// How the daemon talks to `codex app-server`. Selected at startup by
+/// probing `codex app-server --help` for `--listen` support, then cached
+/// for the daemon's lifetime.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CodexMode {
+    /// `<bin> app-server --listen ws://host:port` — one shared child for
+    /// the daemon lifetime, multi-client over websocket. Works on
+    /// codex-cli versions that grew the `--listen` flag (≥ early 2026).
+    Websocket,
+    /// `<bin> app-server` — one fresh child per iroh stream, JSON-RPC
+    /// over stdio. Works on every codex version that has the `app-server`
+    /// subcommand.
+    Stdio,
 }
 
 #[derive(Clone)]
@@ -44,8 +60,12 @@ pub struct AgentManager {
     /// One shared `codex app-server --listen ws://...` for the daemon
     /// lifetime, lazy-spawned on first `connect`. Codex multiplexes
     /// conversations internally, so each iroh stream is its own websocket
-    /// client and the child stays up across client disconnects.
+    /// client and the child stays up across client disconnects. Only
+    /// populated when [`AgentManager::codex_mode`] is `Websocket`.
     codex_child: Arc<Mutex<Option<Child>>>,
+    /// Detected once at startup. Determines whether `serve_codex` runs the
+    /// websocket byte-pump or per-stream stdio bridging.
+    codex_mode: CodexMode,
     session_registry: Arc<SessionRegistry>,
     /// Held to keep the registry's reaper alive for the daemon lifetime.
     _reaper_handle: Arc<tokio::task::JoinHandle<()>>,
@@ -103,11 +123,21 @@ impl AgentManager {
         let session_registry = SessionRegistry::new(registry_config);
         let reaper_handle = Arc::new(session_registry.spawn_reaper());
 
+        let codex_mode = if snapshot.agents.codex.enabled {
+            detect_codex_mode(&snapshot.agents.codex.bin).await
+        } else {
+            // Doesn't matter; codex is disabled. Pick a default so the
+            // field has a value.
+            CodexMode::Stdio
+        };
+        info!(?codex_mode, bin = %snapshot.agents.codex.bin, "codex transport mode");
+
         Ok(Self {
             config,
             bridges,
             opencode_bridge: Arc::new(OnceCell::new()),
             codex_child: Arc::new(Mutex::new(None)),
+            codex_mode,
             session_registry,
             _reaper_handle: reaper_handle,
         })
@@ -122,7 +152,10 @@ impl AgentManager {
             AgentInfo {
                 name: "codex".to_string(),
                 display_name: "Codex".to_string(),
-                wire: AgentWire::Websocket,
+                wire: match self.codex_mode {
+                    CodexMode::Websocket => AgentWire::Websocket,
+                    CodexMode::Stdio => AgentWire::Jsonl,
+                },
                 available: self.codex_available(),
             },
             AgentInfo {
@@ -227,12 +260,57 @@ impl AgentManager {
         }
     }
 
-    async fn serve_codex(&self, mut iroh_stream: IrohStream) -> anyhow::Result<()> {
+    async fn serve_codex(&self, iroh_stream: IrohStream) -> anyhow::Result<()> {
+        match self.codex_mode {
+            CodexMode::Websocket => self.serve_codex_ws(iroh_stream).await,
+            CodexMode::Stdio => self.serve_codex_stdio(iroh_stream).await,
+        }
+    }
+
+    async fn serve_codex_ws(&self, mut iroh_stream: IrohStream) -> anyhow::Result<()> {
         let (host, port) = self.ensure_codex_running().await?;
         let mut tcp = TcpStream::connect((host.as_str(), port))
             .await
             .with_context(|| format!("connecting to codex app-server at {host}:{port}"))?;
         let _ = tokio::io::copy_bidirectional(&mut iroh_stream, &mut tcp).await;
+        Ok(())
+    }
+
+    /// Per-stream stdio bridge for codex versions that don't support
+    /// `--listen`. Each iroh stream gets its own `codex app-server` child;
+    /// codex's on-disk session store handles resume across reconnects.
+    async fn serve_codex_stdio(&self, mut iroh_stream: IrohStream) -> anyhow::Result<()> {
+        let bin = {
+            let cfg = self.config.load();
+            if !cfg.agents.codex.enabled {
+                return Err(anyhow!("codex agent is disabled"));
+            }
+            cfg.agents.codex.bin.clone()
+        };
+
+        let mut child = Command::new(&bin)
+            .arg("app-server")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .with_context(|| format!("spawning `{bin} app-server`"))?;
+
+        let stdin = child.stdin.take().expect("piped stdin");
+        let stdout = child.stdout.take().expect("piped stdout");
+        let stderr = child.stderr.take().expect("piped stderr");
+
+        tokio::spawn(async move {
+            let mut lines = BufReader::new(stderr).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                warn!(target: "codex", "{line}");
+            }
+        });
+
+        let mut child_io = tokio::io::join(stdout, stdin);
+        let _ = tokio::io::copy_bidirectional(&mut iroh_stream, &mut child_io).await;
+        let _ = child.wait().await;
         Ok(())
     }
 
@@ -268,10 +346,7 @@ impl AgentManager {
             return Ok((host, port));
         }
 
-        let child_alive = matches!(
-            guard.as_mut().map(Child::try_wait),
-            Some(Ok(None))
-        );
+        let child_alive = matches!(guard.as_mut().map(Child::try_wait), Some(Ok(None)));
         if !child_alive {
             let listen = format!("ws://{host}:{port}");
             let mut child = Command::new(&bin)
@@ -362,6 +437,37 @@ impl AgentManager {
     fn claude_available(&self) -> bool {
         let cfg = self.config.load();
         cfg.agents.claude.enabled && which::which(&cfg.agents.claude.bin).is_ok()
+    }
+}
+
+/// Probe `<bin> app-server --help` and check whether the `--listen` flag
+/// is documented. If yes, the daemon can run a single shared websocket
+/// app-server; if no (older codex), we fall back to per-stream stdio. On
+/// any failure (binary missing, exec error, garbled output) we default to
+/// `Stdio` because that's the universal mode every codex with `app-server`
+/// supports.
+async fn detect_codex_mode(bin: &str) -> CodexMode {
+    let output = match tokio::time::timeout(
+        Duration::from_secs(5),
+        Command::new(bin).arg("app-server").arg("--help").output(),
+    )
+    .await
+    {
+        Ok(Ok(out)) => out,
+        Ok(Err(err)) => {
+            warn!(error = %err, %bin, "codex app-server --help failed; assuming stdio mode");
+            return CodexMode::Stdio;
+        }
+        Err(_) => {
+            warn!(%bin, "codex app-server --help timed out; assuming stdio mode");
+            return CodexMode::Stdio;
+        }
+    };
+    let help = String::from_utf8_lossy(&output.stdout);
+    if help.contains("--listen") {
+        CodexMode::Websocket
+    } else {
+        CodexMode::Stdio
     }
 }
 

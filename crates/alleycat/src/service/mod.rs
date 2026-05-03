@@ -69,9 +69,9 @@ pub fn uninstall() -> anyhow::Result<()> {
     }
 }
 
-/// True if the autostart file exists on disk. Does not consult the service
-/// manager — callers that want "actually running" should ask the daemon over
-/// the control socket instead.
+/// True if the OS-level autostart entry is active. On Linux, a systemd unit
+/// file must also be enabled; a disabled unit sitting on disk will not restart
+/// the daemon after `stop`.
 pub fn is_installed() -> anyhow::Result<bool> {
     #[cfg(target_os = "macos")]
     {
@@ -79,8 +79,7 @@ pub fn is_installed() -> anyhow::Result<bool> {
     }
     #[cfg(target_os = "linux")]
     {
-        Ok(crate::paths::systemd_unit_path()?.exists()
-            || crate::paths::xdg_autostart_path()?.exists())
+        linux::is_installed()
     }
     #[cfg(target_os = "windows")]
     {
