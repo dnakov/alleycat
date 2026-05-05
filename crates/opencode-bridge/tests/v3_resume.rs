@@ -72,12 +72,10 @@ async fn thread_resume_then_read_returns_persisted_turns() {
     let turns = resume["result"]["thread"]["turns"]
         .as_array()
         .expect("turns array");
-    assert_eq!(turns.len(), 2);
+    assert_eq!(turns.len(), 1);
 
-    // thread/read{includeTurns:true} returns the ThreadItem array per turn,
-    // run through `message_to_turn_items`. Items inherit the message role;
-    // the user message yields a `userMessage` (per T12) and the assistant
-    // message yields `agentMessage` + `reasoning`.
+    // thread/read{includeTurns:true} returns Codex-style turns: one user
+    // prompt plus all assistant-side items that answered it.
     send(
         &mut fx.write,
         4,
@@ -87,24 +85,16 @@ async fn thread_resume_then_read_returns_persisted_turns() {
     .await;
     let read = read_until_response(&mut fx.read, 4).await;
     let turns = read["result"]["thread"]["turns"].as_array().expect("turns");
-    assert_eq!(turns.len(), 2);
-    let user_items = turns[0]["items"].as_array().expect("user items");
-    // T12 routes role=user text parts to `agentMessage` only when the part
-    // type is text and there's no role-aware userMessage handling for plain
-    // text. The existing translation produces `agentMessage` per part regardless
-    // of role for `text` (only file/agent reroute by role). That is the current
-    // shipped behavior; this test pins it so a future role-aware refactor is
-    // an explicit decision.
-    assert_eq!(user_items[0]["type"], "agentMessage");
-    assert_eq!(user_items[0]["text"], "hello");
-    let asst_items = turns[1]["items"].as_array().expect("assistant items");
-    let kinds: Vec<&str> = asst_items
+    assert_eq!(turns.len(), 1);
+    let items = turns[0]["items"].as_array().expect("turn items");
+    let kinds: Vec<&str> = items
         .iter()
         .map(|it| it["type"].as_str().unwrap_or(""))
         .collect();
-    assert_eq!(kinds, vec!["agentMessage", "reasoning"]);
-    assert_eq!(asst_items[0]["text"], "hi back");
-    assert_eq!(asst_items[1]["content"][0], "thinking");
+    assert_eq!(kinds, vec!["userMessage", "agentMessage", "reasoning"]);
+    assert_eq!(items[0]["content"][0]["text"], "hello");
+    assert_eq!(items[1]["text"], "hi back");
+    assert_eq!(items[2]["content"][0], "thinking");
 
     fx.shutdown().await;
 }

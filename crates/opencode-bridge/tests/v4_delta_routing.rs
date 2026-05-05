@@ -181,6 +181,60 @@ async fn bash_tool_output_delta_still_routes_to_command_execution() {
 }
 
 #[tokio::test]
+async fn read_tool_output_delta_routes_to_command_execution() {
+    let (mut read, mut write, sse_injector, _state_dir, server_task) = bring_up_bridge().await;
+    let thread_id = start_thread(&mut read, &mut write, "/tmp/opencode-v4-read").await;
+    start_active_turn(&mut read, &mut write, &thread_id).await;
+
+    inject_sse(
+        &sse_injector,
+        json!({
+            "type":"message.part.updated",
+            "properties":{
+                "sessionID":"ses_1",
+                "part":{
+                    "id":"read1","callID":"c_read1","messageID":"m_read","sessionID":"ses_1",
+                    "type":"tool","tool":"read",
+                    "state":{"status":"running","input":{"filePath":"src/lib.rs"},"time":{"start":3}}
+                },
+                "time":3
+            }
+        }),
+    );
+    let started = read_until_notification(&mut read, "item/started", Duration::from_secs(3)).await;
+    assert_eq!(started["params"]["item"]["type"], "commandExecution");
+    assert_eq!(started["params"]["item"]["cwd"], "/tmp/opencode-v4-read");
+    assert_eq!(
+        started["params"]["item"]["commandActions"][0]["path"],
+        "/tmp/opencode-v4-read/src/lib.rs"
+    );
+
+    inject_sse(
+        &sse_injector,
+        json!({
+            "type":"message.part.delta",
+            "properties":{
+                "sessionID":"ses_1",
+                "messageID":"m_read",
+                "partID":"read1",
+                "field":"output",
+                "delta":"fn main() {}\n"
+            }
+        }),
+    );
+    let notif = read_until_notification(
+        &mut read,
+        "item/commandExecution/outputDelta",
+        Duration::from_secs(3),
+    )
+    .await;
+    assert_eq!(notif["params"]["delta"], "fn main() {}\n");
+
+    drop(write);
+    server_task.abort();
+}
+
+#[tokio::test]
 async fn apply_patch_tool_output_delta_routes_to_file_change() {
     let (mut read, mut write, sse_injector, _state_dir, server_task) = bring_up_bridge().await;
     let thread_id = start_thread(&mut read, &mut write, "/tmp/opencode-v4-patch").await;

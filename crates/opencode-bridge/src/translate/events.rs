@@ -6,7 +6,10 @@ use crate::index::ThreadIndex;
 use crate::opencode_client::OpencodeClient;
 use crate::pty::PtyState;
 use crate::state::{BridgeState, PartKind, TokenUsageBreakdown};
-use crate::translate::tool::{tool_part_side_notifications, tool_part_to_item};
+use crate::translate::tool::{
+    ToolPartContext, tool_part_side_notifications, tool_part_status_is_terminal,
+    tool_part_to_item_with_context,
+};
 
 /// Bundle of references threaded through every SSE event handler in this
 /// module. Fields are all `&` references; the struct derives `Copy` so handlers
@@ -491,6 +494,15 @@ fn handle_message_part_updated(
     let part_type = part.get("type").and_then(Value::as_str).unwrap_or("");
     let kind = classify_part(part);
     rc.state.set_part_kind(part_id, kind);
+    let binding_cwd = rc
+        .index
+        .by_thread(thread_id)
+        .map(|binding| binding.directory);
+    let tool_context = ToolPartContext {
+        cwd: binding_cwd.as_deref(),
+        sender_thread_id: Some(thread_id),
+        include_side_channel_items: false,
+    };
 
     // Reasoning parts get their own codex Reasoning item. We bracket each
     // part with `item/started`/`item/completed`; the closing event is fired
@@ -520,7 +532,7 @@ fn handle_message_part_updated(
     }
 
     if rc.state.mark_part_started(part_id)
-        && let Some(item) = tool_part_to_item(part)
+        && let Some(item) = tool_part_to_item_with_context(part, tool_context)
     {
         let _ = rc.conn.notifier().send_notification(
             "item/started",
@@ -532,12 +544,8 @@ fn handle_message_part_updated(
         );
     }
 
-    let status = part
-        .pointer("/state/status")
-        .and_then(Value::as_str)
-        .unwrap_or("");
-    if matches!(status, "completed" | "error") {
-        if let Some(item) = tool_part_to_item(part) {
+    if tool_part_status_is_terminal(part) {
+        if let Some(item) = tool_part_to_item_with_context(part, tool_context) {
             let _ = rc.conn.notifier().send_notification(
                 "item/completed",
                 json!({
@@ -681,7 +689,10 @@ fn classify_part(part: &Value) -> PartKind {
         "reasoning" => PartKind::Reasoning,
         "tool" => {
             let tool = part.get("tool").and_then(Value::as_str).unwrap_or("");
-            if tool == "bash" {
+            if matches!(
+                tool,
+                "bash" | "read" | "glob" | "grep" | "codesearch" | "list" | "ls"
+            ) {
                 PartKind::ToolBash
             } else if matches!(tool, "write" | "edit" | "patch" | "apply_patch") {
                 PartKind::ToolFileChange

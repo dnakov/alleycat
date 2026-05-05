@@ -33,7 +33,9 @@ use alleycat_bridge_core::{LocalLauncher, ProcessLauncher};
 use uuid::Uuid;
 
 pub use claude_protocol::*;
-pub use process::{ClaudeProcessError, ClaudeProcessHandle, ClaudeSpawnConfig, DEFAULT_INIT_TIMEOUT};
+pub use process::{
+    ClaudeProcessError, ClaudeProcessHandle, ClaudeSpawnConfig, DEFAULT_INIT_TIMEOUT,
+};
 
 /// Pool-wide spawn policy. New fields go here so the per-thread
 /// `acquire_*` signatures stay flat.

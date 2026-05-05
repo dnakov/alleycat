@@ -12,7 +12,9 @@ use crate::opencode_proc::OpencodeRuntime;
 use crate::pty::PtyState;
 use crate::sse::SseConsumer;
 use crate::state::{ActiveTurn, BridgeState};
-use crate::translate::{input::codex_input_to_parts, parts::message_to_turn_items};
+use crate::translate::{
+    input::codex_input_to_parts, parts::message_to_turn_items_with_context, tool::ToolPartContext,
+};
 
 pub struct OpencodeBridge {
     // Keep the runtime alive for the bridge's lifetime. Dropping it triggers
@@ -271,8 +273,11 @@ impl OpencodeBridge {
             .list_messages(&binding.session_id)
             .await
             .unwrap_or(Value::Array(Vec::new()));
-        let turns =
-            collapse_messages_to_turns(messages_after.as_array().cloned().unwrap_or_default());
+        let turns = collapse_messages_to_turns(
+            messages_after.as_array().cloned().unwrap_or_default(),
+            Some(&binding.directory),
+            Some(&binding.thread_id),
+        );
         let mut thread = binding_to_thread(&binding);
         thread["turns"] = json!(turns);
         Ok(json!({ "thread": thread }))
@@ -567,8 +572,11 @@ impl OpencodeBridge {
             .get(&format!("/session/{}/message", binding.session_id))
             .await
             .map_err(|err| JsonRpcError::internal(format!("{err:#}")))?;
-        let turns =
-            collapse_messages_to_turns(messages.as_array().cloned().unwrap_or_default());
+        let turns = collapse_messages_to_turns(
+            messages.as_array().cloned().unwrap_or_default(),
+            Some(&binding.directory),
+            Some(&binding.thread_id),
+        );
         let mut thread = binding_to_thread(&binding);
         thread["turns"] = json!(turns);
         if method == "thread/read" {
@@ -623,8 +631,11 @@ impl OpencodeBridge {
             .get(&format!("/session/{}/message", binding.session_id))
             .await
             .map_err(|err| JsonRpcError::internal(format!("{err:#}")))?;
-        let mut turns =
-            collapse_messages_to_turns(messages.as_array().cloned().unwrap_or_default());
+        let mut turns = collapse_messages_to_turns(
+            messages.as_array().cloned().unwrap_or_default(),
+            Some(&binding.directory),
+            Some(&binding.thread_id),
+        );
         // Default sort direction is `desc` (newest first) per the codex
         // wire spec — `ThreadSortKey::UpdatedAt` + `SortDirection::Desc`
         // is the iOS hydration pattern.
@@ -1116,7 +1127,16 @@ fn flatten_models(providers: Value) -> Vec<Value> {
 /// `info.time.created`; `completedAt` is the LAST assistant message's
 /// `info.time.completed` (or the user's `time.created` if no assistant
 /// followed yet, marking the turn `inProgress`).
-fn collapse_messages_to_turns(messages: Vec<Value>) -> Vec<Value> {
+fn collapse_messages_to_turns(
+    messages: Vec<Value>,
+    default_cwd: Option<&str>,
+    sender_thread_id: Option<&str>,
+) -> Vec<Value> {
+    let tool_context = ToolPartContext {
+        cwd: default_cwd,
+        sender_thread_id,
+        include_side_channel_items: true,
+    };
     let mut turns: Vec<Value> = Vec::new();
     for message in messages {
         let role = message
@@ -1124,23 +1144,23 @@ fn collapse_messages_to_turns(messages: Vec<Value>) -> Vec<Value> {
             .and_then(Value::as_str)
             .unwrap_or("");
         if role == "user" {
-            turns.push(turn_from_user_message(&message));
+            turns.push(turn_from_user_message(&message, tool_context));
         } else if let Some(turn) = turns.last_mut() {
             // Fold this assistant message into the most recent user-anchored
             // turn. We append items, refresh completedAt/durationMs/status,
             // and surface any per-message error.
-            fold_assistant_into_turn(turn, &message);
+            fold_assistant_into_turn(turn, &message, tool_context);
         } else {
             // Stand-alone assistant message with no prior user (shouldn't
             // happen in normal opencode sessions, but keep the data rather
             // than silently dropping). Emit it as its own turn.
-            turns.push(turn_from_assistant_only(&message));
+            turns.push(turn_from_assistant_only(&message, tool_context));
         }
     }
     turns
 }
 
-fn turn_from_user_message(message: &Value) -> Value {
+fn turn_from_user_message(message: &Value, tool_context: ToolPartContext<'_>) -> Value {
     let id = message
         .pointer("/info/id")
         .and_then(Value::as_str)
@@ -1153,7 +1173,7 @@ fn turn_from_user_message(message: &Value) -> Value {
     // synchronously and never writes `time.completed`. Anchor them to the
     // user's `time.created` so the wire shape stays non-null until an
     // assistant message folds in and refreshes the completion fields.
-    let items = message_to_turn_items(message);
+    let items = message_to_turn_items_with_context(message, tool_context);
     json!({
         "id": id,
         "items": items,
@@ -1169,7 +1189,7 @@ fn turn_from_user_message(message: &Value) -> Value {
     })
 }
 
-fn turn_from_assistant_only(message: &Value) -> Value {
+fn turn_from_assistant_only(message: &Value, tool_context: ToolPartContext<'_>) -> Value {
     let id = message
         .pointer("/info/id")
         .and_then(Value::as_str)
@@ -1187,7 +1207,7 @@ fn turn_from_assistant_only(message: &Value) -> Value {
     };
     json!({
         "id": id,
-        "items": message_to_turn_items(message),
+        "items": message_to_turn_items_with_context(message, tool_context),
         "status": if completed_at.is_some() { "completed" } else { "inProgress" },
         "error": opencode_message_error(message),
         "startedAt": started_at,
@@ -1196,10 +1216,10 @@ fn turn_from_assistant_only(message: &Value) -> Value {
     })
 }
 
-fn fold_assistant_into_turn(turn: &mut Value, message: &Value) {
+fn fold_assistant_into_turn(turn: &mut Value, message: &Value, tool_context: ToolPartContext<'_>) {
     // Append the assistant's items to the existing turn's `items` array.
     if let Some(items) = turn.get_mut("items").and_then(Value::as_array_mut) {
-        for item in message_to_turn_items(message) {
+        for item in message_to_turn_items_with_context(message, tool_context) {
             items.push(item);
         }
     }

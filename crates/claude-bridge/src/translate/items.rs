@@ -121,8 +121,7 @@ pub fn records_to_turns(records: &[OnDiskRecord]) -> Vec<Turn> {
         match record.classify() {
             ClassifiedRecord::User { ts, content } => {
                 builder.flush_assistants();
-                if let Some(true) =
-                    builder.try_fold_tool_results(&content, &record.tool_use_result)
+                if let Some(true) = builder.try_fold_tool_results(&content, &record.tool_use_result)
                 {
                     builder.current_completed_at = Some(ts);
                     continue;
@@ -664,14 +663,7 @@ fn build_subagent_disk_item(id: String, args: &Value) -> ThreadItem {
         .get("prompt")
         .and_then(Value::as_str)
         .map(str::to_string);
-    let subagent_type = args.get("subagent_type").and_then(Value::as_str);
-    let description = args.get("description").and_then(Value::as_str);
-    let label = match (subagent_type, description) {
-        (Some(t), Some(d)) if !t.is_empty() && !d.is_empty() => format!("{t}: {d}"),
-        (Some(t), _) if !t.is_empty() => t.to_string(),
-        (_, Some(d)) if !d.is_empty() => d.to_string(),
-        _ => String::new(),
-    };
+    let label = subagent_label(args);
     let receiver_id = format!("subagent-{id}");
     let mut agents_states = HashMap::new();
     agents_states.insert(
@@ -710,7 +702,7 @@ fn build_exploration_disk_item(
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .to_string();
-            let command = format!("Read {path}");
+            let command = read_command(&path, args);
             let name = command_action_name(&path);
             let action = serde_json::json!({
                 "type": "read",
@@ -727,7 +719,7 @@ fn build_exploration_disk_item(
                 .unwrap_or("")
                 .to_string();
             let path = args.get("path").and_then(Value::as_str);
-            let command = format!("Grep {pattern}");
+            let command = grep_command(&pattern, args);
             let mut action = serde_json::json!({
                 "type": "search",
                 "command": command.clone(),
@@ -780,6 +772,99 @@ fn command_action_name(path: &str) -> String {
         .find(|part| !part.is_empty())
         .unwrap_or("file")
         .to_string()
+}
+
+fn subagent_label(args: &Value) -> String {
+    let name = json_str_arg(args, "name");
+    let subagent_type = json_str_arg(args, "subagent_type");
+    let description = json_str_arg(args, "description");
+    let mut parts = Vec::new();
+    match (name, subagent_type, description) {
+        (Some(name), Some(kind), Some(description)) => {
+            parts.push(format!("{name} · {kind}: {description}"));
+        }
+        (Some(name), Some(kind), None) => {
+            parts.push(format!("{name} · {kind}"));
+        }
+        (Some(name), None, Some(description)) => {
+            parts.push(format!("{name}: {description}"));
+        }
+        (Some(name), None, None) => parts.push(name.to_string()),
+        (None, Some(kind), Some(description)) => {
+            parts.push(format!("{kind}: {description}"));
+        }
+        (None, Some(kind), None) => parts.push(kind.to_string()),
+        (None, None, Some(description)) => parts.push(description.to_string()),
+        (None, None, None) => {}
+    }
+    if let Some(team_name) = json_str_arg(args, "team_name") {
+        parts.push(format!("team {team_name}"));
+    }
+    if let Some(true) = json_bool_arg(args, "run_in_background") {
+        parts.push("background".to_string());
+    }
+    parts.join(" · ")
+}
+
+fn read_command(path: &str, args: &Value) -> String {
+    let mut details = Vec::new();
+    if let Some(offset) = json_i64_arg(args, "offset") {
+        details.push(format!("offset {offset}"));
+    }
+    if let Some(limit) = json_i64_arg(args, "limit") {
+        details.push(format!("limit {limit}"));
+    }
+    append_details(format!("Read {path}"), details)
+}
+
+fn grep_command(pattern: &str, args: &Value) -> String {
+    let mut details = Vec::new();
+    if let Some(output_mode) = json_str_arg(args, "output_mode") {
+        details.push(format!("mode {output_mode}"));
+    }
+    if let Some(head_limit) = json_i64_arg(args, "head_limit") {
+        details.push(format!("head {head_limit}"));
+    }
+    if let Some(true) = json_bool_arg(args, "-n") {
+        details.push("-n".to_string());
+    }
+    append_details(format!("Grep {pattern}"), details)
+}
+
+fn append_details(base: String, details: Vec<String>) -> String {
+    if details.is_empty() {
+        base
+    } else {
+        format!("{base} ({})", details.join(", "))
+    }
+}
+
+fn json_i64_arg(args: &Value, key: &str) -> Option<i64> {
+    args.get(key).and_then(|value| match value {
+        Value::Number(number) => number
+            .as_i64()
+            .or_else(|| number.as_u64().and_then(|n| i64::try_from(n).ok())),
+        Value::String(text) => text.parse::<i64>().ok(),
+        _ => None,
+    })
+}
+
+fn json_str_arg<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
+    args.get(key)
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+}
+
+fn json_bool_arg(args: &Value, key: &str) -> Option<bool> {
+    args.get(key).and_then(|value| match value {
+        Value::Bool(value) => Some(*value),
+        Value::String(text) => match text.as_str() {
+            "true" => Some(true),
+            "false" => Some(false),
+            _ => None,
+        },
+        _ => None,
+    })
 }
 
 #[derive(Debug, Deserialize)]
@@ -1179,6 +1264,76 @@ mod tests {
     fn normalize_dynamic_tool_call_output_drops_null() {
         let out = normalize_dynamic_tool_call_output(&json!(null));
         assert!(out.is_empty());
+    }
+
+    #[test]
+    fn disk_exploration_items_preserve_claude_read_and_grep_options_in_command_text() {
+        let read = build_exploration_disk_item(
+            &CodexToolKind::ExplorationRead,
+            "Read",
+            "read-1".to_string(),
+            &json!({"file_path":"/tmp/x.txt","offset":40,"limit":20}),
+        );
+        match read {
+            ThreadItem::CommandExecution {
+                command,
+                command_actions,
+                ..
+            } => {
+                assert_eq!(command, "Read /tmp/x.txt (offset 40, limit 20)");
+                assert_eq!(
+                    command_actions[0]["command"],
+                    "Read /tmp/x.txt (offset 40, limit 20)"
+                );
+            }
+            other => panic!("expected CommandExecution, got {other:?}"),
+        }
+
+        let grep = build_exploration_disk_item(
+            &CodexToolKind::ExplorationSearch,
+            "Grep",
+            "grep-1".to_string(),
+            &json!({"pattern":"foo","path":"src","output_mode":"files_with_matches","head_limit":5,"-n":true}),
+        );
+        match grep {
+            ThreadItem::CommandExecution {
+                command,
+                command_actions,
+                ..
+            } => {
+                assert_eq!(command, "Grep foo (mode files_with_matches, head 5, -n)");
+                assert_eq!(
+                    command_actions[0]["command"],
+                    "Grep foo (mode files_with_matches, head 5, -n)"
+                );
+            }
+            other => panic!("expected CommandExecution, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn disk_subagent_item_preserves_agent_name_team_and_background() {
+        let item = build_subagent_disk_item(
+            "agent-1".to_string(),
+            &json!({
+                "prompt": "do thing",
+                "name": "ios-reader",
+                "subagent_type": "Explore",
+                "description": "find files",
+                "team_name": "litter-ios",
+                "run_in_background": true
+            }),
+        );
+        match item {
+            ThreadItem::CollabAgentToolCall { agents_states, .. } => {
+                let state = agents_states.get("subagent-agent-1").expect("agent state");
+                assert_eq!(
+                    state.message.as_deref(),
+                    Some("ios-reader · Explore: find files · team litter-ios · background")
+                );
+            }
+            other => panic!("expected CollabAgentToolCall, got {other:?}"),
+        }
     }
 
     #[test]

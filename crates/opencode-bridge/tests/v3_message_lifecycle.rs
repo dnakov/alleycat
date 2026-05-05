@@ -199,7 +199,7 @@ async fn bash_tool_part_emits_command_execution_started_and_completed() {
     assert_eq!(started["params"]["item"]["id"], "call_t1");
     assert_eq!(started["params"]["item"]["command"], "ls -la");
     assert_eq!(started["params"]["item"]["cwd"], "/tmp/opencode-v3-tool");
-    assert_eq!(started["params"]["item"]["status"], "running");
+    assert_eq!(started["params"]["item"]["status"], "inProgress");
 
     // Same part now in `completed` state with `output` populated. Bridge
     // should emit `item/completed` with `aggregatedOutput`.
