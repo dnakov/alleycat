@@ -1,7 +1,9 @@
 use std::ffi::OsString;
 use std::path::PathBuf;
 
-use alleycat_bridge_core::{ServerOptions, serve_stdio, serve_unix};
+use alleycat_bridge_core::serve_stdio;
+#[cfg(unix)]
+use alleycat_bridge_core::{ServerOptions, serve_unix};
 use alleycat_opencode_bridge::OpencodeBridge;
 
 enum Transport {
@@ -40,14 +42,25 @@ async fn main() -> anyhow::Result<()> {
 
     match transport_from_env_or_args() {
         Transport::Socket(path) => {
-            serve_unix(
-                bridge,
-                ServerOptions {
-                    socket_path: path,
-                    unlink_stale: true,
-                },
-            )
-            .await
+            #[cfg(unix)]
+            {
+                serve_unix(
+                    bridge,
+                    ServerOptions {
+                        socket_path: path,
+                        unlink_stale: true,
+                    },
+                )
+                .await
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = bridge;
+                anyhow::bail!(
+                    "Unix socket transport is not supported on Windows: {}",
+                    path.display()
+                );
+            }
         }
         Transport::Stdio => serve_stdio(bridge).await,
     }

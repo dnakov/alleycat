@@ -1,18 +1,16 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use alleycat_bridge_core::session::{Session, SessionRegistry, SessionRegistryConfig};
-use alleycat_bridge_core::{Bridge, Conn, JsonRpcError, LocalLauncher};
+use alleycat_bridge_core::{Bridge, LocalLauncher};
 use alleycat_claude_bridge::ClaudeBridge;
 use alleycat_opencode_bridge::OpencodeBridge;
 use alleycat_pi_bridge::PiBridge;
 use anyhow::{Context, anyhow};
 use arc_swap::ArcSwap;
-use async_trait::async_trait;
-use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, BufReader};
 use tokio::net::TcpStream;
 use tokio::process::{Child, Command};
@@ -49,6 +47,12 @@ enum CodexMode {
     Stdio,
 }
 
+struct CodexDetection {
+    mode: CodexMode,
+    bin: PathBuf,
+    available: bool,
+}
+
 #[derive(Clone)]
 pub struct AgentManager {
     config: Arc<ArcSwap<HostConfig>>,
@@ -66,6 +70,10 @@ pub struct AgentManager {
     /// Detected once at startup. Determines whether `serve_codex` runs the
     /// websocket byte-pump or per-stream stdio bridging.
     codex_mode: CodexMode,
+    /// The resolved codex executable selected during startup probing.
+    codex_bin: PathBuf,
+    /// Whether the selected codex executable could be spawned.
+    codex_available: bool,
     session_registry: Arc<SessionRegistry>,
     /// Held to keep the registry's reaper alive for the daemon lifetime.
     _reaper_handle: Arc<tokio::task::JoinHandle<()>>,
@@ -123,21 +131,33 @@ impl AgentManager {
         let session_registry = SessionRegistry::new(registry_config);
         let reaper_handle = Arc::new(session_registry.spawn_reaper());
 
-        let codex_mode = if snapshot.agents.codex.enabled {
-            detect_codex_mode(&snapshot.agents.codex.bin).await
+        let codex_detection = if snapshot.agents.codex.enabled {
+            detect_codex(&snapshot.agents.codex.bin).await
         } else {
             // Doesn't matter; codex is disabled. Pick a default so the
             // field has a value.
-            CodexMode::Stdio
+            CodexDetection {
+                mode: CodexMode::Stdio,
+                bin: PathBuf::from(&snapshot.agents.codex.bin),
+                available: false,
+            }
         };
-        info!(?codex_mode, bin = %snapshot.agents.codex.bin, "codex transport mode");
+        info!(
+            codex_mode = ?codex_detection.mode,
+            configured_bin = %snapshot.agents.codex.bin,
+            bin = %codex_detection.bin.display(),
+            available = codex_detection.available,
+            "codex transport mode"
+        );
 
         Ok(Self {
             config,
             bridges,
             opencode_bridge: Arc::new(OnceCell::new()),
             codex_child: Arc::new(Mutex::new(None)),
-            codex_mode,
+            codex_mode: codex_detection.mode,
+            codex_bin: codex_detection.bin,
+            codex_available: codex_detection.available,
             session_registry,
             _reaper_handle: reaper_handle,
         })
@@ -285,7 +305,7 @@ impl AgentManager {
             if !cfg.agents.codex.enabled {
                 return Err(anyhow!("codex agent is disabled"));
             }
-            cfg.agents.codex.bin.clone()
+            self.codex_bin.clone()
         };
 
         let mut child = Command::new(&bin)
@@ -295,7 +315,7 @@ impl AgentManager {
             .stderr(Stdio::piped())
             .kill_on_drop(true)
             .spawn()
-            .with_context(|| format!("spawning `{bin} app-server`"))?;
+            .with_context(|| format!("spawning `{} app-server`", bin.display()))?;
 
         let stdin = child.stdin.take().expect("piped stdin");
         let stdout = child.stdout.take().expect("piped stdout");
@@ -327,7 +347,7 @@ impl AgentManager {
                 return Err(anyhow!("codex agent is disabled"));
             }
             (
-                cfg.agents.codex.bin.clone(),
+                self.codex_bin.clone(),
                 cfg.agents.codex.host.clone(),
                 cfg.agents.codex.port,
             )
@@ -358,7 +378,9 @@ impl AgentManager {
                 .stderr(Stdio::piped())
                 .kill_on_drop(true)
                 .spawn()
-                .with_context(|| format!("spawning `{bin} app-server --listen {listen}`"))?;
+                .with_context(|| {
+                    format!("spawning `{} app-server --listen {listen}`", bin.display())
+                })?;
 
             if let Some(stderr) = child.stderr.take() {
                 tokio::spawn(async move {
@@ -419,7 +441,7 @@ impl AgentManager {
 
     fn codex_available(&self) -> bool {
         let cfg = self.config.load();
-        cfg.agents.codex.enabled && which::which(&cfg.agents.codex.bin).is_ok()
+        cfg.agents.codex.enabled && self.codex_available
     }
 
     fn pi_available(&self) -> bool {
@@ -443,32 +465,108 @@ impl AgentManager {
 /// Probe `<bin> app-server --help` and check whether the `--listen` flag
 /// is documented. If yes, the daemon can run a single shared websocket
 /// app-server; if no (older codex), we fall back to per-stream stdio. On
-/// any failure (binary missing, exec error, garbled output) we default to
-/// `Stdio` because that's the universal mode every codex with `app-server`
-/// supports.
-async fn detect_codex_mode(bin: &str) -> CodexMode {
-    let output = match tokio::time::timeout(
-        Duration::from_secs(5),
-        Command::new(bin).arg("app-server").arg("--help").output(),
-    )
-    .await
-    {
-        Ok(Ok(out)) => out,
-        Ok(Err(err)) => {
-            warn!(error = %err, %bin, "codex app-server --help failed; assuming stdio mode");
-            return CodexMode::Stdio;
-        }
-        Err(_) => {
-            warn!(%bin, "codex app-server --help timed out; assuming stdio mode");
-            return CodexMode::Stdio;
+/// any failure (binary missing, exec error, garbled output) makes that
+/// candidate unavailable. If no candidate can be spawned, we keep `Stdio` as
+/// the fallback mode but report codex unavailable.
+async fn detect_codex(bin: &str) -> CodexDetection {
+    let fallback_bin = PathBuf::from(bin);
+    let candidates = {
+        let resolved = program_candidates(Path::new(bin));
+        if resolved.is_empty() {
+            vec![fallback_bin.clone()]
+        } else {
+            resolved
         }
     };
-    let help = String::from_utf8_lossy(&output.stdout);
-    if help.contains("--listen") {
-        CodexMode::Websocket
-    } else {
-        CodexMode::Stdio
+
+    for candidate in candidates {
+        let output = match tokio::time::timeout(
+            Duration::from_secs(5),
+            Command::new(&candidate)
+                .arg("app-server")
+                .arg("--help")
+                .output(),
+        )
+        .await
+        {
+            Ok(Ok(out)) => out,
+            Ok(Err(err)) => {
+                warn!(
+                    error = %err,
+                    configured_bin = %bin,
+                    bin = %candidate.display(),
+                    "codex app-server --help failed"
+                );
+                continue;
+            }
+            Err(_) => {
+                warn!(
+                    configured_bin = %bin,
+                    bin = %candidate.display(),
+                    "codex app-server --help timed out"
+                );
+                continue;
+            }
+        };
+        if !output.status.success() {
+            warn!(
+                status = %output.status,
+                configured_bin = %bin,
+                bin = %candidate.display(),
+                "codex app-server --help exited unsuccessfully"
+            );
+            continue;
+        }
+        let mut help = String::from_utf8_lossy(&output.stdout).into_owned();
+        help.push_str(&String::from_utf8_lossy(&output.stderr));
+        let mode = if help.contains("--listen") {
+            CodexMode::Websocket
+        } else {
+            CodexMode::Stdio
+        };
+        return CodexDetection {
+            mode,
+            bin: candidate,
+            available: true,
+        };
     }
+
+    CodexDetection {
+        mode: CodexMode::Stdio,
+        bin: fallback_bin,
+        available: false,
+    }
+}
+
+fn program_candidates(program: &Path) -> Vec<PathBuf> {
+    if program.is_absolute() || program.components().count() > 1 {
+        return vec![program.to_path_buf()];
+    }
+
+    #[cfg(windows)]
+    {
+        let candidates = match which::which_all(program) {
+            Ok(candidates) => candidates
+                .filter(|path| {
+                    matches!(
+                        path.extension()
+                            .and_then(|ext| ext.to_str())
+                            .map(|ext| ext.to_ascii_lowercase())
+                            .as_deref(),
+                        Some("exe" | "cmd" | "bat" | "com")
+                    )
+                })
+                .collect::<Vec<_>>(),
+            Err(_) => Vec::new(),
+        };
+        if !candidates.is_empty() {
+            return candidates;
+        }
+    }
+
+    which::which(program)
+        .map(|path| vec![path])
+        .unwrap_or_default()
 }
 
 fn agent_kind_from_str(name: &str) -> Option<AgentKind> {

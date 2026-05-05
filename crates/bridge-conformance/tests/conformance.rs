@@ -237,7 +237,9 @@ fn workspace_bin(name: &str) -> anyhow::Result<PathBuf> {
         .map(PathBuf::from)
         .unwrap_or_else(|| workspace_root.join("target"));
     // Conformance tests build in dev profile.
-    let candidate = target_dir.join("debug").join(name);
+    let candidate = target_dir
+        .join("debug")
+        .join(format!("{name}{}", std::env::consts::EXE_SUFFIX));
     if !candidate.is_file() {
         anyhow::bail!("expected binary at {} after build", candidate.display());
     }

@@ -4,21 +4,36 @@
 //! `OPENCODE_BRIDGE_BIN` at the resolved binary so it doesn't fall back to
 //! `which opencode` inside a sandboxed test environment.
 
+#[cfg(unix)]
 use std::process::Stdio;
+#[cfg(unix)]
 use std::time::Duration;
 
-use anyhow::{Context, Result, anyhow, bail};
+#[cfg(unix)]
+use anyhow::{Context, anyhow};
+use anyhow::{Result, bail};
+#[cfg(unix)]
 use tempfile::TempDir;
+#[cfg(unix)]
 use tokio::net::UnixStream;
+#[cfg(unix)]
 use tokio::process::Command;
+#[cfg(unix)]
 use tokio::time::sleep;
 
+#[cfg(not(unix))]
+use super::{TargetHandle, TargetSpawn};
+#[cfg(unix)]
 use super::{TargetHandle, TargetSpawn, tee_stream};
+#[cfg(unix)]
 use crate::transport::{JsonRpcClient, boxed_reader, boxed_writer};
 
+#[cfg(unix)]
 const SOCKET_CONNECT_DEADLINE: Duration = Duration::from_secs(15);
+#[cfg(unix)]
 const SOCKET_RETRY_INTERVAL: Duration = Duration::from_millis(100);
 
+#[cfg(unix)]
 pub async fn spawn(opts: TargetSpawn) -> Result<TargetHandle> {
     let bridge_bin = opts
         .bridge_bin
@@ -61,6 +76,12 @@ pub async fn spawn(opts: TargetSpawn) -> Result<TargetHandle> {
     ))
 }
 
+#[cfg(not(unix))]
+pub async fn spawn(_opts: TargetSpawn) -> Result<TargetHandle> {
+    bail!("opencode conformance target uses Unix sockets, which are not available on Windows")
+}
+
+#[cfg(unix)]
 async fn wait_for_socket(path: &std::path::Path) -> Result<UnixStream> {
     let started = std::time::Instant::now();
     loop {
