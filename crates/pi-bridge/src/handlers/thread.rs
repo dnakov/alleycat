@@ -229,34 +229,39 @@ pub async fn handle_thread_resume(
         .ok_or_else(|| ThreadError::NotFound(params.thread_id.clone()))?;
 
     let cwd = resume_cwd_or_fallback(&entry.cwd, &params.thread_id, state.trust_persisted_cwd());
-    let handle = match state.pi_pool().get(&params.thread_id).await {
-        Some(h) => h,
-        None => state
-            .pi_pool()
-            .acquire_for_resume(params.thread_id.clone(), &cwd)
-            .await
-            .map_err(ThreadError::pool)?,
+    let (handle, already_loaded) = match state.pi_pool().get(&params.thread_id).await {
+        Some(h) => (h, true),
+        None => (
+            state
+                .pi_pool()
+                .acquire_for_resume(params.thread_id.clone(), &cwd)
+                .await
+                .map_err(ThreadError::pool)?,
+            false,
+        ),
     };
 
-    // Switch the spawned process to the persisted pi session file so
-    // future commands write to the right JSONL.
-    let switch = handle
-        .send_request(pi::RpcCommand::SwitchSession(pi::SwitchSessionCmd {
-            id: None,
-            session_path: entry
-                .metadata
-                .pi_session_path
-                .to_string_lossy()
-                .into_owned(),
-        }))
-        .await
-        .map_err(|e| ThreadError::PiRpc(e.to_string()))?;
-    if !switch.success {
-        return Err(ThreadError::PiRpc(
-            switch
-                .error
-                .unwrap_or_else(|| "switch_session failed".into()),
-        ));
+    if !already_loaded {
+        // A loaded handle is already on this session. Clients may race
+        // thread/resume with turn/start; do not switch during an active prompt.
+        let switch = handle
+            .send_request(pi::RpcCommand::SwitchSession(pi::SwitchSessionCmd {
+                id: None,
+                session_path: entry
+                    .metadata
+                    .pi_session_path
+                    .to_string_lossy()
+                    .into_owned(),
+            }))
+            .await
+            .map_err(|e| ThreadError::PiRpc(e.to_string()))?;
+        if !switch.success {
+            return Err(ThreadError::PiRpc(
+                switch
+                    .error
+                    .unwrap_or_else(|| "switch_session failed".into()),
+            ));
+        }
     }
 
     apply_model_override(&handle, &params.model, &params.model_provider).await;
