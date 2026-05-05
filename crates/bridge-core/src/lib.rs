@@ -17,9 +17,9 @@ pub use launcher::{
     ProcessRole, ProcessSpec, StdioMode,
 };
 pub use notify::NotificationSender;
-pub use server::{
-    Bridge, Conn, ServerOptions, serve_stdio, serve_stream, serve_stream_with_session, serve_unix,
-};
+pub use server::{Bridge, Conn, serve_stdio, serve_stream, serve_stream_with_session};
+#[cfg(unix)]
+pub use server::{ServerOptions, serve_unix};
 pub use session::{AttachKind, AttachOutcome, Session, SessionRegistry, SessionRegistryConfig};
 pub use thread_index::{
     DEFAULT_LIST_LIMIT, Hydrator, IndexEntry, ListFilter, ListPage, ListSort, MAX_LIST_LIMIT,

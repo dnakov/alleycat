@@ -1,12 +1,16 @@
 use std::collections::HashSet;
+#[cfg(unix)]
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde_json::Value;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
+#[cfg(unix)]
 use tokio::net::UnixListener;
-use tracing::{debug, warn};
+#[cfg(unix)]
+use tracing::debug;
+use tracing::warn;
 
 use crate::envelope::{
     InboundMessage, JsonRpcError, JsonRpcMessage, JsonRpcResponse, JsonRpcVersion, error_codes,
@@ -97,11 +101,13 @@ pub trait Bridge: Send + Sync + 'static {
 }
 
 #[derive(Debug, Clone)]
+#[cfg(unix)]
 pub struct ServerOptions {
     pub socket_path: PathBuf,
     pub unlink_stale: bool,
 }
 
+#[cfg(unix)]
 pub async fn serve_unix<B>(bridge: Arc<B>, options: ServerOptions) -> anyhow::Result<()>
 where
     B: Bridge + ?Sized,
@@ -119,6 +125,7 @@ where
     }
 }
 
+#[cfg(unix)]
 fn bind_unix_socket(path: &Path, unlink_stale: bool) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;

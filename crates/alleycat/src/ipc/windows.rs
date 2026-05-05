@@ -1,4 +1,3 @@
-use std::ffi::OsStr;
 use std::time::Duration;
 
 use anyhow::Context;
@@ -59,7 +58,7 @@ pub(super) async fn connect() -> anyhow::Result<Box<dyn ControlStream>> {
 pub(super) async fn connect_at(name: &str) -> anyhow::Result<Box<dyn ControlStream>> {
     let deadline = std::time::Instant::now() + Duration::from_secs(1);
     loop {
-        match ClientOptions::new().open(<&OsStr>::from(<&str>::as_ref(name))) {
+        match ClientOptions::new().open(name) {
             Ok(client) => return Ok(Box::new(client)),
             Err(e) if e.raw_os_error() == Some(ERROR_PIPE_BUSY) => {
                 if std::time::Instant::now() >= deadline {

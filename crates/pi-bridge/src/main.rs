@@ -8,6 +8,7 @@
 
 use std::path::PathBuf;
 
+#[cfg(unix)]
 use alleycat_bridge_core::ServerOptions;
 use alleycat_pi_bridge::PiBridge;
 use anyhow::Result;
@@ -31,14 +32,25 @@ async fn main() -> Result<()> {
     match socket_arg() {
         Some(path) => {
             tracing::info!(socket = %path.display(), "pi bridge socket listening");
-            alleycat_bridge_core::serve_unix(
-                bridge,
-                ServerOptions {
-                    socket_path: path,
-                    unlink_stale: true,
-                },
-            )
-            .await
+            #[cfg(unix)]
+            {
+                alleycat_bridge_core::serve_unix(
+                    bridge,
+                    ServerOptions {
+                        socket_path: path,
+                        unlink_stale: true,
+                    },
+                )
+                .await
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = bridge;
+                anyhow::bail!(
+                    "Unix socket transport is not supported on Windows: {}",
+                    path.display()
+                );
+            }
         }
         None => alleycat_bridge_core::serve_stdio(bridge).await,
     }

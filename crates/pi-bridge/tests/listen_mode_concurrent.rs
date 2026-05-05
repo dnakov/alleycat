@@ -16,6 +16,8 @@
 //! gets its own pi process (one process per `(cwd, thread_id)` pair, per
 //! pi-bridge plan).
 
+#![cfg(unix)]
+
 mod support;
 
 use std::path::PathBuf;

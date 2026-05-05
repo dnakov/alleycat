@@ -8,7 +8,9 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 
-use alleycat_bridge_core::{ServerOptions, serve_stdio, serve_unix};
+use alleycat_bridge_core::serve_stdio;
+#[cfg(unix)]
+use alleycat_bridge_core::{ServerOptions, serve_unix};
 use alleycat_claude_bridge::ClaudeBridge;
 
 #[tokio::main]
@@ -29,14 +31,25 @@ async fn main() -> Result<()> {
 
     match socket_arg() {
         Some(path) => {
-            serve_unix(
-                bridge,
-                ServerOptions {
-                    socket_path: path,
-                    unlink_stale: true,
-                },
-            )
-            .await
+            #[cfg(unix)]
+            {
+                serve_unix(
+                    bridge,
+                    ServerOptions {
+                        socket_path: path,
+                        unlink_stale: true,
+                    },
+                )
+                .await
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = bridge;
+                anyhow::bail!(
+                    "Unix socket transport is not supported on Windows: {}",
+                    path.display()
+                );
+            }
         }
         None => serve_stdio(bridge).await,
     }
