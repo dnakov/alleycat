@@ -570,6 +570,9 @@ pub enum PiEvent {
         #[serde(rename = "toolResults")]
         tool_results: Vec<ToolResultMessage>,
     },
+    ThinkingLevelChanged {
+        level: ThinkingLevel,
+    },
 
     // Message lifecycle
     MessageStart {
@@ -1441,6 +1444,32 @@ mod tests {
         match serde_json::from_value::<PiOutboundMessage>(evt).unwrap() {
             PiOutboundMessage::Event(PiEvent::AgentStart) => {}
             _ => panic!("agent_start misclassified"),
+        }
+    }
+
+    #[test]
+    fn thinking_level_changed_event_round_trips() {
+        for level in [
+            ThinkingLevel::Off,
+            ThinkingLevel::Minimal,
+            ThinkingLevel::Low,
+            ThinkingLevel::Medium,
+            ThinkingLevel::High,
+            ThinkingLevel::Xhigh,
+        ] {
+            let event = PiEvent::ThinkingLevelChanged { level };
+            let body = serde_json::to_value(&event).unwrap();
+            assert_eq!(
+                body.get("type").and_then(Value::as_str),
+                Some("thinking_level_changed")
+            );
+
+            match serde_json::from_value::<PiOutboundMessage>(body).unwrap() {
+                PiOutboundMessage::Event(PiEvent::ThinkingLevelChanged { level: parsed }) => {
+                    assert_eq!(parsed, level);
+                }
+                _ => panic!("thinking_level_changed misclassified"),
+            }
         }
     }
 
