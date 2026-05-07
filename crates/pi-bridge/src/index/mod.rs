@@ -11,7 +11,7 @@ pub mod pi_session_scan;
 #[cfg(any(test, feature = "test-helpers"))]
 pub mod testing;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -88,24 +88,14 @@ impl ThreadIndex {
         let path = codex_home.join("threads.json");
         let inner = alleycat_bridge_core::ThreadIndex::<PiSessionRef>::open_at(path).await?;
 
-        // Step 1: scan and insert any rows we haven't seen before.
+        // Step 1: scan and upsert rows by pi JSONL path. Existing rows keep
+        // their stable codex thread id, but refresh preview/timestamps/name so
+        // a desktop-started session that advanced while mobile was away is
+        // current the next time the bridge starts.
         let scanned = hydrator.scan_sessions().await;
-        if !scanned.is_empty() {
-            let known_paths: std::collections::HashSet<PathBuf> = inner
-                .snapshot()
-                .await
-                .into_iter()
-                .map(|e| e.metadata.pi_session_path)
-                .collect();
-            for info in &scanned {
-                if known_paths.contains(&info.path) {
-                    continue;
-                }
-                inner.insert(entry_from_pi(info)).await.with_context(|| {
-                    format!("inserting hydrated row for {}", info.path.display())
-                })?;
-            }
-        }
+        upsert_scanned_sessions(&inner, &scanned)
+            .await
+            .context("upserting hydrated pi sessions")?;
 
         // Step 2: resolve fork chains.
         let snapshot = inner.snapshot().await;
@@ -159,30 +149,14 @@ impl ThreadIndex {
         if scanned.is_empty() {
             return Ok(0);
         }
-        let known_paths: std::collections::HashSet<PathBuf> = self
-            .0
-            .snapshot()
-            .await
-            .into_iter()
-            .map(|e| e.metadata.pi_session_path)
-            .collect();
-        let mut added = 0usize;
-        let mut path_to_thread: BTreeMap<PathBuf, String> = self
+        let changed = upsert_scanned_sessions(&self.0, &scanned).await?;
+        let path_to_thread: BTreeMap<PathBuf, String> = self
             .0
             .snapshot()
             .await
             .into_iter()
             .map(|e| (e.metadata.pi_session_path.clone(), e.thread_id.clone()))
             .collect();
-        for info in &scanned {
-            if known_paths.contains(&info.path) {
-                continue;
-            }
-            let entry = entry_from_pi(info);
-            path_to_thread.insert(info.path.clone(), entry.thread_id.clone());
-            self.0.insert(entry).await?;
-            added += 1;
-        }
 
         // Resolve fork chains.
         let snapshot = self.0.snapshot().await;
@@ -205,8 +179,47 @@ impl ThreadIndex {
         for (child, parent) in updates {
             self.0.set_forked_from_id(&child, Some(parent)).await?;
         }
-        Ok(added)
+        Ok(changed)
     }
+}
+
+async fn upsert_scanned_sessions(
+    index: &alleycat_bridge_core::ThreadIndex<PiSessionRef>,
+    scanned: &[PiSessionInfo],
+) -> Result<usize> {
+    if scanned.is_empty() {
+        return Ok(0);
+    }
+
+    let existing_by_path: HashMap<PathBuf, IndexEntry> = index
+        .snapshot()
+        .await
+        .into_iter()
+        .map(|entry| (entry.metadata.pi_session_path.clone(), entry))
+        .collect();
+
+    let mut changed = 0usize;
+    for info in scanned {
+        let mut entry = entry_from_pi(info);
+        if let Some(existing) = existing_by_path.get(&info.path) {
+            // Path is the durable identity for a pi JSONL session. Preserve the
+            // codex-facing thread id and user-local flags, but let the scan
+            // refresh mutable session metadata.
+            entry.thread_id = existing.thread_id.clone();
+            entry.archived = existing.archived;
+            entry.forked_from_id = existing.forked_from_id.clone();
+            entry.source = existing.source;
+            if !existing.model_provider.trim().is_empty() {
+                entry.model_provider = existing.model_provider.clone();
+            }
+        }
+        index
+            .insert(entry)
+            .await
+            .with_context(|| format!("upserting hydrated row for {}", info.path.display()))?;
+        changed += 1;
+    }
+    Ok(changed)
 }
 
 impl std::ops::Deref for ThreadIndex {
@@ -504,6 +517,57 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(reopened.snapshot().await.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn hydrate_refreshes_existing_session_metadata_by_path() {
+        let dir = TempDir::new().unwrap();
+        let pi_root = dir.path().join("sessions");
+        let cwd_dir = pi_root.join("encoded");
+        std::fs::create_dir_all(&cwd_dir).unwrap();
+        let session_path = cwd_dir.join("session.jsonl");
+        std::fs::write(
+            &session_path,
+            r#"{"type":"session","version":3,"id":"sess","timestamp":"2026-04-27T10:00:00Z","cwd":"/p"}
+{"type":"message","id":"m1","parentId":null,"timestamp":"2026-04-27T10:00:05Z","message":{"role":"user","content":"old preview"}}
+"#,
+        )
+        .unwrap();
+
+        let codex_home = dir.path().join("codex-home");
+        let hydrator = PiHydrator::with_override(pi_root.clone());
+        let index = ThreadIndex::open_and_hydrate_with(&codex_home, &hydrator)
+            .await
+            .unwrap();
+        let initial = index.snapshot().await;
+        assert_eq!(initial.len(), 1);
+        let thread_id = initial[0].thread_id.clone();
+
+        index.set_archived(&thread_id, true).await.unwrap();
+        std::fs::write(
+            &session_path,
+            r#"{"type":"session","version":3,"id":"sess","timestamp":"2026-04-27T10:00:00Z","cwd":"/p"}
+{"type":"session_info","id":"si","parentId":null,"timestamp":"2026-04-27T10:00:01Z","name":"Desktop continued"}
+{"type":"message","id":"m1","parentId":null,"timestamp":"2026-04-27T10:00:05Z","message":{"role":"user","content":"new preview"}}
+{"type":"message","id":"m2","parentId":"m1","timestamp":"2026-04-27T10:02:00Z","message":{"role":"assistant","content":"reply"}}
+"#,
+        )
+        .unwrap();
+
+        let refreshed = ThreadIndex::open_and_hydrate_with(&codex_home, &hydrator)
+            .await
+            .unwrap();
+        let rows = refreshed.snapshot().await;
+        assert_eq!(rows.len(), 1, "refresh must not duplicate by path");
+        let row = &rows[0];
+        assert_eq!(
+            row.thread_id, thread_id,
+            "codex thread id should stay stable"
+        );
+        assert!(row.archived, "local archived flag should be preserved");
+        assert_eq!(row.name.as_deref(), Some("Desktop continued"));
+        assert_eq!(row.preview, "new preview");
+        assert_eq!(row.updated_at, 1777284120000);
     }
 
     #[tokio::test]
