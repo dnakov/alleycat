@@ -116,7 +116,8 @@ pub async fn restart_daemon() -> anyhow::Result<()> {
 }
 
 /// Spawn `current_exe serve` as a session-detached background process so
-/// it survives the parent CLI exit and any controlling-terminal SIGHUP.
+/// it survives the parent CLI exit and any controlling-terminal hangup
+/// signal (Unix SIGHUP / Windows console-close).
 fn spawn_serve_detached() -> anyhow::Result<()> {
     let exe = std::env::current_exe().context("locating current executable")?;
     let mut cmd = std::process::Command::new(&exe);
@@ -138,6 +139,20 @@ fn spawn_serve_detached() -> anyhow::Result<()> {
                 Ok(())
             });
         }
+    }
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // DETACHED_PROCESS: child has no console (we already redirect
+        // std{in,out,err} to null and the daemon writes to file logs, so
+        // no console is needed).
+        // CREATE_NEW_PROCESS_GROUP: child becomes its own process-group
+        // leader so a Ctrl+C / Ctrl+Break in the parent's console doesn't
+        // propagate to it.
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
     }
 
     cmd.spawn().context("spawning daemon child")?;
