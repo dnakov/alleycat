@@ -6,26 +6,24 @@ Iroh-backed bridge that multiplexes a few local coding agents — Codex, Pi, Ope
 
 ## Install
 
-Prebuilt binaries are published from the [`kittylitter`](https://github.com/dnakov/litter) project, which packages this daemon for end users. Both `alleycat` and `kittylitter` end up on `PATH` after install (MSI is the one exception — it installs only `alleycat.exe`).
+End-user packages are published from the [`kittylitter`](https://github.com/dnakov/litter) project, which wraps this daemon under the `kittylitter` command. The currently enabled published channel is npm/bun; Homebrew, shell installer, PowerShell installer, and MSI publishing are not enabled in the release config right now. Source installs from this repo expose the daemon as `alleycat`.
 
 | Platform | Install |
 |---|---|
-| macOS (Homebrew) | `brew install dnakov/homebrew-tap/kittylitter` |
-| macOS / Linux (shell) | `curl -sSf https://github.com/dnakov/litter/releases/latest/download/kittylitter-installer.sh \| sh` |
-| Windows (PowerShell) | `irm https://github.com/dnakov/litter/releases/latest/download/kittylitter-installer.ps1 \| iex` |
-| Windows (MSI) | Download `.msi` from the [latest litter release](https://github.com/dnakov/litter/releases/latest) |
 | npm / bun | `npm install -g kittylitter` &nbsp;or&nbsp; `bunx kittylitter` |
 | From source | `cargo install --path crates/alleycat` (this repo) |
 
 ## First run
 
 ```bash
-alleycat install         # autostart at login (no admin)
-alleycat status          # node id, token, agent availability
-alleycat pair --qr       # phone-side QR
+kittylitter install         # autostart at login (no admin)
+kittylitter status          # node id, token, agent availability
+kittylitter pair --qr       # phone-side QR
 ```
 
-`alleycat install` registers a launchd user agent on macOS, a systemd `--user` unit on Linux (with `.desktop` autostart fallback), or a Startup-folder shortcut on Windows. None of them require sudo.
+Use `alleycat` instead of `kittylitter` when running a source build from this repo.
+
+The `install` command registers a launchd user agent on macOS, a systemd `--user` unit on Linux (with `.desktop` autostart fallback), or a Startup-folder shortcut on Windows. None of them require sudo.
 
 The daemon spawns external coding-agent CLIs on demand — install whichever ones you'll use:
 
@@ -37,6 +35,8 @@ The daemon spawns external coding-agent CLIs on demand — install whichever one
 | `codex` | Install the `codex` CLI ([codex docs](https://github.com/openai/codex)). The daemon spawns `codex app-server` on demand. |
 
 ## Commands
+
+The command surface is the same for `kittylitter` packaged installs and `alleycat` source builds. The table uses `alleycat` because this is the daemon repo.
 
 | Command | What it does |
 |---|---|
@@ -156,4 +156,4 @@ The workspace has six crates:
 - `crates/opencode-bridge` — single shared `opencode serve` backend wrapped in the same JSON-RPC surface.
 - `crates/claude-bridge` — `claude -p --output-format stream-json` process pool wrapped in the same JSON-RPC surface (one claude process per codex thread).
 
-Releases are produced from the [`litter`](https://github.com/dnakov/litter) repo, which carries this repo as a submodule under `shared/third_party/alleycat` and runs [`dist`](https://github.com/axodotdev/cargo-dist) against it to build the six platform tarballs and publish the `kittylitter` Homebrew + npm packages. To cut a release: bump `version` in the root `Cargo.toml` here, push, then bump the submodule pin in litter and tag `vX.Y.Z` there.
+Releases are produced from the [`litter`](https://github.com/dnakov/litter) repo, which carries this repo as a submodule under `shared/third_party/alleycat` and runs [`dist`](https://github.com/axodotdev/cargo-dist) against the `kittylitter` wrapper to build platform release artifacts and publish the npm package. Homebrew, shell installer, PowerShell installer, and MSI publishing are disabled in litter's release config right now. To cut a release: bump `version` in the root `Cargo.toml` here, push, then bump the submodule pin in litter and tag `vX.Y.Z` there.
