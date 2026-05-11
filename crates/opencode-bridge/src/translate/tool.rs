@@ -61,6 +61,7 @@ pub fn tool_part_to_item_with_context(part: &Value, context: ToolPartContext<'_>
             "command": command,
             "cwd": resolved_cwd(&input, context),
             "status": command_status(status),
+            "commandActions": [],
             "aggregatedOutput": cap_output(extract_text_output(&state)),
         });
         add_exit_code(&mut item, &state);
@@ -732,6 +733,7 @@ mod tests {
         let item = tool_part_to_item(&p).unwrap();
         assert_eq!(item["type"], "commandExecution");
         assert_eq!(item["command"], "echo hi");
+        assert_eq!(item["commandActions"], json!([]));
         assert_eq!(item["aggregatedOutput"], "hi\n");
     }
 
@@ -943,6 +945,7 @@ mod tests {
         assert_eq!(item["status"], "failed");
         assert_eq!(item["exitCode"], 1);
         assert_eq!(item["durationMs"], 250);
+        assert_eq!(item["commandActions"], json!([]));
         assert_eq!(item["aggregatedOutput"], "boom");
     }
 
