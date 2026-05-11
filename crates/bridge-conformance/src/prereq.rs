@@ -16,6 +16,7 @@ pub enum Prereq {
     Claude { bin: PathBuf },
     Opencode { bin: PathBuf },
     Droid { bin: PathBuf },
+    Hermes { bin: PathBuf },
 }
 
 #[derive(Debug)]
@@ -39,6 +40,7 @@ pub async fn check(target: TargetId) -> Result<Prereq, SkipReason> {
         TargetId::Claude => check_claude(),
         TargetId::Opencode => check_opencode(),
         TargetId::Droid => check_droid(),
+        TargetId::Hermes => check_hermes(),
     }
 }
 
@@ -90,6 +92,12 @@ fn check_droid() -> Result<Prereq, SkipReason> {
             "droid auth unavailable: set FACTORY_API_KEY or run droid login".into(),
         ))
     }
+}
+
+fn check_hermes() -> Result<Prereq, SkipReason> {
+    let bin = which_or_env("HERMES_BRIDGE_BIN", "hermes")
+        .ok_or_else(|| SkipReason::Reason("hermes not on PATH; set HERMES_BRIDGE_BIN".into()))?;
+    Ok(Prereq::Hermes { bin })
 }
 
 fn which_or_env(env_var: &str, bin_name: &str) -> Option<PathBuf> {

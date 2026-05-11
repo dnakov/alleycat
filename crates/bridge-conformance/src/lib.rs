@@ -44,6 +44,8 @@ pub enum TargetId {
     Opencode,
     /// `alleycat-droid-bridge` over stdio (`droid exec` backend).
     Droid,
+    /// `alleycat-hermes-bridge` over stdio (Hermes Agent API or CLI backend).
+    Hermes,
 }
 
 impl TargetId {
@@ -54,6 +56,7 @@ impl TargetId {
         TargetId::Claude,
         TargetId::Opencode,
         TargetId::Droid,
+        TargetId::Hermes,
     ];
 
     pub fn label(self) -> &'static str {
@@ -64,6 +67,7 @@ impl TargetId {
             TargetId::Claude => "claude",
             TargetId::Opencode => "opencode",
             TargetId::Droid => "droid",
+            TargetId::Hermes => "hermes",
         }
     }
 }

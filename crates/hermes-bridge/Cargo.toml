@@ -1,0 +1,53 @@
+[package]
+name = "alleycat-hermes-bridge"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+description = "Codex app-server façade over a Hermes Agent backend, used by the alleycat daemon."
+
+[package.metadata.dist]
+dist = false
+
+[package.metadata.wix]
+upgrade-guid = "A1B2C3D4-E5F6-7890-ABCD-EF1234567890"
+path-guid = "B2C3D4E5-F6A7-8901-BCDE-F12345678901"
+license = false
+eula = false
+
+[[bin]]
+name = "alleycat-hermes-bridge"
+path = "src/main.rs"
+
+[lib]
+name = "alleycat_hermes_bridge"
+path = "src/lib.rs"
+
+[dependencies]
+alleycat-bridge-core = { workspace = true }
+alleycat-codex-proto = { workspace = true }
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+chrono = { workspace = true }
+futures = { workspace = true }
+hex = { workspace = true }
+rand = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+url = { workspace = true }
+uuid = { workspace = true }
+directories = { workspace = true }
+which = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio-tungstenite = { workspace = true }

@@ -74,6 +74,7 @@ dependencies = [
  "alleycat-bridge-core",
  "alleycat-claude-bridge",
  "alleycat-droid-bridge",
+ "alleycat-hermes-bridge",
  "alleycat-opencode-bridge",
  "alleycat-pi-bridge",
  "anyhow",
@@ -233,6 +234,34 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+]
+
+[[package]]
+name = "alleycat-hermes-bridge"
+version = "0.1.0"
+dependencies = [
+ "alleycat-bridge-core",
+ "alleycat-codex-proto",
+ "anyhow",
+ "async-trait",
+ "chrono",
+ "directories",
+ "futures",
+ "hex",
+ "rand 0.8.6",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-tungstenite",
+ "tracing",
+ "tracing-subscriber",
+ "url",
+ "uuid",
+ "which",
 ]
 
 [[package]]

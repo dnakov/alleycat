@@ -3,6 +3,7 @@ const CLAUDE_BRIDGE: &str = include_str!("../../claude-bridge/src/bridge.rs");
 const DROID_BRIDGE: &str = include_str!("../../droid-bridge/src/bridge.rs");
 const PI_BRIDGE: &str = include_str!("../../pi-bridge/src/bridge.rs");
 const OPENCODE_BRIDGE: &str = include_str!("../../opencode-bridge/src/handlers/mod.rs");
+const HERMES_BRIDGE: &str = include_str!("../../hermes-bridge/src/bridge.rs");
 
 const STANDARD_REQUEST_METHODS: &[&str] = &[
     "account/read",
@@ -57,6 +58,7 @@ fn all_jsonrpc_bridges_account_for_the_standard_method_surface() {
         ("droid", DROID_BRIDGE),
         ("pi", PI_BRIDGE),
         ("opencode", OPENCODE_BRIDGE),
+        ("hermes", HERMES_BRIDGE),
     ] {
         for method in STANDARD_REQUEST_METHODS {
             assert!(
@@ -75,6 +77,7 @@ fn all_jsonrpc_bridges_own_initialize_separately_from_dispatch() {
         ("droid", DROID_BRIDGE),
         ("pi", PI_BRIDGE),
         ("opencode", OPENCODE_BRIDGE),
+        ("hermes", HERMES_BRIDGE),
     ] {
         assert!(
             source.contains("async fn initialize"),

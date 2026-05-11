@@ -8,6 +8,7 @@ members = [
     "crates/claude-remote-control",
     "crates/codex-proto",
     "crates/droid-bridge",
+    "crates/hermes-bridge",
     "crates/pi-bridge",
     "crates/opencode-bridge",
 ]
@@ -29,6 +30,7 @@ alleycat-codex-proto = { path = "crates/codex-proto", version = "0.1" }
 alleycat-claude-bridge = { path = "crates/claude-bridge", version = "0.1" }
 alleycat-claude-remote-control = { path = "crates/claude-remote-control", version = "0.1" }
 alleycat-droid-bridge = { path = "crates/droid-bridge", version = "0.1" }
+alleycat-hermes-bridge = { path = "crates/hermes-bridge", version = "0.1" }
 alleycat-opencode-bridge = { path = "crates/opencode-bridge", version = "0.1" }
 alleycat-pi-bridge = { path = "crates/pi-bridge", version = "0.1" }
 anyhow = "1"

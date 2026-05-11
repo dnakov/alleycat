@@ -55,6 +55,12 @@ async fn conformance_droid() {
     run_target(TargetId::Droid).await;
 }
 
+#[tokio::test]
+#[ignore = "live conformance — requires `hermes` CLI or gateway"]
+async fn conformance_hermes() {
+    run_target(TargetId::Hermes).await;
+}
+
 /// Aggregate test: capture transcripts from every available target and
 /// diff each non-codex target against codex (the reference). Skips any
 /// target whose prereqs aren't met. Skips entirely if codex itself is
@@ -84,6 +90,7 @@ async fn conformance_diff_all_against_codex() {
         TargetId::Claude,
         TargetId::Opencode,
         TargetId::Droid,
+        TargetId::Hermes,
     ] {
         match drive_fresh(target).await {
             DriveOutcome::Ran(t) => {
@@ -252,6 +259,12 @@ fn build_spawn(
         (TargetId::Droid, Prereq::Droid { bin }) => TargetSpawn {
             target,
             bridge_bin: Some(workspace_bin("alleycat-droid-bridge")?),
+            backend_bin: Some(bin.clone()),
+            cwd,
+        },
+        (TargetId::Hermes, Prereq::Hermes { bin }) => TargetSpawn {
+            target,
+            bridge_bin: Some(workspace_bin("alleycat-hermes-bridge")?),
             backend_bin: Some(bin.clone()),
             cwd,
         },

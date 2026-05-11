@@ -15,6 +15,7 @@ pub mod amp;
 pub mod claude;
 pub mod codex;
 pub mod droid;
+pub mod hermes;
 pub mod opencode;
 pub mod pi;
 
@@ -80,6 +81,7 @@ pub async fn spawn(opts: TargetSpawn) -> Result<TargetHandle> {
         TargetId::Claude => claude::spawn(opts).await,
         TargetId::Opencode => opencode::spawn(opts).await,
         TargetId::Droid => droid::spawn(opts).await,
+        TargetId::Hermes => hermes::spawn(opts).await,
     }
 }
 

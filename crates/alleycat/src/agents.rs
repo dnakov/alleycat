@@ -9,6 +9,7 @@ use alleycat_bridge_core::session::{Session, SessionRegistry, SessionRegistryCon
 use alleycat_bridge_core::{Bridge, LocalLauncher};
 use alleycat_claude_bridge::ClaudeBridge;
 use alleycat_droid_bridge::DroidBridge;
+use alleycat_hermes_bridge::{HermesBridge, HermesBridgeConfig};
 use alleycat_opencode_bridge::OpencodeBridge;
 use alleycat_pi_bridge::PiBridge;
 use anyhow::{Context, anyhow};
@@ -34,6 +35,7 @@ pub enum AgentKind {
     Claude,
     Opencode,
     Droid,
+    Hermes,
 }
 
 /// How the daemon talks to `codex app-server`. Selected at startup by
@@ -149,6 +151,21 @@ impl AgentManager {
         bridges.insert(AgentKind::Claude, claude_bridge as Arc<dyn Bridge>);
         bridges.insert(AgentKind::Droid, droid_bridge as Arc<dyn Bridge>);
 
+        let hermes_cfg = &snapshot.agents.hermes;
+        let hermes_bridge_cfg = HermesBridgeConfig {
+            mode: alleycat_hermes_bridge::HermesMode::Auto {
+                api_base: hermes_cfg.api_base.clone(),
+                bin: Some(hermes_cfg.bin.clone()),
+            },
+            state_dir: codex_home
+                .as_ref()
+                .map(|p| p.join("hermes-bridge").to_string_lossy().to_string()),
+        };
+        bridges.insert(
+            AgentKind::Hermes,
+            Arc::new(HermesBridge::new(hermes_bridge_cfg)) as Arc<dyn Bridge>,
+        );
+
         let session_cfg = &snapshot.session;
         let registry_config = SessionRegistryConfig {
             ring_max_msgs: session_cfg.replay_max_msgs,
@@ -236,6 +253,12 @@ impl AgentManager {
                 wire: AgentWire::Jsonl,
                 available: self.droid_available(),
             },
+            AgentInfo {
+                name: "hermes".to_string(),
+                display_name: "Hermes".to_string(),
+                wire: AgentWire::Jsonl,
+                available: self.hermes_available(),
+            },
         ]
     }
 
@@ -307,6 +330,7 @@ impl AgentManager {
             "opencode" => Some("opencode"),
             "claude" => Some("claude"),
             "droid" => Some("droid"),
+            "hermes" => Some("hermes"),
             _ => None,
         }
     }
@@ -320,6 +344,7 @@ impl AgentManager {
             "opencode" => cfg.agents.opencode.enabled,
             "claude" => cfg.agents.claude.enabled,
             "droid" => cfg.agents.droid.enabled,
+            "hermes" => cfg.agents.hermes.enabled,
             _ => false,
         }
     }
@@ -549,6 +574,11 @@ impl AgentManager {
             && which::which(&cfg.agents.droid.bin).is_ok()
             && has_factory_auth(&cfg.agents.droid.api_key_env)
     }
+
+    fn hermes_available(&self) -> bool {
+        let cfg = self.config.load();
+        cfg.agents.hermes.enabled && which::which(&cfg.agents.hermes.bin).is_ok()
+    }
 }
 
 /// Probe `<bin> app-server --help` and check whether the `--listen` flag
@@ -682,6 +712,7 @@ fn agent_kind_from_str(name: &str) -> Option<AgentKind> {
         "claude" => Some(AgentKind::Claude),
         "opencode" => Some(AgentKind::Opencode),
         "droid" => Some(AgentKind::Droid),
+        "hermes" => Some(AgentKind::Hermes),
         _ => None,
     }
 }
@@ -693,6 +724,7 @@ fn agent_kind_str(kind: AgentKind) -> &'static str {
         AgentKind::Claude => "claude",
         AgentKind::Opencode => "opencode",
         AgentKind::Droid => "droid",
+        AgentKind::Hermes => "hermes",
     }
 }
 
@@ -704,6 +736,7 @@ impl crate::config::AgentsConfig {
             AgentKind::Claude => self.claude.enabled,
             AgentKind::Opencode => self.opencode.enabled,
             AgentKind::Droid => self.droid.enabled,
+            AgentKind::Hermes => self.hermes.enabled,
         }
     }
 }

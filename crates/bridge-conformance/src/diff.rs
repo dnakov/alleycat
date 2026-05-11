@@ -365,6 +365,38 @@ impl KnownDivergence {
                 ),
                 field_path_divergences: COMMON_FIELD_DIVERGENCES,
             },
+
+            TargetId::Hermes => Self {
+                target,
+                skipped_methods: concat_static(
+                    &[
+                        "account/login/start",
+                        "account/login/cancel",
+                        "account/logout",
+                        "mcpServer/oauth/login",
+                        "skills/config/write",
+                        "thread/fork",
+                        "thread/rollback",
+                        "review/start",
+                    ],
+                    SHAPE_DIVERGENT_RESPONSES,
+                ),
+                skipped_notifications: concat_static(
+                    &[
+                        "thread/name/updated",
+                        "turn/diff/updated",
+                        "turn/plan/updated",
+                        "item/mcpToolCall/progress",
+                        "item/dynamicToolCall/argumentsDelta",
+                        "model/rerouted",
+                        "configWarning",
+                        "deprecationNotice",
+                        "serverRequest/resolved",
+                    ],
+                    SHAPE_DIVERGENT_NOTIFICATIONS,
+                ),
+                field_path_divergences: COMMON_FIELD_DIVERGENCES,
+            },
             TargetId::Droid => Self {
                 target,
                 skipped_methods: concat_static(

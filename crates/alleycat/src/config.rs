@@ -53,7 +53,7 @@ impl Default for SessionConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct AgentsConfig {
     pub codex: CodexAgentConfig,
@@ -62,19 +62,7 @@ pub struct AgentsConfig {
     pub opencode: OpencodeAgentConfig,
     pub claude: ClaudeAgentConfig,
     pub droid: DroidAgentConfig,
-}
-
-impl Default for AgentsConfig {
-    fn default() -> Self {
-        Self {
-            codex: CodexAgentConfig::default(),
-            pi: PiAgentConfig::default(),
-            amp: AmpAgentConfig::default(),
-            opencode: OpencodeAgentConfig::default(),
-            claude: ClaudeAgentConfig::default(),
-            droid: DroidAgentConfig::default(),
-        }
-    }
+    pub hermes: HermesAgentConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -195,6 +183,26 @@ impl Default for DroidAgentConfig {
             enabled: true,
             bin: "droid".to_string(),
             api_key_env: "FACTORY_API_KEY".to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct HermesAgentConfig {
+    pub enabled: bool,
+    /// Hermes CLI binary used for fallback mode.
+    pub bin: String,
+    /// Loopback Hermes gateway API base URL.
+    pub api_base: String,
+}
+
+impl Default for HermesAgentConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            bin: "hermes".to_string(),
+            api_base: "http://127.0.0.1:8642".to_string(),
         }
     }
 }

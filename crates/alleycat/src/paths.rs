@@ -382,11 +382,16 @@ mod tests {
     #[test]
     fn control_socket_prefers_xdg_runtime_dir_when_set() {
         let mut h = TempHome::new();
-        let runtime = h.path().join("xdg-runtime");
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let runtime = PathBuf::from(format!("/tmp/alleycat-rt-{}-{stamp}", std::process::id()));
         std::fs::create_dir_all(&runtime).unwrap();
         h.override_env(&[("XDG_RUNTIME_DIR", runtime.to_str().unwrap())]);
         let sock = control_socket_path().unwrap();
         assert!(sock.starts_with(&runtime));
+        let _ = std::fs::remove_dir_all(runtime);
     }
 
     #[cfg(target_os = "macos")]
