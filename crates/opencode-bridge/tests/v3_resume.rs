@@ -98,3 +98,75 @@ async fn thread_resume_then_read_returns_persisted_turns() {
 
     fx.shutdown().await;
 }
+
+#[tokio::test]
+async fn thread_resume_with_bash_history_keeps_command_actions_field() {
+    let state = std::sync::Arc::new(std::sync::Mutex::new(FakeServerState::default()));
+    {
+        let mut guard = state.lock().unwrap();
+        guard.route(
+            "GET /session?directory=%2Ftmp%2Fv3r-bash",
+            json!([{
+                "id":"ses_resume_bash",
+                "directory":"/tmp/v3r-bash",
+                "title":"V3-Resume Bash",
+                "time":{"created":1_000,"updated":1_000}
+            }]),
+        );
+        guard.route(
+            "GET /session/ses_resume_bash/message",
+            json!([
+                {
+                    "info": {"id":"msg_user","role":"user","sessionID":"ses_resume_bash"},
+                    "parts": [{"id":"p1","type":"text","text":"run ls"}]
+                },
+                {
+                    "info": {"id":"msg_asst","role":"assistant","sessionID":"ses_resume_bash"},
+                    "parts": [{
+                        "id":"p_bash","type":"tool","callID":"call_bash","tool":"bash",
+                        "state":{
+                            "status":"completed",
+                            "input":{"command":"ls","cwd":"/tmp/v3r-bash"},
+                            "output":"a\nb\n"
+                        }
+                    }]
+                }
+            ]),
+        );
+    }
+
+    let mut fx = bring_up_bridge("v3r-bash", state.clone()).await;
+
+    send(
+        &mut fx.write,
+        2,
+        "thread/list",
+        json!({"cwd":"/tmp/v3r-bash"}),
+    )
+    .await;
+    let list = read_until_response(&mut fx.read, 2).await;
+    let thread_id = list["result"]["data"][0]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    send(
+        &mut fx.write,
+        3,
+        "thread/resume",
+        json!({"threadId":thread_id}),
+    )
+    .await;
+    let resume = read_until_response(&mut fx.read, 3).await;
+    let turns = resume["result"]["thread"]["turns"]
+        .as_array()
+        .expect("turns array");
+    assert_eq!(turns.len(), 1);
+    let items = turns[0]["items"].as_array().expect("turn items");
+    assert_eq!(items.len(), 2);
+    assert_eq!(items[1]["type"], "commandExecution");
+    assert_eq!(items[1]["command"], "ls");
+    assert_eq!(items[1]["commandActions"], json!([]));
+
+    fx.shutdown().await;
+}
