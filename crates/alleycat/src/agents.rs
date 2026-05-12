@@ -257,7 +257,7 @@ impl AgentManager {
                 name: "hermes".to_string(),
                 display_name: "Hermes".to_string(),
                 wire: AgentWire::Jsonl,
-                available: self.hermes_available(),
+                available: self.hermes_available().await,
             },
         ]
     }
@@ -575,10 +575,25 @@ impl AgentManager {
             && has_factory_auth(&cfg.agents.droid.api_key_env)
     }
 
-    fn hermes_available(&self) -> bool {
-        let cfg = self.config.load();
-        cfg.agents.hermes.enabled && which::which(&cfg.agents.hermes.bin).is_ok()
+    async fn hermes_available(&self) -> bool {
+        let (enabled, bin, api_base) = {
+            let cfg = self.config.load();
+            (
+                cfg.agents.hermes.enabled,
+                cfg.agents.hermes.bin.clone(),
+                cfg.agents.hermes.api_base.clone(),
+            )
+        };
+        enabled && (which::which(&bin).is_ok() || hermes_api_available(&api_base).await)
     }
+}
+
+async fn hermes_api_available(api_base: &str) -> bool {
+    let url = format!("{}/health", api_base.trim_end_matches('/'));
+    matches!(
+        tokio::time::timeout(Duration::from_millis(300), reqwest::get(url)).await,
+        Ok(Ok(response)) if response.status().is_success()
+    )
 }
 
 /// Probe `<bin> app-server --help` and check whether the `--listen` flag

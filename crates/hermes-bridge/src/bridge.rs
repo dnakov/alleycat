@@ -126,19 +126,27 @@ fn truncate_string(value: &mut String, cap: usize) {
     value.push_str("\n...[truncated]");
 }
 
-fn completed_turn(turn_id: &str) -> Turn {
+fn in_progress_turn(turn_id: &str) -> Turn {
     Turn {
         id: turn_id.to_string(),
         items: vec![],
         items_view: "full".to_string(),
-        status: TurnStatus::Completed,
+        status: TurnStatus::InProgress,
         error: None,
         started_at: Some(epoch_ms()),
-        completed_at: Some(epoch_ms()),
+        completed_at: None,
         duration_ms: None,
     }
 }
 
+fn completed_turn(turn_id: &str) -> Turn {
+    let mut turn = in_progress_turn(turn_id);
+    turn.status = TurnStatus::Completed;
+    turn.completed_at = Some(epoch_ms());
+    turn
+}
+
+#[derive(Clone)]
 pub struct HermesBridge {
     config: HermesBridgeConfig,
     index: Arc<ThreadIndex>,
@@ -214,7 +222,7 @@ impl HermesBridge {
             instruction_sources: vec![],
             approval_policy: AskForApproval::Never,
             approvals_reviewer: ApprovalsReviewer::User,
-            sandbox: json!({"type": "danger-full-access"}),
+            sandbox: json!({"type": "dangerFullAccess"}),
             permission_profile: None,
             active_permission_profile: None,
             reasoning_effort: Some(ReasoningEffort::Medium),
@@ -408,11 +416,11 @@ impl HermesBridge {
             sandbox: p
                 .sandbox
                 .map(|mode| match mode {
-                    SandboxMode::ReadOnly => json!({"type": "read-only"}),
-                    SandboxMode::WorkspaceWrite => json!({"type": "workspace-write"}),
-                    SandboxMode::DangerFullAccess => json!({"type": "danger-full-access"}),
+                    SandboxMode::ReadOnly => json!({"type": "readOnly"}),
+                    SandboxMode::WorkspaceWrite => json!({"type": "workspaceWrite"}),
+                    SandboxMode::DangerFullAccess => json!({"type": "dangerFullAccess"}),
                 })
-                .unwrap_or_else(|| json!({"type": "danger-full-access"})),
+                .unwrap_or_else(|| json!({"type": "dangerFullAccess"})),
             permission_profile: p.permission_profile,
             active_permission_profile: None,
             reasoning_effort: Some(ReasoningEffort::Medium),
@@ -720,13 +728,8 @@ impl HermesBridge {
                     .map(|h| h.status == "ok")
                     .unwrap_or(false)
                 {
-                    match self
-                        .dispatch_turn_api(ctx, &thread_id, &turn_id, &session_id, &p)
+                    self.dispatch_turn_api(ctx, &thread_id, &turn_id, &session_id, &p)
                         .await
-                    {
-                        Ok(value) => Ok(value),
-                        Err(_) => self.dispatch_turn_cli(ctx, &thread_id, &turn_id, &p).await,
-                    }
                 } else {
                     self.dispatch_turn_cli(ctx, &thread_id, &turn_id, &p).await
                 }
@@ -1080,17 +1083,30 @@ impl HermesBridge {
         params: &TurnStartParams,
     ) -> Result<Value, JsonRpcError> {
         let text = user_text(&params.input);
+        let cwd = params
+            .cwd
+            .as_ref()
+            .map(|p| p.to_string_lossy().to_string())
+            .or_else(|| {
+                self.index
+                    .get_by_thread(thread_id)
+                    .and_then(|binding| binding.cwd)
+            });
         let request = CreateRunRequest {
             input: text,
             session_id: Some(session_id.to_string()),
-            cwd: params.cwd.as_ref().map(|p| p.to_string_lossy().to_string()),
+            cwd,
             model: params.model.clone(),
         };
-        let run = self
-            .api_client
-            .create_run(request)
-            .await
-            .map_err(|e| rpc_error(-32603, format!("Hermes API error: {e}")))?;
+        let run = match self.api_client.create_run(request).await {
+            Ok(run) => run,
+            Err(e) => {
+                let message = format!("Hermes API error: {e}");
+                self.emit_turn_completed(ctx, thread_id, turn_id, None, Some(message.clone()))
+                    .await;
+                return error_response(-32603, &message);
+            }
+        };
         if let Some(ref hermes_session_id) = run.session_id {
             self.index.update_after_turn(
                 thread_id,
@@ -1115,17 +1131,71 @@ impl HermesBridge {
         let agent_item_id = format!("item_{}", random_hex(8));
         self.emit_agent_started(ctx, thread_id, turn_id, &agent_item_id)
             .await;
+        let response_turn = in_progress_turn(turn_id);
+        let auto_approve = matches!(params.approval_policy.as_ref(), Some(AskForApproval::Never));
+        let bridge = self.clone();
+        let ctx = ctx.clone();
+        let thread_id = thread_id.to_string();
+        let turn_id = turn_id.to_string();
+        tokio::spawn(async move {
+            bridge
+                .pump_api_events(
+                    ctx,
+                    thread_id,
+                    turn_id,
+                    agent_item_id,
+                    run.run_id,
+                    auto_approve,
+                )
+                .await;
+        });
+        to_value(TurnStartResponse {
+            turn: response_turn,
+        })
+    }
+
+    async fn pump_api_events(
+        &self,
+        ctx: Conn,
+        thread_id: String,
+        turn_id: String,
+        agent_item_id: String,
+        run_id: String,
+        auto_approve: bool,
+    ) {
         let mut full_text = String::new();
         let mut terminal = false;
-        let resp = self
-            .api_client
-            .events_stream(&run.run_id)
-            .await
-            .map_err(|e| rpc_error(-32603, format!("Hermes events error: {e}")))?;
+        let resp = match self.api_client.events_stream(&run_id).await {
+            Ok(resp) => resp,
+            Err(e) => {
+                let message = format!("Hermes events error: {e}");
+                self.emit_agent_completed(&ctx, &thread_id, &turn_id, &agent_item_id, "")
+                    .await;
+                self.emit_turn_completed(&ctx, &thread_id, &turn_id, None, Some(message))
+                    .await;
+                return;
+            }
+        };
         let mut body = String::new();
         let mut stream = resp.bytes_stream();
         while let Some(chunk) = stream.next().await {
-            let bytes = chunk.map_err(|e| rpc_error(-32603, format!("Hermes SSE error: {e}")))?;
+            let bytes = match chunk {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    let message = format!("Hermes SSE error: {e}");
+                    self.emit_agent_completed(
+                        &ctx,
+                        &thread_id,
+                        &turn_id,
+                        &agent_item_id,
+                        &full_text,
+                    )
+                    .await;
+                    self.emit_turn_completed(&ctx, &thread_id, &turn_id, None, Some(message))
+                        .await;
+                    return;
+                }
+            };
             body.push_str(&String::from_utf8_lossy(&bytes));
             while let Some(idx) = body.find("\n\n") {
                 let complete = body[..idx + 2].to_string();
@@ -1133,27 +1203,81 @@ impl HermesBridge {
                 for event in crate::sse::parse_sse_frames(&complete) {
                     if let Some(delta) = event.message_delta() {
                         full_text.push_str(&delta);
-                        self.emit_agent_delta(ctx, thread_id, turn_id, &agent_item_id, &delta)
+                        self.emit_agent_delta(&ctx, &thread_id, &turn_id, &agent_item_id, &delta)
                             .await;
                     } else if let Some(error) = event.terminal_error() {
                         self.emit_agent_completed(
-                            ctx,
-                            thread_id,
-                            turn_id,
+                            &ctx,
+                            &thread_id,
+                            &turn_id,
                             &agent_item_id,
                             &full_text,
                         )
                         .await;
                         self.emit_turn_completed(
-                            ctx,
-                            thread_id,
-                            turn_id,
+                            &ctx,
+                            &thread_id,
+                            &turn_id,
                             None,
                             Some(format!("Hermes API error: {error}")),
                         )
                         .await;
-                        return error_response(-32603, &format!("Hermes API error: {error}"));
+                        return;
+                    } else if event.event == "approval.request" {
+                        if auto_approve {
+                            if let Err(e) = self.api_client.approve_run_once(&run_id).await {
+                                let message = format!("Hermes approval error: {e}");
+                                self.emit_agent_completed(
+                                    &ctx,
+                                    &thread_id,
+                                    &turn_id,
+                                    &agent_item_id,
+                                    &full_text,
+                                )
+                                .await;
+                                self.emit_turn_completed(
+                                    &ctx,
+                                    &thread_id,
+                                    &turn_id,
+                                    None,
+                                    Some(message),
+                                )
+                                .await;
+                                return;
+                            }
+                        } else if !auto_approve {
+                            self.emit_agent_completed(
+                                &ctx,
+                                &thread_id,
+                                &turn_id,
+                                &agent_item_id,
+                                &full_text,
+                            )
+                            .await;
+                            self.emit_turn_completed(
+                                &ctx,
+                                &thread_id,
+                                &turn_id,
+                                None,
+                                Some("Hermes approval required".to_string()),
+                            )
+                            .await;
+                            return;
+                        }
                     } else if event.is_terminal_success() {
+                        if full_text.is_empty()
+                            && let Some(output) = event.data.get("output").and_then(Value::as_str)
+                        {
+                            full_text.push_str(output);
+                            self.emit_agent_delta(
+                                &ctx,
+                                &thread_id,
+                                &turn_id,
+                                &agent_item_id,
+                                output,
+                            )
+                            .await;
+                        }
                         terminal = true;
                     }
                 }
@@ -1169,18 +1293,15 @@ impl HermesBridge {
             for event in crate::sse::parse_sse_frames(&body) {
                 if let Some(delta) = event.message_delta() {
                     full_text.push_str(&delta);
-                    self.emit_agent_delta(ctx, thread_id, turn_id, &agent_item_id, &delta)
+                    self.emit_agent_delta(&ctx, &thread_id, &turn_id, &agent_item_id, &delta)
                         .await;
                 }
             }
         }
-        self.emit_agent_completed(ctx, thread_id, turn_id, &agent_item_id, &full_text)
+        self.emit_agent_completed(&ctx, &thread_id, &turn_id, &agent_item_id, &full_text)
             .await;
-        self.emit_turn_completed(ctx, thread_id, turn_id, Some(&full_text), None)
+        self.emit_turn_completed(&ctx, &thread_id, &turn_id, Some(&full_text), None)
             .await;
-        to_value(TurnStartResponse {
-            turn: completed_turn(turn_id),
-        })
     }
 
     async fn dispatch_turn_cli(
@@ -1191,17 +1312,22 @@ impl HermesBridge {
         params: &TurnStartParams,
     ) -> Result<Value, JsonRpcError> {
         let text = user_text(&params.input);
+        let binding = self.index.get_by_thread(thread_id);
         let (bin, session_id) = match &self.config.mode {
             crate::config::HermesMode::Cli { bin }
             | crate::config::HermesMode::Auto { bin, .. } => (
                 bin.clone().unwrap_or_else(|| "hermes".to_string()),
-                self.index
-                    .get_by_thread(thread_id)
-                    .map(|b| b.hermes_session_id),
+                binding.as_ref().map(|b| b.hermes_session_id.clone()),
             ),
             crate::config::HermesMode::Api { .. } => ("hermes".to_string(), None),
         };
-        match crate::cli_adapter::run_hermes_cli(&bin, &text, session_id.as_deref(), None).await {
+        let cwd = params
+            .cwd
+            .clone()
+            .or_else(|| binding.and_then(|b| b.cwd.map(PathBuf::from)));
+        match crate::cli_adapter::run_hermes_cli(&bin, &text, session_id.as_deref(), cwd.as_ref())
+            .await
+        {
             Ok(output) => {
                 self.emit_synthetic_completion(ctx, thread_id, turn_id, &output)
                     .await;

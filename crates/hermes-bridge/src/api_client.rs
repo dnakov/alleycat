@@ -27,7 +27,6 @@ pub struct HealthResponse {
 
 /// Request body for `POST /v1/runs`.
 #[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
 pub struct CreateRunRequest {
     /// The prompt or message to send (stock Hermes API field).
     pub input: String,
@@ -44,11 +43,10 @@ pub struct CreateRunRequest {
 
 /// Response from `POST /v1/runs`.
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct CreateRunResponse {
-    #[serde(alias = "run_id")]
+    #[serde(alias = "runId")]
     pub run_id: String,
-    #[serde(default, alias = "session_id")]
+    #[serde(default, alias = "sessionId")]
     pub session_id: Option<String>,
 }
 
@@ -191,6 +189,25 @@ impl HermesApiClient {
         }
         Ok(())
     }
+
+    /// Resolve a pending tool approval for a running turn.
+    pub async fn approve_run_once(&self, run_id: &str) -> Result<()> {
+        let url = format!("{}/v1/runs/{}/approval", self.base_url, run_id);
+        let mut req = self.client.post(&url);
+        if let Some(ref key) = self.api_key {
+            req = req.bearer_auth(key);
+        }
+        let resp = req
+            .json(&serde_json::json!({ "choice": "once" }))
+            .send()
+            .await
+            .with_context(|| "POST /v1/runs/{id}/approval")?;
+        let status = resp.status();
+        if !status.is_success() {
+            anyhow::bail!("approve run failed: {}", status);
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -212,9 +229,10 @@ mod tests {
         );
         assert!(value.get("prompt").is_none());
         assert_eq!(
-            value.get("sessionId"),
+            value.get("session_id"),
             Some(&Value::String("thread-1".to_string()))
         );
+        assert!(value.get("sessionId").is_none());
     }
 
     #[tokio::test]

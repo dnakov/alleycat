@@ -21,9 +21,14 @@ pub async fn spawn(opts: TargetSpawn) -> Result<TargetHandle> {
     cmd.env("CODEX_HOME", codex_home.path());
 
     // If a backend_bin was provided, set HERMES_BRIDGE_BIN so the bridge
-    // uses CLI mode; otherwise leave it unset and the bridge will try API
-    // mode (defaulting to the bridge's configured Hermes API base).
-    if let Some(ref backend_bin) = opts.backend_bin {
+    // uses CLI mode, unless the caller explicitly requested API mode via
+    // HERMES_BRIDGE_MODE=api for gateway conformance.
+    let explicit_api_mode = std::env::var("HERMES_BRIDGE_MODE")
+        .map(|mode| mode.eq_ignore_ascii_case("api"))
+        .unwrap_or(false);
+    if let Some(ref backend_bin) = opts.backend_bin
+        && !explicit_api_mode
+    {
         cmd.env("HERMES_BRIDGE_BIN", backend_bin);
         cmd.env("HERMES_BRIDGE_MODE", "cli");
     }
