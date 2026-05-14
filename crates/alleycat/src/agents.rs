@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 
 use alleycat_acp_bridge::AcpBridge;
 use alleycat_amp_bridge::AmpBridge;
+use alleycat_bridge_core::codex_resolver::{newest_codex_candidates_first, program_candidates};
 use alleycat_bridge_core::session::{Session, SessionRegistry, SessionRegistryConfig};
 use alleycat_bridge_core::{Bridge, LocalLauncher};
 use alleycat_claude_bridge::ClaudeBridge;
@@ -16,8 +17,11 @@ use alleycat_opencode_bridge::OpencodeBridge;
 use alleycat_pi_bridge::PiBridge;
 use anyhow::{Context, anyhow};
 use arc_swap::ArcSwap;
+use serde::Deserialize;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, BufReader};
 use tokio::net::TcpStream;
+#[cfg(unix)]
+use tokio::net::UnixStream;
 use tokio::process::{Child, Command};
 use tokio::sync::{Mutex, OnceCell};
 use tracing::{info, warn};
@@ -28,9 +32,8 @@ use crate::protocol::{AgentInfo, AgentWire};
 use crate::stream::IrohStream;
 
 /// Stable identifier for a JSON-RPC bridge agent. Codex is intentionally
-/// excluded — the daemon talks to it directly (either over a shared
-/// websocket-listen child or one stdio child per iroh stream, depending on
-/// which mode the local codex binary supports).
+/// excluded — Alleycat talks to it directly through Codex's app-server
+/// transport, using the best mode supported by the local codex binary.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum AgentKind {
     Pi,
@@ -46,9 +49,13 @@ pub enum AgentKind {
 /// the user-installed `codex` binary, then cached for the daemon's lifetime.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CodexMode {
+    /// Upstream lifecycle manager: `<bin> app-server daemon start`, then one
+    /// `<bin> app-server proxy --sock <daemon socket>` child per iroh stream.
+    /// This is Codex's intended remote/SSH app-server management path.
+    UnixDaemon,
     /// `<bin> app-server --listen unix://` plus one `<bin> app-server proxy`
-    /// child per iroh stream. This matches Codex Desktop's remote transport
-    /// and keeps Codex state in the default app-server Unix socket.
+    /// child per iroh stream. Compatibility path for CLIs without the upstream
+    /// daemon command.
     UnixProxy,
     /// `<bin> app-server --listen ws://host:port` — one shared child for
     /// the daemon lifetime, multi-client over websocket. Works on
@@ -67,6 +74,38 @@ struct CodexDetection {
 }
 
 #[derive(Clone)]
+struct CodexUnixEndpoint {
+    bin: PathBuf,
+    /// `None` means Codex's default control socket. `Some` is an explicit socket
+    /// passed to `app-server proxy --sock` and, for legacy child-owned startup,
+    /// to `--listen unix://PATH`.
+    socket_path: Option<PathBuf>,
+}
+
+impl CodexUnixEndpoint {
+    fn default_socket(bin: PathBuf) -> Self {
+        Self {
+            bin,
+            socket_path: None,
+        }
+    }
+
+    fn custom_socket(bin: PathBuf, socket_path: PathBuf) -> Self {
+        Self {
+            bin,
+            socket_path: Some(socket_path),
+        }
+    }
+
+    fn listen_url(&self) -> String {
+        match self.socket_path.as_deref() {
+            Some(socket_path) => format!("unix://{}", socket_path.display()),
+            None => "unix://".to_string(),
+        }
+    }
+}
+
+#[derive(Clone)]
 pub struct AgentManager {
     config: Arc<ArcSwap<HostConfig>>,
     bridges: HashMap<AgentKind, Arc<dyn Bridge>>,
@@ -79,8 +118,8 @@ pub struct AgentManager {
     /// Alleycat is proxying to an externally-started Codex app-server.
     codex_child: Arc<Mutex<Option<Child>>>,
     /// Detected once at startup. Determines whether `serve_codex` runs the
-    /// Unix proxy byte-pump, legacy websocket byte-pump, or per-stream stdio
-    /// bridging.
+    /// upstream daemon proxy, legacy Unix proxy, legacy websocket byte-pump, or
+    /// per-stream stdio bridging.
     codex_mode: CodexMode,
     /// The resolved codex executable selected during startup probing.
     codex_bin: PathBuf,
@@ -247,6 +286,7 @@ impl AgentManager {
         if let Some(opencode) = self.opencode_bridge.get() {
             opencode.shutdown().await;
         }
+        self.stop_codex_child().await;
     }
 
     pub async fn list_agents(&self) -> Vec<AgentInfo> {
@@ -267,6 +307,7 @@ impl AgentManager {
             };
             let wire = if manifest.name == "codex" {
                 match self.codex_mode {
+                    CodexMode::UnixDaemon => AgentWire::Websocket,
                     CodexMode::UnixProxy => AgentWire::Websocket,
                     CodexMode::Websocket => AgentWire::Websocket,
                     CodexMode::Stdio => AgentWire::Jsonl,
@@ -391,14 +432,15 @@ impl AgentManager {
     }
 
     async fn restart_codex(&self) -> anyhow::Result<()> {
-        let mut guard = self.codex_child.lock().await;
-        if let Some(mut child) = guard.take() {
-            child
-                .kill()
+        if self.codex_mode == CodexMode::UnixDaemon {
+            let bin = self.codex_bin.clone();
+            run_codex_app_server_daemon(&bin, "restart")
                 .await
-                .context("stopping codex app-server child")?;
-            let _ = child.wait().await;
-            info!("codex app-server child stopped");
+                .map(|_| ())?;
+            return Ok(());
+        }
+
+        if self.stop_codex_child().await {
             return Ok(());
         }
 
@@ -420,8 +462,20 @@ impl AgentManager {
         Ok(())
     }
 
+    async fn stop_codex_child(&self) -> bool {
+        let mut guard = self.codex_child.lock().await;
+        if let Some(mut child) = guard.take() {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            info!("codex app-server child stopped");
+            return true;
+        }
+        false
+    }
+
     async fn serve_codex(&self, iroh_stream: IrohStream) -> anyhow::Result<()> {
         match self.codex_mode {
+            CodexMode::UnixDaemon => self.serve_codex_unix_proxy(iroh_stream).await,
             CodexMode::UnixProxy => self.serve_codex_unix_proxy(iroh_stream).await,
             CodexMode::Websocket => self.serve_codex_ws(iroh_stream).await,
             CodexMode::Stdio => self.serve_codex_stdio(iroh_stream).await,
@@ -429,16 +483,33 @@ impl AgentManager {
     }
 
     async fn serve_codex_unix_proxy(&self, mut iroh_stream: IrohStream) -> anyhow::Result<()> {
-        let bin = self.ensure_codex_unix_running().await?;
-        let mut child = Command::new(&bin)
-            .arg("app-server")
-            .arg("proxy")
+        let endpoint = if self.codex_mode == CodexMode::UnixDaemon {
+            self.ensure_codex_daemon_running().await?
+        } else {
+            self.ensure_codex_unix_running().await?
+        };
+        let mut command = codex_command(&endpoint.bin);
+        command.arg("app-server").arg("proxy");
+        if let Some(socket_path) = endpoint.socket_path.as_deref() {
+            command.arg("--sock").arg(socket_path);
+        }
+        let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true)
             .spawn()
-            .with_context(|| format!("spawning `{} app-server proxy`", bin.display()))?;
+            .with_context(|| {
+                let socket = endpoint
+                    .socket_path
+                    .as_deref()
+                    .map(|path| format!(" --sock {}", path.display()))
+                    .unwrap_or_default();
+                format!(
+                    "spawning `{} app-server proxy{socket}`",
+                    endpoint.bin.display()
+                )
+            })?;
 
         let stdin = child.stdin.take().expect("piped stdin");
         let stdout = child.stdout.take().expect("piped stdout");
@@ -466,10 +537,9 @@ impl AgentManager {
         Ok(())
     }
 
-    /// Ensures Codex's default Unix-socket app-server is reachable. If an
-    /// external Codex daemon/Desktop already owns the socket, Alleycat leaves it
-    /// alone and only starts per-stream `app-server proxy` children.
-    async fn ensure_codex_unix_running(&self) -> anyhow::Result<PathBuf> {
+    /// Starts the upstream Codex app-server daemon idempotently, then uses the
+    /// socket path reported by the daemon's JSON lifecycle output.
+    async fn ensure_codex_daemon_running(&self) -> anyhow::Result<CodexUnixEndpoint> {
         let bin = {
             let cfg = self.config.load();
             if !cfg.agents.codex.enabled {
@@ -478,28 +548,138 @@ impl AgentManager {
             self.codex_bin.clone()
         };
 
-        if probe_codex_app_server_proxy(&bin).await.is_ok() {
-            return Ok(bin);
-        }
+        let output = run_codex_app_server_daemon(&bin, "start").await?;
+        let endpoint = match output.socket_path {
+            Some(socket_path) => CodexUnixEndpoint::custom_socket(bin, socket_path),
+            None => CodexUnixEndpoint::default_socket(bin),
+        };
+        probe_codex_app_server_proxy(&endpoint.bin, endpoint.socket_path.as_deref())
+            .await
+            .with_context(|| {
+                let socket = endpoint
+                    .socket_path
+                    .as_deref()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_else(|| "default".to_string());
+                format!("codex app-server proxy could not reach daemon socket {socket}")
+            })?;
+        Ok(endpoint)
+    }
+
+    /// Ensures Codex's default Unix-socket app-server is reachable. If an
+    /// external Codex daemon/Desktop already owns the socket, Alleycat leaves it
+    /// alone and only starts per-stream `app-server proxy` children.
+    async fn ensure_codex_unix_running(&self) -> anyhow::Result<CodexUnixEndpoint> {
+        let bin = {
+            let cfg = self.config.load();
+            if !cfg.agents.codex.enabled {
+                return Err(anyhow!("codex agent is disabled"));
+            }
+            self.codex_bin.clone()
+        };
+
+        let endpoint = match probe_codex_app_server_proxy(&bin, None).await {
+            Ok(()) => return Ok(CodexUnixEndpoint::default_socket(bin)),
+            Err(error) => {
+                if let Some(socket_path) = default_codex_control_socket_accepts_connections().await
+                {
+                    warn!(
+                        "codex default control socket accepts connections but proxy websocket handshake failed; using alleycat-owned socket default_socket={} error={error:#}",
+                        socket_path.display()
+                    );
+                    CodexUnixEndpoint::custom_socket(
+                        bin,
+                        alleycat_codex_control_socket_path(&socket_path),
+                    )
+                } else {
+                    CodexUnixEndpoint::default_socket(bin)
+                }
+            }
+        };
 
         let mut guard = self.codex_child.lock().await;
-        if probe_codex_app_server_proxy(&bin).await.is_ok() {
-            return Ok(bin);
+        match probe_codex_app_server_proxy(&endpoint.bin, endpoint.socket_path.as_deref()).await {
+            Ok(()) => return Ok(endpoint),
+            Err(error) => {
+                if endpoint.socket_path.is_none()
+                    && let Some(socket_path) =
+                        default_codex_control_socket_accepts_connections().await
+                {
+                    warn!(
+                        "codex default control socket accepts connections but proxy websocket handshake failed; using alleycat-owned socket default_socket={} error={error:#}",
+                        socket_path.display()
+                    );
+                    drop(guard);
+                    return self
+                        .ensure_codex_unix_running_with_endpoint(CodexUnixEndpoint::custom_socket(
+                            endpoint.bin,
+                            alleycat_codex_control_socket_path(&socket_path),
+                        ))
+                        .await;
+                }
+            }
         }
 
-        let child_alive = matches!(guard.as_mut().map(Child::try_wait), Some(Ok(None)));
-        if !child_alive {
-            let mut child = Command::new(&bin)
+        self.ensure_codex_unix_running_locked(endpoint, &mut *guard)
+            .await
+    }
+
+    async fn ensure_codex_unix_running_with_endpoint(
+        &self,
+        endpoint: CodexUnixEndpoint,
+    ) -> anyhow::Result<CodexUnixEndpoint> {
+        if probe_codex_app_server_proxy(&endpoint.bin, endpoint.socket_path.as_deref())
+            .await
+            .is_ok()
+        {
+            return Ok(endpoint);
+        }
+        let mut guard = self.codex_child.lock().await;
+        self.ensure_codex_unix_running_locked(endpoint, &mut *guard)
+            .await
+    }
+
+    async fn ensure_codex_unix_running_locked(
+        &self,
+        endpoint: CodexUnixEndpoint,
+        guard: &mut Option<Child>,
+    ) -> anyhow::Result<CodexUnixEndpoint> {
+        if let Some(child) = guard.as_mut() {
+            match child.try_wait() {
+                Ok(None) => {
+                    if let Some(mut child) = guard.take() {
+                        let _ = child.kill().await;
+                        let _ = child.wait().await;
+                        info!("restarting codex app-server child after failed proxy probe");
+                    }
+                }
+                Ok(Some(status)) => {
+                    info!("discarding exited codex app-server child status={status}");
+                    *guard = None;
+                }
+                Err(error) => {
+                    warn!("discarding codex app-server child after try_wait failed: {error}");
+                    *guard = None;
+                }
+            }
+        }
+
+        if guard.is_none() {
+            let listen_url = endpoint.listen_url();
+            let mut child = codex_command(&endpoint.bin)
                 .arg("app-server")
                 .arg("--listen")
-                .arg("unix://")
+                .arg(&listen_url)
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::piped())
                 .kill_on_drop(true)
                 .spawn()
                 .with_context(|| {
-                    format!("spawning `{} app-server --listen unix://`", bin.display())
+                    format!(
+                        "spawning `{} app-server --listen {listen_url}`",
+                        endpoint.bin.display()
+                    )
                 })?;
 
             if let Some(stderr) = child.stderr.take() {
@@ -513,12 +693,22 @@ impl AgentManager {
 
             *guard = Some(child);
         }
-        drop(guard);
 
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
-            if probe_codex_app_server_proxy(&bin).await.is_ok() {
-                return Ok(bin);
+            if probe_codex_app_server_proxy(&endpoint.bin, endpoint.socket_path.as_deref())
+                .await
+                .is_ok()
+            {
+                return Ok(endpoint);
+            }
+            if let Some(child) = guard.as_mut()
+                && let Ok(Some(status)) = child.try_wait()
+            {
+                *guard = None;
+                return Err(anyhow!(
+                    "codex app-server exited before app-server proxy became reachable: {status}"
+                ));
             }
             if Instant::now() >= deadline {
                 return Err(anyhow!(
@@ -541,7 +731,7 @@ impl AgentManager {
             self.codex_bin.clone()
         };
 
-        let mut child = Command::new(&bin)
+        let mut child = codex_command(&bin)
             .arg("app-server")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -602,7 +792,7 @@ impl AgentManager {
         let child_alive = matches!(guard.as_mut().map(Child::try_wait), Some(Ok(None)));
         if !child_alive {
             let listen = format!("ws://{host}:{port}");
-            let mut child = Command::new(&bin)
+            let mut child = codex_command(&bin)
                 .arg("app-server")
                 .arg("--listen")
                 .arg(&listen)
@@ -734,12 +924,44 @@ async fn hermes_api_available(api_base: &str) -> bool {
     )
 }
 
-/// Probe the user-installed Codex CLI. Prefer the Unix app-server proxy when
-/// available, because it matches Codex Desktop's remote transport. Fall back to
-/// the older TCP websocket listener or finally stdio for older CLIs. Any
-/// failure (binary missing, exec error, garbled output) makes that candidate
-/// unavailable. If no candidate can be spawned, we keep `Stdio` as the fallback
-/// mode but report codex unavailable.
+fn codex_command(bin: &Path) -> Command {
+    #[cfg(windows)]
+    if codex_needs_windows_cmd_shell(bin) {
+        let shell =
+            std::env::var_os("ComSpec").unwrap_or_else(|| std::ffi::OsString::from("cmd.exe"));
+        let mut command = Command::new(shell);
+        command.arg("/d").arg("/c").arg(bin);
+        return command;
+    }
+
+    Command::new(bin)
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn codex_needs_windows_cmd_shell(bin: &Path) -> bool {
+    let Some(file_name) = bin.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    if !file_name.eq_ignore_ascii_case("codex")
+        && !file_name.to_ascii_lowercase().starts_with("codex.")
+    {
+        return false;
+    }
+    matches!(
+        bin.extension()
+            .and_then(|ext| ext.to_str())
+            .map(|ext| ext.to_ascii_lowercase())
+            .as_deref(),
+        None | Some("cmd" | "bat")
+    )
+}
+
+/// Probe the user-installed Codex CLI. Prefer upstream daemon lifecycle plus
+/// Unix proxy when available, then the legacy manual Unix proxy path, then the
+/// older TCP websocket listener, and finally stdio for older CLIs. Any failure
+/// (binary missing, exec error, garbled output) makes that candidate unavailable.
+/// If no candidate can be spawned, we keep `Stdio` as the fallback mode but
+/// report codex unavailable.
 async fn detect_codex(bin: &str) -> CodexDetection {
     let fallback_bin = PathBuf::from(bin);
     let candidates = {
@@ -750,11 +972,12 @@ async fn detect_codex(bin: &str) -> CodexDetection {
             resolved
         }
     };
+    let candidates = newest_codex_candidates_first(candidates).await;
 
     for candidate in candidates {
         let output = match tokio::time::timeout(
             Duration::from_secs(5),
-            Command::new(&candidate)
+            codex_command(&candidate)
                 .arg("app-server")
                 .arg("--help")
                 .output(),
@@ -793,7 +1016,12 @@ async fn detect_codex(bin: &str) -> CodexDetection {
         help.push_str(&String::from_utf8_lossy(&output.stderr));
         let listen_supported = help.contains("--listen");
         let proxy_supported = codex_app_server_proxy_supported(&candidate).await;
-        let mode = if listen_supported && proxy_supported {
+        let daemon_supported = listen_supported
+            && proxy_supported
+            && codex_app_server_daemon_supported(&candidate).await;
+        let mode = if daemon_supported {
+            CodexMode::UnixDaemon
+        } else if listen_supported && proxy_supported {
             CodexMode::UnixProxy
         } else if listen_supported {
             CodexMode::Websocket
@@ -818,7 +1046,7 @@ async fn codex_app_server_proxy_supported(bin: &Path) -> bool {
     matches!(
         tokio::time::timeout(
             Duration::from_secs(5),
-            Command::new(bin)
+            codex_command(bin)
                 .arg("app-server")
                 .arg("proxy")
                 .arg("--help")
@@ -831,16 +1059,100 @@ async fn codex_app_server_proxy_supported(bin: &Path) -> bool {
     )
 }
 
-async fn probe_codex_app_server_proxy(bin: &Path) -> anyhow::Result<()> {
-    let mut child = Command::new(bin)
-        .arg("app-server")
-        .arg("proxy")
+async fn codex_app_server_daemon_supported(bin: &Path) -> bool {
+    matches!(
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            codex_command(bin)
+                .arg("app-server")
+                .arg("daemon")
+                .arg("--help")
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status(),
+        )
+        .await,
+        Ok(Ok(status)) if status.success()
+    )
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CodexDaemonOutput {
+    socket_path: Option<PathBuf>,
+}
+
+async fn run_codex_app_server_daemon(
+    bin: &Path,
+    subcommand: &str,
+) -> anyhow::Result<CodexDaemonOutput> {
+    let output = tokio::time::timeout(
+        Duration::from_secs(90),
+        codex_command(bin)
+            .arg("app-server")
+            .arg("daemon")
+            .arg(subcommand)
+            .output(),
+    )
+    .await
+    .with_context(|| {
+        format!(
+            "timed out running `{} app-server daemon {subcommand}`",
+            bin.display()
+        )
+    })?
+    .with_context(|| format!("running `{} app-server daemon {subcommand}`", bin.display()))?;
+
+    if !output.status.success() {
+        return Err(anyhow!(
+            "`{} app-server daemon {subcommand}` exited with {}: stdout={} stderr={}",
+            bin.display(),
+            output.status,
+            process_output_excerpt(&output.stdout),
+            process_output_excerpt(&output.stderr),
+        ));
+    }
+
+    serde_json::from_slice::<CodexDaemonOutput>(&output.stdout).with_context(|| {
+        format!(
+            "parsing `{} app-server daemon {subcommand}` JSON output: {}",
+            bin.display(),
+            process_output_excerpt(&output.stdout)
+        )
+    })
+}
+
+fn process_output_excerpt(bytes: &[u8]) -> String {
+    const MAX_OUTPUT_LEN: usize = 2000;
+    let value = String::from_utf8_lossy(bytes).trim().replace('\n', "\\n");
+    if value.len() <= MAX_OUTPUT_LEN {
+        return value;
+    }
+    let excerpt = value.chars().take(MAX_OUTPUT_LEN).collect::<String>();
+    format!("{excerpt}...")
+}
+
+async fn probe_codex_app_server_proxy(
+    bin: &Path,
+    socket_path: Option<&Path>,
+) -> anyhow::Result<()> {
+    let mut command = codex_command(bin);
+    command.arg("app-server").arg("proxy");
+    if let Some(socket_path) = socket_path {
+        command.arg("--sock").arg(socket_path);
+    }
+    let mut child = command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true)
         .spawn()
-        .with_context(|| format!("spawning `{} app-server proxy`", bin.display()))?;
+        .with_context(|| {
+            let socket = socket_path
+                .map(|path| format!(" --sock {}", path.display()))
+                .unwrap_or_default();
+            format!("spawning `{} app-server proxy{socket}`", bin.display())
+        })?;
 
     let stdin = child
         .stdin
@@ -863,49 +1175,59 @@ async fn probe_codex_app_server_proxy(bin: &Path) -> anyhow::Result<()> {
 
     let child_io = tokio::io::join(stdout, stdin);
     let result = tokio::time::timeout(
-        Duration::from_secs(2),
-        tokio_tungstenite::client_async("ws://codex-app-server-proxy.localhost/", child_io),
+        Duration::from_secs(5),
+        tokio_tungstenite::client_async("ws://codex-app-server-proxy.localhost/rpc", child_io),
     )
-    .await
-    .context("timed out opening websocket over codex app-server proxy")?;
+    .await;
 
     let _ = child.kill().await;
     let _ = child.wait().await;
 
-    result
-        .map(|_| ())
-        .context("codex app-server proxy websocket handshake failed")
+    match result {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(error)) => Err(error).context("codex app-server proxy websocket handshake failed"),
+        Err(_) => Err(anyhow!(
+            "timed out opening websocket over codex app-server proxy"
+        )),
+    }
 }
 
-fn program_candidates(program: &Path) -> Vec<PathBuf> {
-    if program.is_absolute() || program.components().count() > 1 {
-        return vec![program.to_path_buf()];
-    }
+#[cfg(unix)]
+async fn default_codex_control_socket_accepts_connections() -> Option<PathBuf> {
+    let path = default_codex_control_socket_path()?;
+    UnixStream::connect(&path).await.ok()?;
+    Some(path)
+}
 
-    #[cfg(windows)]
-    {
-        let candidates = match which::which_all(program) {
-            Ok(candidates) => candidates
-                .filter(|path| {
-                    matches!(
-                        path.extension()
-                            .and_then(|ext| ext.to_str())
-                            .map(|ext| ext.to_ascii_lowercase())
-                            .as_deref(),
-                        Some("exe" | "cmd" | "bat" | "com")
-                    )
-                })
-                .collect::<Vec<_>>(),
-            Err(_) => Vec::new(),
-        };
-        if !candidates.is_empty() {
-            return candidates;
+#[cfg(not(unix))]
+async fn default_codex_control_socket_accepts_connections() -> Option<PathBuf> {
+    None
+}
+
+fn alleycat_codex_control_socket_path(default_socket_path: &Path) -> PathBuf {
+    default_socket_path
+        .parent()
+        .map(|parent| parent.join("alleycat-app-server-control.sock"))
+        .unwrap_or_else(|| default_socket_path.with_file_name("alleycat-app-server-control.sock"))
+}
+
+#[cfg(unix)]
+fn default_codex_control_socket_path() -> Option<PathBuf> {
+    let codex_home = match std::env::var_os("CODEX_HOME") {
+        Some(value) if !value.is_empty() => {
+            let path = PathBuf::from(value);
+            if !path.is_dir() {
+                return None;
+            }
+            path.canonicalize().ok()?
         }
-    }
-
-    which::which(program)
-        .map(|path| vec![path])
-        .unwrap_or_default()
+        _ => directories::BaseDirs::new()?.home_dir().join(".codex"),
+    };
+    Some(
+        codex_home
+            .join("app-server-control")
+            .join("app-server-control.sock"),
+    )
 }
 
 /// Resolve the configured pi binary against PATH. If the configured name
@@ -988,4 +1310,18 @@ fn has_amp_auth(api_key_env: &str) -> bool {
         .map(PathBuf::from)
         .unwrap_or_else(|| home.join(".local/share"));
     data_home.join("amp/secrets.json").is_file() || home.join(".amp/oauth").is_dir()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn codex_windows_cmd_shell_detection_is_limited_to_codex_shims() {
+        assert!(codex_needs_windows_cmd_shell(Path::new("codex")));
+        assert!(codex_needs_windows_cmd_shell(Path::new("codex.cmd")));
+        assert!(codex_needs_windows_cmd_shell(Path::new("CODEX.BAT")));
+        assert!(!codex_needs_windows_cmd_shell(Path::new("codex.exe")));
+        assert!(!codex_needs_windows_cmd_shell(Path::new("pi.cmd")));
+    }
 }
