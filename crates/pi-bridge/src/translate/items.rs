@@ -60,7 +60,8 @@ pub fn translate_messages(messages: &[AgentMessage]) -> Vec<Turn> {
                     current_started_at = Some(asst.timestamp);
                 }
                 current_completed_at = Some(asst.timestamp);
-                push_assistant_items(asst, &mut current_items, &tool_results);
+                let turn_index = turns.len();
+                push_assistant_items(asst, turn_index, &mut current_items, &tool_results);
             }
             AgentMessage::ToolResult(_) => {
                 // Folded into the matching tool-call item via `tool_results`.
@@ -117,6 +118,18 @@ fn index_tool_results<'a>(messages: &'a [AgentMessage]) -> HashMap<&'a str, &'a 
     out
 }
 
+pub(crate) fn user_item_id(turn_index: usize) -> String {
+    format!("user_{turn_index}")
+}
+
+pub(crate) fn assistant_item_id(turn_index: usize, timestamp: i64) -> String {
+    format!("assistant_{turn_index}_{timestamp}")
+}
+
+pub(crate) fn reasoning_item_id(turn_index: usize, timestamp: i64) -> String {
+    format!("reasoning_{turn_index}_{timestamp}")
+}
+
 fn user_message_to_item(message: &UserMessage, turn_index: usize) -> ThreadItem {
     let content = match &message.content {
         UserMessageContent::Text(s) => vec![UserInput::Text {
@@ -137,13 +150,14 @@ fn user_message_to_item(message: &UserMessage, turn_index: usize) -> ThreadItem 
             .collect(),
     };
     ThreadItem::UserMessage {
-        id: format!("user_{turn_index}_{}", message.timestamp),
+        id: user_item_id(turn_index),
         content,
     }
 }
 
 fn push_assistant_items(
     message: &AssistantMessage,
+    turn_index: usize,
     out: &mut Vec<ThreadItem>,
     tool_results: &HashMap<&str, &ToolResultMessage>,
 ) {
@@ -160,7 +174,7 @@ fn push_assistant_items(
 
     if !text.is_empty() {
         out.push(ThreadItem::AgentMessage {
-            id: format!("assistant_{}", message.timestamp),
+            id: assistant_item_id(turn_index, message.timestamp),
             text,
             phase: Some(serde_json::Value::String("final_answer".into())),
             memory_citation: None,
@@ -168,7 +182,7 @@ fn push_assistant_items(
     }
     if !thinking.is_empty() {
         out.push(ThreadItem::Reasoning {
-            id: format!("reasoning_{}", message.timestamp),
+            id: reasoning_item_id(turn_index, message.timestamp),
             summary: Vec::new(),
             content: thinking,
         });
@@ -501,7 +515,8 @@ mod tests {
         assert_eq!(turns.len(), 1);
         assert_eq!(turns[0].items.len(), 1);
         match &turns[0].items[0] {
-            ThreadItem::UserMessage { content, .. } => {
+            ThreadItem::UserMessage { id, content } => {
+                assert_eq!(id, "user_0");
                 assert_eq!(content.len(), 1);
                 match &content[0] {
                     UserInput::Text { text, .. } => assert_eq!(text, "hello"),
@@ -573,6 +588,9 @@ mod tests {
             })
             .collect();
         assert_eq!(kinds, vec!["user", "agent", "reasoning"]);
+        assert_eq!(turns[0].items[0].id(), "user_0");
+        assert_eq!(turns[0].items[1].id(), "assistant_0_2");
+        assert_eq!(turns[0].items[2].id(), "reasoning_0_2");
     }
 
     #[test]

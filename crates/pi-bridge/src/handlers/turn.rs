@@ -55,6 +55,7 @@ use crate::pool::pi_protocol as pi;
 use crate::state::ConnectionState;
 use crate::translate::events::{EventTranslatorState, turn_status_from_agent_end};
 use crate::translate::input::translate_user_input;
+use crate::translate::items::{translate_messages, user_item_id};
 
 /// Per-thread active-turn registry. Pi only allows one active turn per
 /// process, so this is a 1:1 map. Keyed by codex `thread_id`.
@@ -122,6 +123,8 @@ pub async fn handle_turn_start(
     let prompt = translate_user_input(&params.input)
         .map_err(|e| TurnError::InputTranslation(e.to_string()))?;
 
+    let next_turn_index = next_turn_index(&handle).await?;
+
     let turn_id = Uuid::now_v7().to_string();
     let approval_policy = params
         .approval_policy
@@ -167,7 +170,7 @@ pub async fn handle_turn_start(
     // Clients render history from these item events; if we skip the echo,
     // the user's prompt never shows up in `thread/read`.
     let user_message_item = p::ThreadItem::UserMessage {
-        id: Uuid::now_v7().to_string(),
+        id: user_item_id(next_turn_index),
         content: params.input.clone(),
     };
     if state.should_emit("item/started") {
@@ -224,6 +227,7 @@ pub async fn handle_turn_start(
         approval_policy,
         events_rx,
         started_at,
+        turn_index: next_turn_index,
     });
 
     Ok(p::TurnStartResponse { turn })
@@ -390,6 +394,24 @@ fn split_model_selection(model: &str) -> Option<(&str, &str)> {
     (!provider.is_empty() && !model_id.is_empty()).then_some((provider, model_id))
 }
 
+async fn next_turn_index(handle: &Arc<PiProcessHandle>) -> Result<usize, TurnError> {
+    let resp = handle
+        .send_request(pi::RpcCommand::GetMessages(pi::BareCmd::default()))
+        .await
+        .map_err(|e| TurnError::PiRpc(e.to_string()))?;
+    if !resp.success {
+        return Err(TurnError::PiRpc(
+            resp.error.unwrap_or_else(|| "get_messages failed".into()),
+        ));
+    }
+    let data: pi::GetMessagesData = serde_json::from_value(
+        resp.data
+            .ok_or_else(|| TurnError::PiRpc("missing messages data".into()))?,
+    )
+    .map_err(|e| TurnError::PiRpc(format!("decode messages: {e}")))?;
+    Ok(translate_messages(&data.messages).len())
+}
+
 fn notification_frame(notif: p::ServerNotification) -> p::JsonRpcMessage {
     let value = serde_json::to_value(&notif).expect("ServerNotification serializes");
     let method = value
@@ -413,6 +435,7 @@ struct EventPumpArgs {
     approval_policy: p::AskForApproval,
     events_rx: broadcast::Receiver<pi::PiEvent>,
     started_at: i64,
+    turn_index: usize,
 }
 
 fn spawn_event_pump(args: EventPumpArgs) {
@@ -422,7 +445,11 @@ fn spawn_event_pump(args: EventPumpArgs) {
 }
 
 async fn run_event_pump(mut args: EventPumpArgs) {
-    let mut translator = EventTranslatorState::new(args.thread_id.clone(), args.turn_id.clone());
+    let mut translator = EventTranslatorState::with_turn_index(
+        args.thread_id.clone(),
+        args.turn_id.clone(),
+        args.turn_index,
+    );
     let mut error_message: Option<String> = None;
     let mut sent_completed = false;
 

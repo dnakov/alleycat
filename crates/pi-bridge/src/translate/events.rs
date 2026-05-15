@@ -37,6 +37,7 @@ use crate::pool::pi_protocol::{
     AgentMessage, AssistantContentBlock, AssistantMessage, AssistantMessageEvent, PiEvent,
     StopReason as PiStopReason,
 };
+use crate::translate::items::{assistant_item_id, reasoning_item_id};
 use crate::translate::tool_call::{CodexToolKind, classify};
 
 /// Per-(thread, turn) state the translator carries between events.
@@ -48,6 +49,7 @@ use crate::translate::tool_call::{CodexToolKind, classify};
 pub struct EventTranslatorState {
     thread_id: String,
     turn_id: String,
+    turn_index: usize,
     open_message_item: Option<OpenItem>,
     open_reasoning_item: Option<OpenItem>,
     open_tool_calls: HashMap<String, OpenToolCall>,
@@ -74,9 +76,18 @@ struct OpenToolCall {
 
 impl EventTranslatorState {
     pub fn new(thread_id: impl Into<String>, turn_id: impl Into<String>) -> Self {
+        Self::with_turn_index(thread_id, turn_id, 0)
+    }
+
+    pub fn with_turn_index(
+        thread_id: impl Into<String>,
+        turn_id: impl Into<String>,
+        turn_index: usize,
+    ) -> Self {
         Self {
             thread_id: thread_id.into(),
             turn_id: turn_id.into(),
+            turn_index,
             open_message_item: None,
             open_reasoning_item: None,
             open_tool_calls: HashMap::new(),
@@ -182,7 +193,7 @@ impl EventTranslatorState {
     // ---- message lifecycle -------------------------------------------------
 
     fn translate_message_start(&mut self, message: AssistantMessage) -> Vec<ServerNotification> {
-        let item_id = new_item_id();
+        let item_id = assistant_item_id(self.turn_index, message.timestamp);
         self.open_message_item = Some(OpenItem {
             item_id: item_id.clone(),
         });
@@ -200,7 +211,7 @@ impl EventTranslatorState {
     ) -> Vec<ServerNotification> {
         match event {
             AssistantMessageEvent::TextStart { .. } => Vec::new(),
-            AssistantMessageEvent::TextDelta { delta, .. } => {
+            AssistantMessageEvent::TextDelta { delta, partial, .. } => {
                 if let Some(item) = self.open_message_item.as_ref() {
                     vec![ServerNotification::AgentMessageDelta(
                         AgentMessageDeltaNotification {
@@ -212,7 +223,7 @@ impl EventTranslatorState {
                         },
                     )]
                 } else {
-                    let mut out = self.translate_message_start(AssistantMessage::placeholder());
+                    let mut out = self.translate_message_start(partial);
                     if let Some(item) = self.open_message_item.as_ref() {
                         out.push(ServerNotification::AgentMessageDelta(
                             AgentMessageDeltaNotification {
@@ -229,8 +240,8 @@ impl EventTranslatorState {
             }
             AssistantMessageEvent::TextEnd { .. } => Vec::new(),
 
-            AssistantMessageEvent::ThinkingStart { .. } => {
-                let item_id = new_item_id();
+            AssistantMessageEvent::ThinkingStart { partial, .. } => {
+                let item_id = reasoning_item_id(self.turn_index, partial.timestamp);
                 self.open_reasoning_item = Some(OpenItem {
                     item_id: item_id.clone(),
                 });
@@ -956,36 +967,6 @@ fn mcp_result_split(
     (Some(Box::new(payload)), None)
 }
 
-impl AssistantMessage {
-    fn placeholder() -> Self {
-        Self {
-            role: crate::pool::pi_protocol::AssistantRole::Assistant,
-            content: Vec::new(),
-            api: String::new(),
-            provider: String::new(),
-            model: String::new(),
-            response_id: None,
-            usage: crate::pool::pi_protocol::Usage {
-                input: 0,
-                output: 0,
-                cache_read: 0,
-                cache_write: 0,
-                total_tokens: 0,
-                cost: crate::pool::pi_protocol::UsageCost {
-                    input: 0.0,
-                    output: 0.0,
-                    cache_read: 0.0,
-                    cache_write: 0.0,
-                    total: 0.0,
-                },
-            },
-            stop_reason: PiStopReason::Stop,
-            error_message: None,
-            timestamp: 0,
-        }
-    }
-}
-
 /// Helper for `handlers/turn.rs`: derive a `TurnStatus`/`TurnError` pair from
 /// the optional error string carried out of the final pi event of a turn.
 pub fn turn_status_from_agent_end(error_message: Option<&str>) -> (TurnStatus, Option<TurnError>) {
@@ -1012,11 +993,18 @@ mod tests {
     };
 
     fn state() -> EventTranslatorState {
-        EventTranslatorState::new("th_1", "tu_1")
+        EventTranslatorState::with_turn_index("th_1", "tu_1", 7)
     }
 
     fn agent_msg(text: &str) -> AgentMessage {
         AgentMessage::Assistant(assistant_message(text))
+    }
+
+    fn item_id_from_started(notification: &ServerNotification) -> &str {
+        match notification {
+            ServerNotification::ItemStarted(n) => n.item.id(),
+            other => panic!("expected ItemStarted, got {other:?}"),
+        }
     }
 
     fn assistant_message(text: &str) -> AssistantMessage {
@@ -1067,7 +1055,7 @@ mod tests {
         match &out[0] {
             ServerNotification::ItemStarted(n) => match &n.item {
                 ThreadItem::AgentMessage { id, text, .. } => {
-                    assert!(!id.is_empty());
+                    assert_eq!(id, "assistant_7_0");
                     assert_eq!(text, "");
                 }
                 other => panic!("expected AgentMessage, got {other:?}"),
@@ -1106,6 +1094,58 @@ mod tests {
     }
 
     #[test]
+    fn live_stream_item_ids_match_replay_ids_for_same_turn_index() {
+        let mut live = EventTranslatorState::with_turn_index("th_1", "live_turn", 3);
+        let mut message = assistant_message("answer");
+        message.content.insert(
+            0,
+            AssistantContentBlock::Thinking(crate::pool::pi_protocol::ThinkingContent {
+                thinking: "ponder".into(),
+                thinking_signature: None,
+                redacted: None,
+            }),
+        );
+        message.timestamp = 42;
+
+        let started = live.translate(PiEvent::MessageStart {
+            message: AgentMessage::Assistant(message.clone()),
+        });
+        let thinking = live.translate(PiEvent::MessageUpdate {
+            message: AgentMessage::Assistant(message.clone()),
+            assistant_message_event: AssistantMessageEvent::ThinkingStart {
+                content_index: 0,
+                partial: message.clone(),
+            },
+        });
+
+        let replay = crate::translate::items::translate_messages(&[
+            AgentMessage::User(crate::pool::pi_protocol::UserMessage {
+                role: crate::pool::pi_protocol::UserRole::User,
+                content: crate::pool::pi_protocol::UserMessageContent::Text("q".into()),
+                timestamp: 1,
+            }),
+            AgentMessage::User(crate::pool::pi_protocol::UserMessage {
+                role: crate::pool::pi_protocol::UserRole::User,
+                content: crate::pool::pi_protocol::UserMessageContent::Text("q".into()),
+                timestamp: 2,
+            }),
+            AgentMessage::User(crate::pool::pi_protocol::UserMessage {
+                role: crate::pool::pi_protocol::UserRole::User,
+                content: crate::pool::pi_protocol::UserMessageContent::Text("q".into()),
+                timestamp: 3,
+            }),
+            AgentMessage::User(crate::pool::pi_protocol::UserMessage {
+                role: crate::pool::pi_protocol::UserRole::User,
+                content: crate::pool::pi_protocol::UserMessageContent::Text("q".into()),
+                timestamp: 4,
+            }),
+            AgentMessage::Assistant(message),
+        ]);
+        assert_eq!(item_id_from_started(&started[0]), replay[3].items[1].id());
+        assert_eq!(item_id_from_started(&thinking[0]), replay[3].items[2].id());
+    }
+
+    #[test]
     fn thinking_lifecycle_emits_reasoning_item() {
         let mut s = state();
         let started = s.translate(PiEvent::MessageUpdate {
@@ -1116,7 +1156,13 @@ mod tests {
             },
         });
         assert_eq!(started.len(), 1);
-        assert!(matches!(started[0], ServerNotification::ItemStarted(_)));
+        match &started[0] {
+            ServerNotification::ItemStarted(n) => match &n.item {
+                ThreadItem::Reasoning { id, .. } => assert_eq!(id, "reasoning_7_0"),
+                other => panic!("expected Reasoning, got {other:?}"),
+            },
+            other => panic!("unexpected {other:?}"),
+        }
 
         let delta = s.translate(PiEvent::MessageUpdate {
             message: agent_msg(""),
