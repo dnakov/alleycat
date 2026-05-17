@@ -290,6 +290,7 @@ impl ClaudeProcessHandle {
             args,
             cwd: Some(cwd.clone()),
             env: Vec::new(),
+            env_clear: false,
             stdin: StdioMode::Piped,
             stdout: StdioMode::Piped,
             stderr: StdioMode::Piped,

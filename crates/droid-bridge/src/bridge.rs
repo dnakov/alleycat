@@ -866,6 +866,7 @@ impl DroidBridge {
             args: params.command[1..].iter().map(Into::into).collect(),
             cwd: params.cwd,
             env,
+            env_clear: false,
             stdin: StdioMode::Null,
             stdout: StdioMode::Piped,
             stderr: StdioMode::Piped,

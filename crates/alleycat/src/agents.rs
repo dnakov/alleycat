@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
@@ -8,11 +9,14 @@ use alleycat_acp_bridge::AcpBridge;
 use alleycat_amp_bridge::AmpBridge;
 use alleycat_bridge_core::codex_resolver::{newest_codex_candidates_first, program_candidates};
 use alleycat_bridge_core::session::{Session, SessionRegistry, SessionRegistryConfig};
-use alleycat_bridge_core::{Bridge, LocalLauncher};
+use alleycat_bridge_core::{
+    Bridge, LaunchEnvironment, LaunchEnvironmentResolver, LocalLauncher, ProcessLauncher,
+    UserEnvironmentLauncher,
+};
 use alleycat_claude_bridge::ClaudeBridge;
 use alleycat_devin_bridge::DevinBridge;
-use alleycat_grok_bridge::GrokBridge;
 use alleycat_droid_bridge::DroidBridge;
+use alleycat_grok_bridge::GrokBridge;
 use alleycat_hermes_bridge::{HermesBridge, HermesBridgeConfig};
 use alleycat_opencode_bridge::OpencodeBridge;
 use alleycat_pi_bridge::PiBridge;
@@ -127,6 +131,7 @@ pub struct AgentManager {
     codex_bin: PathBuf,
     /// Whether the selected codex executable could be spawned.
     codex_available: bool,
+    launch_env: LaunchEnvironmentResolver,
     session_registry: Arc<SessionRegistry>,
     /// Held to keep the registry's reaper alive for the daemon lifetime.
     _reaper_handle: Arc<tokio::task::JoinHandle<()>>,
@@ -136,33 +141,37 @@ impl AgentManager {
     pub async fn new(config: Arc<ArcSwap<HostConfig>>) -> anyhow::Result<Self> {
         let snapshot = config.load();
 
-        // Honor `CODEX_HOME` so the user can point the bridge thread indices
-        // at the same on-disk session store their `pi-coding-agent` / `codex`
-        // CLI already uses (typically `~/.codex`). Each bridge falls back to
-        // its own OS-conventional default when unset.
-        let codex_home = match std::env::var_os("CODEX_HOME") {
-            Some(value) if !value.is_empty() => Some(PathBuf::from(value)),
-            _ => None,
-        };
+        let launch_env = LaunchEnvironmentResolver::default();
+        let daemon_cwd = std::env::current_dir().ok();
+        let daemon_env = launch_env.resolve(daemon_cwd.as_deref()).await;
+
+        // Honor `CODEX_HOME` from the same resolved launch environment used
+        // for child processes, so bridge indexes/config and spawned agents all
+        // agree even when launchd/systemd did not inherit the user's shell env.
+        let codex_home = env_path(&daemon_env, "CODEX_HOME");
         if let Some(ref home) = codex_home {
             tokio::fs::create_dir_all(home)
                 .await
                 .with_context(|| format!("creating {}", home.display()))?;
         }
 
-        let pi_bin = resolve_pi_bin(&snapshot.agents.pi.bin)
-            .unwrap_or_else(|| PathBuf::from(snapshot.agents.pi.bin.clone()));
+        let base_launcher: Arc<dyn ProcessLauncher> = Arc::new(LocalLauncher);
+        let user_launcher =
+            UserEnvironmentLauncher::with_resolver(base_launcher, launch_env.clone())
+                .with_program_aliases(pi_program_aliases());
+        let launcher: Arc<dyn ProcessLauncher> = Arc::new(user_launcher);
+
         let mut pi_builder = PiBridge::builder()
-            .agent_bin(pi_bin)
-            .launcher(Arc::new(LocalLauncher));
+            .agent_bin(PathBuf::from(&snapshot.agents.pi.bin))
+            .launcher(Arc::clone(&launcher));
         if let Some(ref home) = codex_home {
             pi_builder = pi_builder.codex_home(home.clone());
         }
         let pi_bridge = pi_builder.build().await.context("building pi bridge")?;
 
         let mut amp_builder = AmpBridge::builder()
-            .agent_bin(snapshot.agents.amp.bin.clone())
-            .launcher(Arc::new(LocalLauncher))
+            .agent_bin(PathBuf::from(&snapshot.agents.amp.bin))
+            .launcher(Arc::clone(&launcher))
             .dangerously_allow_all(snapshot.agents.amp.dangerously_allow_all);
         if let Some(ref home) = codex_home {
             amp_builder = amp_builder.codex_home(home.clone());
@@ -170,8 +179,8 @@ impl AgentManager {
         let amp_bridge = amp_builder.build().await.context("building amp bridge")?;
 
         let mut claude_builder = ClaudeBridge::builder()
-            .agent_bin(snapshot.agents.claude.bin.clone())
-            .launcher(Arc::new(LocalLauncher))
+            .agent_bin(PathBuf::from(&snapshot.agents.claude.bin))
+            .launcher(Arc::clone(&launcher))
             .bypass_permissions(snapshot.agents.claude.bypass_permissions);
         if let Some(ref home) = codex_home {
             claude_builder = claude_builder.codex_home(home.clone());
@@ -182,8 +191,8 @@ impl AgentManager {
             .context("building claude bridge")?;
 
         let mut droid_builder = DroidBridge::builder()
-            .agent_bin(snapshot.agents.droid.bin.clone())
-            .launcher(Arc::new(LocalLauncher));
+            .agent_bin(PathBuf::from(&snapshot.agents.droid.bin))
+            .launcher(Arc::clone(&launcher));
         if let Some(ref home) = codex_home {
             droid_builder = droid_builder.codex_home(home.clone());
         }
@@ -193,8 +202,8 @@ impl AgentManager {
             .context("building droid bridge")?;
 
         let devin_builder = AcpBridge::builder()
-            .agent_bin(snapshot.agents.devin.bin.clone())
-            .launcher(Arc::new(LocalLauncher));
+            .agent_bin(PathBuf::from(&snapshot.agents.devin.bin))
+            .launcher(Arc::clone(&launcher));
         let devin_acp = devin_builder
             .build()
             .await
@@ -210,12 +219,12 @@ impl AgentManager {
         // All Grok launch knowledge lives in `grok-bridge`.
         // The daemon and acp-bridge stay unaware of "agent", "stdio", etc.
         let grok_bridge = GrokBridge::build(
-            snapshot.agents.grok.bin.clone(),
+            PathBuf::from(&snapshot.agents.grok.bin),
             snapshot.agents.grok.no_leader,
             snapshot.agents.grok.model.clone(),
             snapshot.agents.grok.always_approve,
             snapshot.agents.grok.reasoning_effort.clone(),
-            Arc::new(LocalLauncher),
+            Arc::clone(&launcher),
         )
         .await
         .context("building grok bridge")?;
@@ -254,7 +263,7 @@ impl AgentManager {
         let reaper_handle = Arc::new(session_registry.spawn_reaper());
 
         let codex_detection = if snapshot.agents.codex.enabled {
-            detect_codex(&snapshot.agents.codex.bin).await
+            detect_codex(&snapshot.agents.codex.bin, &daemon_env).await
         } else {
             // Doesn't matter; codex is disabled. Pick a default so the
             // field has a value.
@@ -280,6 +289,7 @@ impl AgentManager {
             codex_mode: codex_detection.mode,
             codex_bin: codex_detection.bin,
             codex_available: codex_detection.available,
+            launch_env,
             session_registry,
             _reaper_handle: reaper_handle,
         })
@@ -308,20 +318,22 @@ impl AgentManager {
     }
 
     pub async fn list_agents(&self) -> Vec<AgentInfo> {
-        // Availability is computed per-agent (some are async, some not),
-        // then each manifest is rendered to the wire `AgentInfo` shape.
+        // Availability is computed against the same terminal-like launch
+        // environment used for child processes, then each manifest is rendered
+        // to the wire `AgentInfo` shape.
+        let launch_env = self.daemon_launch_env().await;
         let mut out = Vec::with_capacity(MANIFESTS.len());
         for manifest in MANIFESTS {
             let available = match manifest.name {
                 "codex" => self.codex_available(),
-                "pi" => self.pi_available(),
-                "amp" => self.amp_available(),
-                "opencode" => self.opencode_available(),
-                "claude" => self.claude_available(),
-                "droid" => self.droid_available(),
-                "hermes" => self.hermes_available().await,
-                "devin" => self.devin_available(),
-                "grok" => self.grok_available(),
+                "pi" => self.pi_available(&launch_env),
+                "amp" => self.amp_available(&launch_env),
+                "opencode" => self.opencode_available(&launch_env),
+                "claude" => self.claude_available(&launch_env),
+                "droid" => self.droid_available(&launch_env),
+                "hermes" => self.hermes_available(&launch_env).await,
+                "devin" => self.devin_available(&launch_env),
+                "grok" => self.grok_available(&launch_env),
                 _ => false,
             };
             let wire = if manifest.name == "codex" {
@@ -455,7 +467,8 @@ impl AgentManager {
     async fn restart_codex(&self) -> anyhow::Result<()> {
         if self.codex_mode == CodexMode::UnixDaemon {
             let bin = self.codex_bin.clone();
-            run_codex_app_server_daemon(&bin, "restart")
+            let env = self.daemon_launch_env().await;
+            run_codex_app_server_daemon(&bin, "restart", &env)
                 .await
                 .map(|_| ())?;
             return Ok(());
@@ -509,7 +522,9 @@ impl AgentManager {
         } else {
             self.ensure_codex_unix_running().await?
         };
+        let env = self.daemon_launch_env().await;
         let mut command = codex_command(&endpoint.bin);
+        apply_launch_env_to_command(&mut command, &env);
         command.arg("app-server").arg("proxy");
         if let Some(socket_path) = endpoint.socket_path.as_deref() {
             command.arg("--sock").arg(socket_path);
@@ -569,12 +584,13 @@ impl AgentManager {
             self.codex_bin.clone()
         };
 
-        let output = run_codex_app_server_daemon(&bin, "start").await?;
+        let env = self.daemon_launch_env().await;
+        let output = run_codex_app_server_daemon(&bin, "start", &env).await?;
         let endpoint = match output.socket_path {
             Some(socket_path) => CodexUnixEndpoint::custom_socket(bin, socket_path),
             None => CodexUnixEndpoint::default_socket(bin),
         };
-        probe_codex_app_server_proxy(&endpoint.bin, endpoint.socket_path.as_deref())
+        probe_codex_app_server_proxy(&endpoint.bin, endpoint.socket_path.as_deref(), &env)
             .await
             .with_context(|| {
                 let socket = endpoint
@@ -599,10 +615,12 @@ impl AgentManager {
             self.codex_bin.clone()
         };
 
-        let endpoint = match probe_codex_app_server_proxy(&bin, None).await {
+        let env = self.daemon_launch_env().await;
+        let endpoint = match probe_codex_app_server_proxy(&bin, None, &env).await {
             Ok(()) => return Ok(CodexUnixEndpoint::default_socket(bin)),
             Err(error) => {
-                if let Some(socket_path) = default_codex_control_socket_accepts_connections().await
+                if let Some(socket_path) =
+                    default_codex_control_socket_accepts_connections(&env).await
                 {
                     warn!(
                         "codex default control socket accepts connections but proxy websocket handshake failed; using alleycat-owned socket default_socket={} error={error:#}",
@@ -619,12 +637,14 @@ impl AgentManager {
         };
 
         let mut guard = self.codex_child.lock().await;
-        match probe_codex_app_server_proxy(&endpoint.bin, endpoint.socket_path.as_deref()).await {
+        match probe_codex_app_server_proxy(&endpoint.bin, endpoint.socket_path.as_deref(), &env)
+            .await
+        {
             Ok(()) => return Ok(endpoint),
             Err(error) => {
                 if endpoint.socket_path.is_none()
                     && let Some(socket_path) =
-                        default_codex_control_socket_accepts_connections().await
+                        default_codex_control_socket_accepts_connections(&env).await
                 {
                     warn!(
                         "codex default control socket accepts connections but proxy websocket handshake failed; using alleycat-owned socket default_socket={} error={error:#}",
@@ -632,37 +652,42 @@ impl AgentManager {
                     );
                     drop(guard);
                     return self
-                        .ensure_codex_unix_running_with_endpoint(CodexUnixEndpoint::custom_socket(
-                            endpoint.bin,
-                            alleycat_codex_control_socket_path(&socket_path),
-                        ))
+                        .ensure_codex_unix_running_with_endpoint(
+                            CodexUnixEndpoint::custom_socket(
+                                endpoint.bin,
+                                alleycat_codex_control_socket_path(&socket_path),
+                            ),
+                            &env,
+                        )
                         .await;
                 }
             }
         }
 
-        self.ensure_codex_unix_running_locked(endpoint, &mut *guard)
+        self.ensure_codex_unix_running_locked(endpoint, &env, &mut *guard)
             .await
     }
 
     async fn ensure_codex_unix_running_with_endpoint(
         &self,
         endpoint: CodexUnixEndpoint,
+        env: &LaunchEnvironment,
     ) -> anyhow::Result<CodexUnixEndpoint> {
-        if probe_codex_app_server_proxy(&endpoint.bin, endpoint.socket_path.as_deref())
+        if probe_codex_app_server_proxy(&endpoint.bin, endpoint.socket_path.as_deref(), env)
             .await
             .is_ok()
         {
             return Ok(endpoint);
         }
         let mut guard = self.codex_child.lock().await;
-        self.ensure_codex_unix_running_locked(endpoint, &mut *guard)
+        self.ensure_codex_unix_running_locked(endpoint, env, &mut *guard)
             .await
     }
 
     async fn ensure_codex_unix_running_locked(
         &self,
         endpoint: CodexUnixEndpoint,
+        env: &LaunchEnvironment,
         guard: &mut Option<Child>,
     ) -> anyhow::Result<CodexUnixEndpoint> {
         if let Some(child) = guard.as_mut() {
@@ -687,7 +712,9 @@ impl AgentManager {
 
         if guard.is_none() {
             let listen_url = endpoint.listen_url();
-            let mut child = codex_command(&endpoint.bin)
+            let mut command = codex_command(&endpoint.bin);
+            apply_launch_env_to_command(&mut command, env);
+            let mut child = command
                 .arg("app-server")
                 .arg("--listen")
                 .arg(&listen_url)
@@ -717,7 +744,7 @@ impl AgentManager {
 
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
-            if probe_codex_app_server_proxy(&endpoint.bin, endpoint.socket_path.as_deref())
+            if probe_codex_app_server_proxy(&endpoint.bin, endpoint.socket_path.as_deref(), env)
                 .await
                 .is_ok()
             {
@@ -752,7 +779,10 @@ impl AgentManager {
             self.codex_bin.clone()
         };
 
-        let mut child = codex_command(&bin)
+        let env = self.daemon_launch_env().await;
+        let mut command = codex_command(&bin);
+        apply_launch_env_to_command(&mut command, &env);
+        let mut child = command
             .arg("app-server")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -810,10 +840,13 @@ impl AgentManager {
             return Ok((host, port));
         }
 
+        let env = self.daemon_launch_env().await;
         let child_alive = matches!(guard.as_mut().map(Child::try_wait), Some(Ok(None)));
         if !child_alive {
             let listen = format!("ws://{host}:{port}");
-            let mut child = codex_command(&bin)
+            let mut command = codex_command(&bin);
+            apply_launch_env_to_command(&mut command, &env);
+            let mut child = command
                 .arg("app-server")
                 .arg("--listen")
                 .arg(&listen)
@@ -888,48 +921,53 @@ impl AgentManager {
         cfg.agents.codex.enabled && self.codex_available
     }
 
-    fn pi_available(&self) -> bool {
-        let cfg = self.config.load();
-        cfg.agents.pi.enabled && resolve_pi_bin(&cfg.agents.pi.bin).is_some()
+    async fn daemon_launch_env(&self) -> LaunchEnvironment {
+        let cwd = std::env::current_dir().ok();
+        self.launch_env.resolve(cwd.as_deref()).await
     }
 
-    fn opencode_available(&self) -> bool {
+    fn pi_available(&self, env: &LaunchEnvironment) -> bool {
+        let cfg = self.config.load();
+        cfg.agents.pi.enabled && resolve_pi_bin_with_env(&cfg.agents.pi.bin, env).is_some()
+    }
+
+    fn opencode_available(&self, env: &LaunchEnvironment) -> bool {
         let cfg = self.config.load();
         cfg.agents.opencode.enabled
-            && (std::env::var_os("OPENCODE_BRIDGE_BACKEND_URL").is_some()
-                || which::which(&cfg.agents.opencode.bin).is_ok())
+            && (env.contains_key("OPENCODE_BRIDGE_BACKEND_URL")
+                || command_available_in_env(&cfg.agents.opencode.bin, env))
     }
 
-    fn amp_available(&self) -> bool {
+    fn amp_available(&self, env: &LaunchEnvironment) -> bool {
         let cfg = self.config.load();
         cfg.agents.amp.enabled
-            && which::which(&cfg.agents.amp.bin).is_ok()
-            && has_amp_auth(&cfg.agents.amp.api_key_env)
+            && command_available_in_env(&cfg.agents.amp.bin, env)
+            && has_amp_auth(&cfg.agents.amp.api_key_env, env)
     }
 
-    fn claude_available(&self) -> bool {
+    fn claude_available(&self, env: &LaunchEnvironment) -> bool {
         let cfg = self.config.load();
-        cfg.agents.claude.enabled && which::which(&cfg.agents.claude.bin).is_ok()
+        cfg.agents.claude.enabled && command_available_in_env(&cfg.agents.claude.bin, env)
     }
 
-    fn droid_available(&self) -> bool {
+    fn droid_available(&self, env: &LaunchEnvironment) -> bool {
         let cfg = self.config.load();
         cfg.agents.droid.enabled
-            && which::which(&cfg.agents.droid.bin).is_ok()
-            && has_factory_auth(&cfg.agents.droid.api_key_env)
+            && command_available_in_env(&cfg.agents.droid.bin, env)
+            && has_factory_auth(&cfg.agents.droid.api_key_env, env)
     }
 
-    fn devin_available(&self) -> bool {
+    fn devin_available(&self, env: &LaunchEnvironment) -> bool {
         let cfg = self.config.load();
-        cfg.agents.devin.enabled && which::which(&cfg.agents.devin.bin).is_ok()
+        cfg.agents.devin.enabled && command_available_in_env(&cfg.agents.devin.bin, env)
     }
 
-    fn grok_available(&self) -> bool {
+    fn grok_available(&self, env: &LaunchEnvironment) -> bool {
         let cfg = self.config.load();
-        cfg.agents.grok.enabled && which::which(&cfg.agents.grok.bin).is_ok()
+        cfg.agents.grok.enabled && command_available_in_env(&cfg.agents.grok.bin, env)
     }
 
-    async fn hermes_available(&self) -> bool {
+    async fn hermes_available(&self, env: &LaunchEnvironment) -> bool {
         let (enabled, bin, api_base) = {
             let cfg = self.config.load();
             (
@@ -938,7 +976,7 @@ impl AgentManager {
                 cfg.agents.hermes.api_base.clone(),
             )
         };
-        enabled && (which::which(&bin).is_ok() || hermes_api_available(&api_base).await)
+        enabled && (command_available_in_env(&bin, env) || hermes_api_available(&api_base).await)
     }
 }
 
@@ -961,6 +999,10 @@ fn codex_command(bin: &Path) -> Command {
     }
 
     Command::new(bin)
+}
+
+fn apply_launch_env_to_command(command: &mut Command, env: &LaunchEnvironment) {
+    command.env_clear().envs(env.clone().into_pairs());
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -988,28 +1030,29 @@ fn codex_needs_windows_cmd_shell(bin: &Path) -> bool {
 /// (binary missing, exec error, garbled output) makes that candidate unavailable.
 /// If no candidate can be spawned, we keep `Stdio` as the fallback mode but
 /// report codex unavailable.
-async fn detect_codex(bin: &str) -> CodexDetection {
+async fn detect_codex(bin: &str, env: &LaunchEnvironment) -> CodexDetection {
     let fallback_bin = PathBuf::from(bin);
     let candidates = {
-        let resolved = program_candidates(Path::new(bin));
+        let mut resolved = Vec::new();
+        if let Some(path) = resolve_bin_with_env(bin, env) {
+            resolved.push(path);
+        }
+        resolved.extend(program_candidates(Path::new(bin)));
         if resolved.is_empty() {
             vec![fallback_bin.clone()]
         } else {
+            resolved.sort();
+            resolved.dedup();
             resolved
         }
     };
     let candidates = newest_codex_candidates_first(candidates).await;
 
     for candidate in candidates {
-        let output = match tokio::time::timeout(
-            Duration::from_secs(5),
-            codex_command(&candidate)
-                .arg("app-server")
-                .arg("--help")
-                .output(),
-        )
-        .await
-        {
+        let mut command = codex_command(&candidate);
+        apply_launch_env_to_command(&mut command, env);
+        command.arg("app-server").arg("--help");
+        let output = match tokio::time::timeout(Duration::from_secs(5), command.output()).await {
             Ok(Ok(out)) => out,
             Ok(Err(err)) => {
                 warn!(
@@ -1041,10 +1084,10 @@ async fn detect_codex(bin: &str) -> CodexDetection {
         let mut help = String::from_utf8_lossy(&output.stdout).into_owned();
         help.push_str(&String::from_utf8_lossy(&output.stderr));
         let listen_supported = help.contains("--listen");
-        let proxy_supported = codex_app_server_proxy_supported(&candidate).await;
+        let proxy_supported = codex_app_server_proxy_supported(&candidate, env).await;
         let daemon_supported = listen_supported
             && proxy_supported
-            && codex_app_server_daemon_supported(&candidate).await;
+            && codex_app_server_daemon_supported(&candidate, env).await;
         let mode = if daemon_supported {
             CodexMode::UnixDaemon
         } else if listen_supported && proxy_supported {
@@ -1068,36 +1111,32 @@ async fn detect_codex(bin: &str) -> CodexDetection {
     }
 }
 
-async fn codex_app_server_proxy_supported(bin: &Path) -> bool {
+async fn codex_app_server_proxy_supported(bin: &Path, env: &LaunchEnvironment) -> bool {
+    let mut command = codex_command(bin);
+    apply_launch_env_to_command(&mut command, env);
+    command
+        .arg("app-server")
+        .arg("proxy")
+        .arg("--help")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
     matches!(
-        tokio::time::timeout(
-            Duration::from_secs(5),
-            codex_command(bin)
-                .arg("app-server")
-                .arg("proxy")
-                .arg("--help")
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status(),
-        )
-        .await,
+        tokio::time::timeout(Duration::from_secs(5), command.status()).await,
         Ok(Ok(status)) if status.success()
     )
 }
 
-async fn codex_app_server_daemon_supported(bin: &Path) -> bool {
+async fn codex_app_server_daemon_supported(bin: &Path, env: &LaunchEnvironment) -> bool {
+    let mut command = codex_command(bin);
+    apply_launch_env_to_command(&mut command, env);
+    command
+        .arg("app-server")
+        .arg("daemon")
+        .arg("--help")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
     matches!(
-        tokio::time::timeout(
-            Duration::from_secs(5),
-            codex_command(bin)
-                .arg("app-server")
-                .arg("daemon")
-                .arg("--help")
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status(),
-        )
-        .await,
+        tokio::time::timeout(Duration::from_secs(5), command.status()).await,
         Ok(Ok(status)) if status.success()
     )
 }
@@ -1111,23 +1150,20 @@ struct CodexDaemonOutput {
 async fn run_codex_app_server_daemon(
     bin: &Path,
     subcommand: &str,
+    env: &LaunchEnvironment,
 ) -> anyhow::Result<CodexDaemonOutput> {
-    let output = tokio::time::timeout(
-        Duration::from_secs(90),
-        codex_command(bin)
-            .arg("app-server")
-            .arg("daemon")
-            .arg(subcommand)
-            .output(),
-    )
-    .await
-    .with_context(|| {
-        format!(
-            "timed out running `{} app-server daemon {subcommand}`",
-            bin.display()
-        )
-    })?
-    .with_context(|| format!("running `{} app-server daemon {subcommand}`", bin.display()))?;
+    let mut command = codex_command(bin);
+    apply_launch_env_to_command(&mut command, env);
+    command.arg("app-server").arg("daemon").arg(subcommand);
+    let output = tokio::time::timeout(Duration::from_secs(90), command.output())
+        .await
+        .with_context(|| {
+            format!(
+                "timed out running `{} app-server daemon {subcommand}`",
+                bin.display()
+            )
+        })?
+        .with_context(|| format!("running `{} app-server daemon {subcommand}`", bin.display()))?;
 
     if !output.status.success() {
         return Err(anyhow!(
@@ -1161,8 +1197,10 @@ fn process_output_excerpt(bytes: &[u8]) -> String {
 async fn probe_codex_app_server_proxy(
     bin: &Path,
     socket_path: Option<&Path>,
+    env: &LaunchEnvironment,
 ) -> anyhow::Result<()> {
     let mut command = codex_command(bin);
+    apply_launch_env_to_command(&mut command, env);
     command.arg("app-server").arg("proxy");
     if let Some(socket_path) = socket_path {
         command.arg("--sock").arg(socket_path);
@@ -1219,14 +1257,18 @@ async fn probe_codex_app_server_proxy(
 }
 
 #[cfg(unix)]
-async fn default_codex_control_socket_accepts_connections() -> Option<PathBuf> {
-    let path = default_codex_control_socket_path()?;
+async fn default_codex_control_socket_accepts_connections(
+    env: &LaunchEnvironment,
+) -> Option<PathBuf> {
+    let path = default_codex_control_socket_path(env)?;
     UnixStream::connect(&path).await.ok()?;
     Some(path)
 }
 
 #[cfg(not(unix))]
-async fn default_codex_control_socket_accepts_connections() -> Option<PathBuf> {
+async fn default_codex_control_socket_accepts_connections(
+    _env: &LaunchEnvironment,
+) -> Option<PathBuf> {
     None
 }
 
@@ -1238,16 +1280,15 @@ fn alleycat_codex_control_socket_path(default_socket_path: &Path) -> PathBuf {
 }
 
 #[cfg(unix)]
-fn default_codex_control_socket_path() -> Option<PathBuf> {
-    let codex_home = match std::env::var_os("CODEX_HOME") {
-        Some(value) if !value.is_empty() => {
-            let path = PathBuf::from(value);
+fn default_codex_control_socket_path(env: &LaunchEnvironment) -> Option<PathBuf> {
+    let codex_home = match env_path(env, "CODEX_HOME") {
+        Some(path) => {
             if !path.is_dir() {
                 return None;
             }
             path.canonicalize().ok()?
         }
-        _ => directories::BaseDirs::new()?.home_dir().join(".codex"),
+        None => directories::BaseDirs::new()?.home_dir().join(".codex"),
     };
     Some(
         codex_home
@@ -1256,21 +1297,68 @@ fn default_codex_control_socket_path() -> Option<PathBuf> {
     )
 }
 
-/// Resolve the configured pi binary against PATH. If the configured name
-/// isn't on PATH, fall back to known aliases (`pi`, `pi-coding-agent`) so
-/// users with stale config or non-canonical install layouts still get the
-/// agent reported as available and spawn against a binary that actually
-/// exists. Returns the resolved name (the one that should be invoked).
-fn resolve_pi_bin(configured: &str) -> Option<PathBuf> {
-    if let Some(path) = which::which(configured).ok() {
-        return Some(path);
+fn env_path(env: &LaunchEnvironment, key: &str) -> Option<PathBuf> {
+    env.get(key)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+}
+
+fn pi_program_aliases() -> [(OsString, Vec<OsString>); 2] {
+    [
+        (
+            OsString::from("pi"),
+            vec![OsString::from("pi-coding-agent")],
+        ),
+        (
+            OsString::from("pi-coding-agent"),
+            vec![OsString::from("pi")],
+        ),
+    ]
+}
+
+/// Resolve the configured pi binary against the same launch environment used
+/// for child processes. If the configured name isn't on PATH, fall back to known
+/// aliases (`pi`, `pi-coding-agent`) so users with stale config or
+/// non-canonical install layouts still get the agent reported as available and
+/// spawn against a binary that actually exists.
+fn resolve_pi_bin_with_env(configured: &str, env: &LaunchEnvironment) -> Option<PathBuf> {
+    resolve_bin_with_env(configured, env).or_else(|| {
+        ["pi", "pi-coding-agent"]
+            .into_iter()
+            .filter(|alias| *alias != configured)
+            .find_map(|alias| resolve_bin_with_env(alias, env))
+    })
+}
+
+fn resolve_bin_with_env(configured: &str, env: &LaunchEnvironment) -> Option<PathBuf> {
+    let path = Path::new(configured);
+    if path.components().count() > 1 {
+        return is_executable_file(path).then(|| path.to_path_buf());
     }
-    for alias in ["pi", "pi-coding-agent"] {
-        if alias != configured && let Some (path) = which::which(alias).ok() {
-            return Some(path);
-        }
+    env.find_on_path(configured)
+}
+
+fn command_available_in_env(configured: &str, env: &LaunchEnvironment) -> bool {
+    resolve_bin_with_env(configured, env).is_some()
+}
+
+fn is_executable_file(path: &Path) -> bool {
+    if !path.is_file() {
+        return false;
     }
-    None
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        path.metadata()
+            .map(|metadata| metadata.permissions().mode() & 0o111 != 0)
+            .unwrap_or(false)
+    }
+
+    #[cfg(not(unix))]
+    {
+        true
+    }
 }
 
 fn agent_kind_from_str(name: &str) -> Option<AgentKind> {
@@ -1315,11 +1403,11 @@ impl crate::config::AgentsConfig {
     }
 }
 
-fn has_factory_auth(api_key_env: &str) -> bool {
-    if std::env::var_os(api_key_env).is_some() {
+fn has_factory_auth(api_key_env: &str, env: &LaunchEnvironment) -> bool {
+    if env.contains_key(api_key_env) {
         return true;
     }
-    let Some(home) = std::env::var_os("HOME") else {
+    let Some(home) = env.get("HOME") else {
         return false;
     };
     PathBuf::from(home)
@@ -1327,15 +1415,16 @@ fn has_factory_auth(api_key_env: &str) -> bool {
         .is_file()
 }
 
-fn has_amp_auth(api_key_env: &str) -> bool {
-    if std::env::var_os(api_key_env).is_some() {
+fn has_amp_auth(api_key_env: &str, env: &LaunchEnvironment) -> bool {
+    if env.contains_key(api_key_env) {
         return true;
     }
-    let Some(home) = std::env::var_os("HOME") else {
+    let Some(home) = env.get("HOME") else {
         return false;
     };
     let home = PathBuf::from(home);
-    let data_home = std::env::var_os("XDG_DATA_HOME")
+    let data_home = env
+        .get("XDG_DATA_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| home.join(".local/share"));
     data_home.join("amp/secrets.json").is_file() || home.join(".amp/oauth").is_dir()

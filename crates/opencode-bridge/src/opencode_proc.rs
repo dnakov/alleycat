@@ -1,9 +1,11 @@
+use std::ffi::OsStr;
 use std::net::TcpListener;
 use std::path::PathBuf;
 use std::process::Command as StdCommand;
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
+use alleycat_bridge_core::{LaunchEnvironment, LaunchEnvironmentResolver};
 use rand::RngCore;
 use tokio::process::{Child, Command as TokioCommand};
 
@@ -23,8 +25,14 @@ impl OpencodeRuntime {
     }
 
     pub async fn start_from_env() -> anyhow::Result<Self> {
-        if let Ok(base_url) = std::env::var("OPENCODE_BRIDGE_BACKEND_URL") {
-            let auth_token = std::env::var("OPENCODE_BRIDGE_AUTH_TOKEN").unwrap_or_default();
+        let cwd = std::env::current_dir().ok();
+        let launch_env = LaunchEnvironmentResolver::default()
+            .resolve(cwd.as_deref())
+            .await;
+
+        if let Some(base_url) = env_string(&launch_env, "OPENCODE_BRIDGE_BACKEND_URL") {
+            let auth_token =
+                env_string(&launch_env, "OPENCODE_BRIDGE_AUTH_TOKEN").unwrap_or_default();
             return Ok(Self {
                 base_url,
                 auth_token,
@@ -32,23 +40,27 @@ impl OpencodeRuntime {
             });
         }
 
-        let bin = resolve_opencode_bin();
-        let port = match std::env::var("OPENCODE_BRIDGE_PORT").as_deref() {
-            Ok("auto") | Err(_) => pick_port()?,
-            Ok(value) => value.parse::<u16>()?,
+        // The daemon writes host-configured opencode.bin into its own process
+        // environment just before lazy bridge construction. Keep that explicit
+        // config override above shell/mise/direnv ambient values.
+        let configured_bin = std::env::var("OPENCODE_BRIDGE_BIN").ok();
+        let bin = resolve_opencode_bin(&launch_env, configured_bin.as_deref());
+        let port = match env_string(&launch_env, "OPENCODE_BRIDGE_PORT").as_deref() {
+            Some("auto") | None => pick_port()?,
+            Some(value) => value.parse::<u16>()?,
         };
         // `--auth-token` was removed from `opencode serve` in 1.3.x and
         // passing it makes the binary print usage and exit immediately. Only
         // forward an explicit override; otherwise leave it off and treat the
         // server as unauthenticated (`OpencodeClient` skips the query param
         // when `auth_token` is empty).
-        let explicit_auth_token = match std::env::var("OPENCODE_BRIDGE_AUTH_TOKEN").as_deref() {
-            Ok("auto") | Ok("") | Err(_) => None,
-            Ok(value) => Some(value.to_string()),
-        };
+        let explicit_auth_token =
+            match env_string(&launch_env, "OPENCODE_BRIDGE_AUTH_TOKEN").as_deref() {
+                Some("auto") | Some("") | None => None,
+                Some(value) => Some(value.to_string()),
+            };
         let auth_token = explicit_auth_token.clone().unwrap_or_default();
-        let extra_args = std::env::var("OPENCODE_BRIDGE_EXTRA_ARGS")
-            .ok()
+        let extra_args = env_string(&launch_env, "OPENCODE_BRIDGE_EXTRA_ARGS")
             .map(|raw| {
                 raw.split('\u{1f}')
                     .map(ToOwned::to_owned)
@@ -58,6 +70,8 @@ impl OpencodeRuntime {
 
         let mut command = TokioCommand::new(bin);
         command
+            .env_clear()
+            .envs(launch_env.clone().into_pairs())
             .args(extra_args)
             .arg(format!("--port={port}"))
             .stdin(Stdio::null())
@@ -110,33 +124,33 @@ fn pick_port() -> anyhow::Result<u16> {
     Ok(listener.local_addr()?.port())
 }
 
-fn resolve_opencode_bin() -> String {
-    match std::env::var("OPENCODE_BRIDGE_BIN") {
-        Ok(raw) => {
-            let bin = raw.trim();
-            if !bin.is_empty() && bin != "opencode" {
-                return bin.to_string();
-            }
-        }
-        Err(_) => {}
-    }
-
-    if command_looks_usable("opencode") {
-        return "opencode".to_string();
-    }
-
-    for candidate in fallback_opencode_bins() {
-        if command_looks_usable(&candidate) {
-            return candidate.to_string_lossy().to_string();
+fn resolve_opencode_bin(env: &LaunchEnvironment, configured_bin: Option<&str>) -> PathBuf {
+    let env_configured = env_string(env, "OPENCODE_BRIDGE_BIN");
+    if let Some(raw) = configured_bin.or(env_configured.as_deref()) {
+        let bin = raw.trim();
+        if !bin.is_empty() && bin != "opencode" {
+            return PathBuf::from(bin);
         }
     }
 
-    "opencode".to_string()
+    if let Some(path) = env.find_on_path("opencode")
+        && command_looks_usable(&path, env)
+    {
+        return path;
+    }
+
+    for candidate in fallback_opencode_bins(env) {
+        if command_looks_usable(&candidate, env) {
+            return candidate;
+        }
+    }
+
+    PathBuf::from("opencode")
 }
 
-fn fallback_opencode_bins() -> Vec<PathBuf> {
+fn fallback_opencode_bins(env: &LaunchEnvironment) -> Vec<PathBuf> {
     let mut bins = Vec::new();
-    if let Some(home) = std::env::var_os("HOME") {
+    if let Some(home) = env.get("HOME") {
         bins.push(PathBuf::from(home).join(".opencode/bin/opencode"));
     }
     bins.push(PathBuf::from("/opt/homebrew/bin/opencode"));
@@ -144,15 +158,26 @@ fn fallback_opencode_bins() -> Vec<PathBuf> {
     bins
 }
 
-fn command_looks_usable(bin: impl AsRef<std::ffi::OsStr>) -> bool {
-    StdCommand::new(bin)
+fn command_looks_usable(bin: impl AsRef<OsStr>, env: &LaunchEnvironment) -> bool {
+    let mut command = StdCommand::new(bin);
+    command
+        .env_clear()
+        .envs(env.clone().into_pairs())
         .arg("--version")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::null());
+    command
         .status()
         .map(|status| status.success())
         .unwrap_or(false)
+}
+
+fn env_string(env: &LaunchEnvironment, key: &str) -> Option<String> {
+    env.get(key)
+        .and_then(OsStr::to_str)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
 }
 
 #[allow(dead_code)]

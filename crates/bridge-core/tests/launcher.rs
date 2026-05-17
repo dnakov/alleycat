@@ -18,6 +18,7 @@ fn shell_spec(script: &str) -> ProcessSpec {
         args: vec![OsString::from(flag), OsString::from(script)],
         cwd: None,
         env: Vec::new(),
+        env_clear: false,
         stdin: StdioMode::Null,
         stdout: StdioMode::Piped,
         stderr: StdioMode::Null,
@@ -88,4 +89,24 @@ async fn local_launcher_passes_env_to_child() {
         buf.trim_end().ends_with("from-launcher"),
         "expected child to echo env var, got {buf:?}"
     );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn local_launcher_can_clear_parent_env() {
+    if std::env::var_os("HOME").is_none() {
+        return;
+    }
+
+    let mut spec = shell_spec("printf %s \"${HOME-unset}\"");
+    spec.env_clear = true;
+
+    let launcher = LocalLauncher::new();
+    let mut child = launcher.launch(spec).await.expect("spawn");
+    let mut stdout = child.take_stdout().expect("stdout pipe");
+    let mut buf = String::new();
+    stdout.read_to_string(&mut buf).await.expect("read stdout");
+    let _ = child.wait().await;
+
+    assert_eq!(buf, "unset");
 }

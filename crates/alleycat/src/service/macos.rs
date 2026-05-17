@@ -14,8 +14,15 @@ pub(super) fn install() -> anyhow::Result<()> {
     let exe = std::env::current_exe().context("resolving current executable for launchd plist")?;
     let log_path = paths::log_dir()?.join("daemon.log");
     let inherit_path = std::env::var("PATH").ok();
+    let inherit_shell = std::env::var("SHELL").ok();
 
-    write_plist(&plist_path, &exe, &log_path, inherit_path.as_deref())?;
+    write_plist(
+        &plist_path,
+        &exe,
+        &log_path,
+        inherit_path.as_deref(),
+        inherit_shell.as_deref(),
+    )?;
 
     let uid = current_uid();
     let domain_target = format!("gui/{uid}/{label}", label = service_label());
@@ -119,6 +126,7 @@ pub(super) fn write_plist(
     exe: &Path,
     log_path: &Path,
     inherit_path: Option<&str>,
+    inherit_shell: Option<&str>,
 ) -> anyhow::Result<()> {
     if let Some(parent) = plist_path.parent() {
         std::fs::create_dir_all(parent)
@@ -129,7 +137,7 @@ pub(super) fn write_plist(
             .with_context(|| format!("creating {}", parent.display()))?;
     }
 
-    let body = render_plist(exe, log_path, inherit_path);
+    let body = render_plist(exe, log_path, inherit_path, inherit_shell);
     let tmp = plist_path.with_extension("plist.tmp");
     std::fs::write(&tmp, body.as_bytes()).with_context(|| format!("writing {}", tmp.display()))?;
     std::fs::rename(&tmp, plist_path)
@@ -137,7 +145,12 @@ pub(super) fn write_plist(
     Ok(())
 }
 
-fn render_plist(exe: &Path, log_path: &Path, inherit_path: Option<&str>) -> String {
+fn render_plist(
+    exe: &Path,
+    log_path: &Path,
+    inherit_path: Option<&str>,
+    inherit_shell: Option<&str>,
+) -> String {
     let label = service_label();
     let exe = xml_escape(&exe.to_string_lossy());
     let log = xml_escape(&log_path.to_string_lossy());
@@ -145,13 +158,26 @@ fn render_plist(exe: &Path, log_path: &Path, inherit_path: Option<&str>) -> Stri
     // which makes `which::which` fail for tools installed under ~/.bun/bin,
     // ~/.opencode/bin, /opt/homebrew/bin, etc. Inheriting the install-time
     // PATH preserves the user's expectation that "opencode" / "pi" resolve
-    // the same way they do in the shell that ran `alleycat install`.
-    let env_block = match inherit_path {
-        Some(path) => format!(
-            "    <key>EnvironmentVariables</key>\n    <dict>\n        <key>PATH</key>\n        <string>{}</string>\n    </dict>\n",
+    // the same way they do in the shell that ran `alleycat install`. SHELL is
+    // safe to persist and lets the launch-environment resolver choose fish,
+    // zsh, bash, or sh the same way the user does.
+    let mut env_entries = String::new();
+    if let Some(path) = inherit_path {
+        env_entries.push_str(&format!(
+            "        <key>PATH</key>\n        <string>{}</string>\n",
             xml_escape(path)
-        ),
-        None => String::new(),
+        ));
+    }
+    if let Some(shell) = inherit_shell {
+        env_entries.push_str(&format!(
+            "        <key>SHELL</key>\n        <string>{}</string>\n",
+            xml_escape(shell)
+        ));
+    }
+    let env_block = if env_entries.is_empty() {
+        String::new()
+    } else {
+        format!("    <key>EnvironmentVariables</key>\n    <dict>\n{env_entries}    </dict>\n")
     };
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -211,7 +237,7 @@ mod tests {
         let plist = tmp.join("dev.alleycat.alleycat.plist");
         let exe = PathBuf::from("/usr/local/bin/alleycat");
         let log = tmp.join("daemon.log");
-        write_plist(&plist, &exe, &log, None).expect("write_plist");
+        write_plist(&plist, &exe, &log, None, None).expect("write_plist");
         let body = std::fs::read_to_string(&plist).expect("read plist");
         assert!(body.contains("<string>dev.alleycat.alleycat</string>"));
         assert!(body.contains("<string>/usr/local/bin/alleycat</string>"));
@@ -238,12 +264,15 @@ mod tests {
             &exe,
             &log,
             Some("/Users/me/.bun/bin:/opt/homebrew/bin:/usr/bin:/bin"),
+            Some("/opt/homebrew/bin/fish"),
         )
         .expect("write_plist");
         let body = std::fs::read_to_string(&plist).expect("read plist");
         assert!(body.contains("<key>EnvironmentVariables</key>"));
         assert!(body.contains("<key>PATH</key>"));
         assert!(body.contains("/Users/me/.bun/bin:/opt/homebrew/bin:/usr/bin:/bin"));
+        assert!(body.contains("<key>SHELL</key>"));
+        assert!(body.contains("/opt/homebrew/bin/fish"));
         let _ = std::fs::remove_dir_all(&tmp);
     }
 

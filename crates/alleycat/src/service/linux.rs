@@ -12,11 +12,17 @@ use crate::service::DAEMON_SUBCOMMAND;
 pub(super) fn install() -> anyhow::Result<()> {
     let exe = std::env::current_exe().context("resolving current executable")?;
     let inherit_path = std::env::var("PATH").ok();
+    let inherit_shell = std::env::var("SHELL").ok();
 
     if systemd_user_session_available() {
         let unit_path = paths::systemd_unit_path()?;
         let unit_name = systemd_unit_name(&unit_path)?;
-        write_systemd_unit(&unit_path, &exe, inherit_path.as_deref())?;
+        write_systemd_unit(
+            &unit_path,
+            &exe,
+            inherit_path.as_deref(),
+            inherit_shell.as_deref(),
+        )?;
         run_systemctl(&["--user", "daemon-reload"])?;
         run_systemctl(&["--user", "enable", "--now", &unit_name])?;
         eprintln!(
@@ -81,12 +87,13 @@ pub(super) fn write_systemd_unit(
     unit_path: &Path,
     exe: &Path,
     inherit_path: Option<&str>,
+    inherit_shell: Option<&str>,
 ) -> anyhow::Result<()> {
     if let Some(parent) = unit_path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating {}", parent.display()))?;
     }
-    let body = render_systemd_unit(exe, inherit_path);
+    let body = render_systemd_unit(exe, inherit_path, inherit_shell);
     let tmp = unit_path.with_extension("service.tmp");
     std::fs::write(&tmp, body.as_bytes()).with_context(|| format!("writing {}", tmp.display()))?;
     std::fs::rename(&tmp, unit_path)
@@ -107,16 +114,28 @@ pub(super) fn write_autostart_desktop(desktop_path: &Path, exe: &Path) -> anyhow
     Ok(())
 }
 
-fn render_systemd_unit(exe: &Path, inherit_path: Option<&str>) -> String {
+fn render_systemd_unit(
+    exe: &Path,
+    inherit_path: Option<&str>,
+    inherit_shell: Option<&str>,
+) -> String {
     let exe = exe.to_string_lossy();
     // systemd `--user` units inherit `DefaultEnvironment=` from `manager.conf`,
     // not the user's interactive shell. Propagating PATH preserves the
     // expectation that `which("opencode")` / `which("pi")` resolves the
-    // same way it does in the shell that ran `alleycat install`.
-    let env_line = match inherit_path {
-        Some(path) => format!("Environment=\"PATH={path}\"\n"),
-        None => String::new(),
-    };
+    // same way it does in the shell that ran `alleycat install`. SHELL is safe
+    // to persist and lets the launch-environment resolver choose fish, zsh,
+    // bash, or sh the same way the user does.
+    let mut env_line = String::new();
+    if let Some(path) = inherit_path {
+        env_line.push_str(&format!("Environment=\"PATH={}\"\n", systemd_escape(path)));
+    }
+    if let Some(shell) = inherit_shell {
+        env_line.push_str(&format!(
+            "Environment=\"SHELL={}\"\n",
+            systemd_escape(shell)
+        ));
+    }
     format!(
         "[Unit]\n\
          Description=Alleycat bridge daemon\n\
@@ -132,6 +151,10 @@ fn render_systemd_unit(exe: &Path, inherit_path: Option<&str>) -> String {
          [Install]\n\
          WantedBy=default.target\n"
     )
+}
+
+fn systemd_escape(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
 fn render_autostart_desktop(exe: &Path) -> String {
@@ -246,7 +269,7 @@ mod tests {
         let tmp = tempdir();
         let unit = tmp.join("alleycat.service");
         let exe = PathBuf::from("/opt/alleycat/bin/alleycat");
-        write_systemd_unit(&unit, &exe, None).expect("write unit");
+        write_systemd_unit(&unit, &exe, None, None).expect("write unit");
         let body = std::fs::read_to_string(&unit).expect("read unit");
         assert!(body.contains(&format!(
             "ExecStart=/opt/alleycat/bin/alleycat {DAEMON_SUBCOMMAND}"
@@ -269,10 +292,12 @@ mod tests {
             &unit,
             &exe,
             Some("/home/me/.local/bin:/usr/local/bin:/usr/bin"),
+            Some("/usr/bin/fish"),
         )
         .expect("write unit");
         let body = std::fs::read_to_string(&unit).expect("read unit");
         assert!(body.contains("Environment=\"PATH=/home/me/.local/bin:/usr/local/bin:/usr/bin\""));
+        assert!(body.contains("Environment=\"SHELL=/usr/bin/fish\""));
         let _ = std::fs::remove_dir_all(&tmp);
     }
 

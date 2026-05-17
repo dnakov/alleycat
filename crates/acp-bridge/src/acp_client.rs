@@ -136,6 +136,7 @@ impl AcpClient {
             role: ProcessRole::Agent,
             cwd: None,
             env: vec![],
+            env_clear: false,
             stdin: StdioMode::Piped,
             stdout: StdioMode::Piped,
             stderr: StdioMode::Null,

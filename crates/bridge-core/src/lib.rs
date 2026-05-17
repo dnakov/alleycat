@@ -2,6 +2,7 @@ pub mod codex_resolver;
 pub mod envelope;
 pub mod framing;
 pub mod git_info;
+pub mod launch_environment;
 pub mod launcher;
 pub mod notify;
 pub mod pool;
@@ -15,6 +16,9 @@ pub use envelope::{
     JsonRpcResponse, JsonRpcVersion, RequestId, error_codes,
 };
 pub use git_info::git_info_for_cwd;
+pub use launch_environment::{
+    LaunchEnvironment, LaunchEnvironmentPolicy, LaunchEnvironmentResolver, UserEnvironmentLauncher,
+};
 pub use launcher::{
     ChildProcess, ChildStderr, ChildStdin, ChildStdout, LocalLauncher, ProcessLauncher,
     ProcessRole, ProcessSpec, StdioMode,

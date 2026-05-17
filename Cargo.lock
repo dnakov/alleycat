@@ -86,6 +86,7 @@ dependencies = [
  "clap",
  "directories",
  "fd-lock",
+ "futures",
  "hex",
  "hostname",
  "iroh",

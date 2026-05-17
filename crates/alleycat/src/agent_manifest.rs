@@ -196,6 +196,8 @@ pub const MANIFESTS: &[AgentManifest] = &[
         visible_modes: None,
         supports_ssh_bridge: true,
         uses_direct_codex_port: false,
+        supports_thread_permission_overrides: false,
+        reports_effective_thread_permissions: false,
     },
 ];
 

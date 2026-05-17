@@ -37,6 +37,7 @@ async-trait.workspace = true
 clap.workspace = true
 directories.workspace = true
 fd-lock.workspace = true
+futures.workspace = true
 hex.workspace = true
 hostname.workspace = true
 iroh.workspace = true

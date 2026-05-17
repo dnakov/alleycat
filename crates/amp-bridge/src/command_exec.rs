@@ -86,6 +86,7 @@ pub async fn handle_command_exec(
         args: argv[1..].iter().map(|s| s.clone().into()).collect(),
         cwd: params.cwd.clone().map(Into::into),
         env,
+        env_clear: false,
         stdin: StdioMode::Null,
         stdout: StdioMode::Piped,
         stderr: StdioMode::Piped,

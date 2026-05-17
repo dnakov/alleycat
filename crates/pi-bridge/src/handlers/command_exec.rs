@@ -134,6 +134,7 @@ pub async fn handle_command_exec(
         args: argv[1..].iter().map(OsString::from).collect(),
         cwd: params.cwd.as_ref().map(std::path::PathBuf::from),
         env,
+        env_clear: false,
         stdin: StdioMode::Null,
         stdout: StdioMode::Piped,
         stderr: StdioMode::Piped,

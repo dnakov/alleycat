@@ -60,10 +60,13 @@ pub struct ProcessSpec {
     pub program: PathBuf,
     pub args: Vec<OsString>,
     pub cwd: Option<PathBuf>,
-    /// Environment variables to set on the child. These are layered on top of
-    /// the launcher's default environment; each entry overrides any inherited
-    /// value with the same key.
+    /// Environment variables to set on the child. Unless `env_clear` is true,
+    /// these are layered on top of the launcher's default environment; each
+    /// entry overrides any inherited value with the same key.
     pub env: Vec<(OsString, OsString)>,
+    /// Start the child from exactly `env` instead of inheriting the launcher
+    /// process environment first.
+    pub env_clear: bool,
     pub stdin: StdioMode,
     pub stdout: StdioMode,
     pub stderr: StdioMode,
@@ -77,6 +80,7 @@ impl ProcessSpec {
             args: Vec::new(),
             cwd: None,
             env: Vec::new(),
+            env_clear: false,
             role: ProcessRole::Agent,
             stdin: StdioMode::Piped,
             stdout: StdioMode::Piped,
@@ -133,6 +137,9 @@ impl ProcessLauncher for LocalLauncher {
             cmd.args(&spec.args);
             if let Some(cwd) = &spec.cwd {
                 cmd.current_dir(cwd);
+            }
+            if spec.env_clear {
+                cmd.env_clear();
             }
             for (k, v) in &spec.env {
                 cmd.env(k, v);
