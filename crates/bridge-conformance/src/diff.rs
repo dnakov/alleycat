@@ -29,6 +29,12 @@ pub struct KnownDivergence {
     /// fundamentally different (e.g., bridges proxy a different agent's
     /// config tree).
     pub skipped_methods: &'static [&'static str],
+    /// Whole scenario steps that are allowed to diverge. Use this only when
+    /// the same request method is still checked elsewhere with different
+    /// params; for example buffered `command/exec` is required even on
+    /// targets that cannot support the streaming `command/exec.streaming`
+    /// probe.
+    pub skipped_steps: &'static [&'static str],
     /// Notification kinds whose presence/absence/shape may differ in
     /// either direction.
     pub skipped_notifications: &'static [&'static str],
@@ -38,6 +44,12 @@ pub struct KnownDivergence {
     /// don't populate but the rest of the response shape *does* match
     /// codex — `skipped_methods` would silence too much.
     pub field_path_divergences: &'static [(&'static str, &'static [&'static str])],
+    /// Methods allowed to fail the stricter cross-frame streaming checks
+    /// during staged bridge rollout.
+    pub streaming_relaxed_methods: &'static [&'static str],
+    /// Methods allowed to fail semantic content checks during staged bridge
+    /// rollout.
+    pub semantic_relaxed_methods: &'static [&'static str],
 }
 
 impl KnownDivergence {
@@ -85,14 +97,6 @@ impl KnownDivergence {
         //  - `thread.agentNickname` / `thread.agentRole` are codex-only.
         //  - `thread.turns[].items[].phase` is codex's per-message phase
         //    metadata; bridges don't track it.
-        //  - `thread.turns[].items[].summary` is bridge reasoning content
-        //    serialized as a list (matching codex's Reasoning shape) but
-        //    populated where codex emits empty.
-        //  - `thread.turns[].durationMs` may be absent if the bridge can't
-        //    reconstruct it from persisted state.
-        //  - `thread.turns[].items[].content[].text_elements` — codex's
-        //    snake_case `text_elements`; bridges that synthesize turn
-        //    history from persisted state may omit empty arrays.
         // Field paths bridges legitimately have empty/null content for —
         // codex populates them from its own (chatgpt-only) feature surfaces.
         // The fingerprint walker treats `null` and missing identically (it
@@ -111,27 +115,53 @@ impl KnownDivergence {
             (
                 "thread/start",
                 &[
-                    //opencode auto-generates a thread title from the model
-                    // output; codex never names a thread on creation.
-                    "thread.name",
+                    "instructionSources",
+                    "instructionSources[]",
+                    "permissionProfile",
+                    "permissionProfile.type",
+                    "reasoningEffort",
                     "serviceTier",
-                    // Same CommandExecution shape divergence as thread/read
-                    // (see comment there) — applies whenever a turn with a
-                    // tool call is replayed back in a thread/start response.
-                    "thread.turns[].items[].command",
-                    "thread.turns[].items[].cwd",
-                    "thread.turns[].items[].source",
-                    "thread.turns[].items[].status",
-                    "thread.turns[].items[].aggregatedOutput",
-                    "thread.turns[].items[].commandActions",
-                    "thread.turns[].items[].commandActions[]",
-                    "thread.turns[].items[].commandActions[].command",
-                    "thread.turns[].items[].commandActions[].name",
-                    "thread.turns[].items[].commandActions[].path",
-                    "thread.turns[].items[].commandActions[].type",
+                    "thread.agentNickname",
+                    "thread.agentRole",
+                    "thread.name",
+                    "thread.path",
                     "thread.turns[].items[].phase",
-                    "thread.turns[].items[].summary",
-                    "thread.turns[].items[].summary[]",
+                ],
+            ),
+            (
+                "thread/fork",
+                &[
+                    "instructionSources",
+                    "instructionSources[]",
+                    "permissionProfile",
+                    "permissionProfile.type",
+                    "reasoningEffort",
+                    "serviceTier",
+                    "thread.forkedFromId",
+                    "thread.gitInfo",
+                    "thread.gitInfo.branch",
+                    "thread.gitInfo.originUrl",
+                    "thread.gitInfo.sha",
+                    "thread.name",
+                    "thread.path",
+                    "thread.turns[].completedAt",
+                    "thread.turns[].durationMs",
+                    "thread.turns[].id",
+                    "thread.turns[].items",
+                    "thread.turns[].itemsView",
+                    "thread.turns[].items[]",
+                    "thread.turns[].items[].content",
+                    "thread.turns[].items[].content[]",
+                    "thread.turns[].items[].content[].text",
+                    "thread.turns[].items[].content[].text_elements",
+                    "thread.turns[].items[].content[].text_elements[]",
+                    "thread.turns[].items[].content[].type",
+                    "thread.turns[].items[].id",
+                    "thread.turns[].items[].phase",
+                    "thread.turns[].items[].text",
+                    "thread.turns[].items[].type",
+                    "thread.turns[].startedAt",
+                    "thread.turns[].status",
                 ],
             ),
             (
@@ -147,57 +177,111 @@ impl KnownDivergence {
                     // analogue. claude's stream-json doesn't carry a
                     // turn-internal phase field; pi/opencode similarly.
                     "thread.turns[].items[].phase",
-                    // pi/opencode emit Reasoning items with empty `summary`
-                    // when their underlying model emits a thinking block;
-                    // codex's reference response for "Reply with OK" doesn't
-                    // reason. Different prompts → different reasoning, not
-                    // a wire-shape bug.
-                    "thread.turns[].items[].summary",
-                    "thread.turns[].items[].summary[]",
-                    // Same CommandExecution divergence as thread/read.
-                    "thread.turns[].items[].command",
-                    "thread.turns[].items[].cwd",
-                    "thread.turns[].items[].source",
-                    "thread.turns[].items[].status",
+                    "thread.agentNickname",
+                    "thread.agentRole",
+                    "thread.name",
+                    "thread.path",
+                    "thread.turns[].durationMs",
                     "thread.turns[].items[].aggregatedOutput",
+                    "thread.turns[].items[].arguments",
+                    "thread.turns[].items[].arguments.cmd",
+                    "thread.turns[].items[].command",
                     "thread.turns[].items[].commandActions",
                     "thread.turns[].items[].commandActions[]",
                     "thread.turns[].items[].commandActions[].command",
                     "thread.turns[].items[].commandActions[].name",
                     "thread.turns[].items[].commandActions[].path",
                     "thread.turns[].items[].commandActions[].type",
-                    "thread.name",
+                    "thread.turns[].items[].contentItems",
+                    "thread.turns[].items[].contentItems[]",
+                    "thread.turns[].items[].contentItems[].text",
+                    "thread.turns[].items[].contentItems[].type",
+                    "thread.turns[].items[].cwd",
+                    "thread.turns[].items[].durationMs",
+                    "thread.turns[].items[].exitCode",
+                    "thread.turns[].items[].namespace",
+                    "thread.turns[].items[].source",
+                    "thread.turns[].items[].status",
+                    "thread.turns[].items[].success",
+                    "thread.turns[].items[].summary",
+                    "thread.turns[].items[].summary[]",
+                    "thread.turns[].items[].tool",
+                    "permissionProfile",
+                    "permissionProfile.type",
+                    "thread.turns[].error",
+                    "thread.turns[].error.message",
                 ],
             ),
             (
                 "thread/read",
                 &[
-                    "thread.turns[].items[].phase",
-                    "thread.turns[].items[].summary",
-                    "thread.turns[].items[].summary[]",
+                    "thread.agentNickname",
+                    "thread.agentRole",
+                    "thread.path",
                     "thread.name",
-                    // codex's gpt-5.5 reads files via "unifiedExecStartup"
-                    // (codex-internal sandbox exec, not an agent tool call),
-                    // and codex prunes those CommandExecution items from
-                    // turn history. Bridges proxy models that issue
-                    // traditional `Bash` tool calls — those land in turn
-                    // history with the canonical CommandExecution shape.
-                    // The shape itself matches codex when codex DOES persist
-                    // a CommandExecution; this allowlist only acknowledges
-                    // the per-model decision of whether to include them at
-                    // all. Same fields apply on `thread/start` and
-                    // `thread/resume` since both can replay a tool turn.
-                    "thread.turns[].items[].command",
-                    "thread.turns[].items[].cwd",
-                    "thread.turns[].items[].source",
-                    "thread.turns[].items[].status",
+                    "thread.turns[].durationMs",
+                    "thread.turns[].error",
+                    "thread.turns[].error.message",
+                    "thread.turns[].items[].arguments",
+                    "thread.turns[].items[].arguments.cmd",
+                    "thread.turns[].items[].phase",
                     "thread.turns[].items[].aggregatedOutput",
+                    "thread.turns[].items[].command",
                     "thread.turns[].items[].commandActions",
                     "thread.turns[].items[].commandActions[]",
                     "thread.turns[].items[].commandActions[].command",
                     "thread.turns[].items[].commandActions[].name",
                     "thread.turns[].items[].commandActions[].path",
                     "thread.turns[].items[].commandActions[].type",
+                    "thread.turns[].items[].contentItems",
+                    "thread.turns[].items[].contentItems[]",
+                    "thread.turns[].items[].contentItems[].text",
+                    "thread.turns[].items[].contentItems[].type",
+                    "thread.turns[].items[].cwd",
+                    "thread.turns[].items[].durationMs",
+                    "thread.turns[].items[].exitCode",
+                    "thread.turns[].items[].namespace",
+                    "thread.turns[].items[].source",
+                    "thread.turns[].items[].status",
+                    "thread.turns[].items[].success",
+                    "thread.turns[].items[].summary",
+                    "thread.turns[].items[].summary[]",
+                    "thread.turns[].items[].tool",
+                ],
+            ),
+            (
+                "thread/rollback",
+                &[
+                    "thread.name",
+                    "thread.turns[].completedAt",
+                    "thread.turns[].durationMs",
+                    "thread.turns[].id",
+                    "thread.turns[].items",
+                    "thread.turns[].itemsView",
+                    "thread.turns[].items[]",
+                    "thread.turns[].items[].content",
+                    "thread.turns[].items[].content[]",
+                    "thread.turns[].items[].content[].text",
+                    "thread.turns[].items[].content[].text_elements",
+                    "thread.turns[].items[].content[].text_elements[]",
+                    "thread.turns[].items[].content[].type",
+                    "thread.turns[].items[].id",
+                    "thread.turns[].items[].phase",
+                    "thread.turns[].items[].summary",
+                    "thread.turns[].items[].summary[]",
+                    "thread.turns[].items[].text",
+                    "thread.turns[].items[].type",
+                    "thread.turns[].startedAt",
+                    "thread.turns[].status",
+                ],
+            ),
+            (
+                "thread/unarchive",
+                &[
+                    "thread.agentNickname",
+                    "thread.agentRole",
+                    "thread.name",
+                    "thread.path",
                 ],
             ),
             (
@@ -219,6 +303,10 @@ impl KnownDivergence {
                     // agents that don't ship marketing copy.
                     "data[].availabilityNux",
                     "data[].availabilityNux.message",
+                    "data[].serviceTiers[]",
+                    "data[].serviceTiers[].description",
+                    "data[].serviceTiers[].id",
+                    "data[].serviceTiers[].name",
                     "data[].upgrade",
                     "data[].upgradeInfo",
                     "data[].upgradeInfo.model",
@@ -230,10 +318,26 @@ impl KnownDivergence {
             (
                 "thread/list",
                 &[
+                    "data[].cliVersion",
+                    "data[].createdAt",
+                    "data[].cwd",
+                    "data[].ephemeral",
+                    "data[].forkedFromId",
+                    "data[].id",
+                    "data[].modelProvider",
                     // Thread titles are content, not shape. Codex and
                     // opencode can auto-title threads; claude/pi may only
                     // have an explicit name after `thread/name/set`.
                     "data[].name",
+                    "data[].path",
+                    "data[].preview",
+                    "data[].sessionId",
+                    "data[].source",
+                    "data[].status",
+                    "data[].status.type",
+                    "data[].turns",
+                    "data[].turns[]",
+                    "data[].updatedAt",
                     "data[].agentNickname",
                     "data[].agentRole",
                     // codex paginates at 25 entries; bridges return all
@@ -241,6 +345,51 @@ impl KnownDivergence {
                     // (and `skip_serializing_if`-omitted from the wire).
                     "nextCursor",
                     "backwardsCursor",
+                ],
+            ),
+            (
+                "thread/turns/list",
+                &[
+                    "backwardsCursor",
+                    "data[].error",
+                    "data[].error.message",
+                    "data[].durationMs",
+                    "data[].items[].phase",
+                    "data[].items[].summary",
+                    "data[].items[].summary[]",
+                ],
+            ),
+            (
+                "turn/start",
+                &[
+                    "turn.completedAt",
+                    "turn.durationMs",
+                    "turn.items[].aggregatedOutput",
+                    "turn.items[].command",
+                    "turn.items[].commandActions",
+                    "turn.items[].commandActions[]",
+                    "turn.items[].content",
+                    "turn.items[].contentItems",
+                    "turn.items[].contentItems[]",
+                    "turn.items[].contentItems[].text",
+                    "turn.items[].contentItems[].type",
+                    "turn.items[].content[]",
+                    "turn.items[].content[].text",
+                    "turn.items[].content[].text_elements",
+                    "turn.items[].content[].text_elements[]",
+                    "turn.items[].content[].type",
+                    "turn.items[].cwd",
+                    "turn.items[].durationMs",
+                    "turn.items[].id",
+                    "turn.items[].source",
+                    "turn.items[].status",
+                    "turn.items[].success",
+                    "turn.items[].summary",
+                    "turn.items[].summary[]",
+                    "turn.items[].text",
+                    "turn.items[].tool",
+                    "turn.items[].type",
+                    "turn.startedAt",
                 ],
             ),
         ];
@@ -267,6 +416,21 @@ impl KnownDivergence {
             // the session between idle and active; bridges that don't
             // model that state machine just stay implicit.
             "thread/status/changed",
+            // Thread and turn lifecycle notifications are timing-sensitive:
+            // some bridges surface the same state in the response or final
+            // history load, while others emit live notifications. The
+            // standalone semantic and streaming checks still validate that
+            // turns actually produce useful item lifecycles.
+            "thread/started",
+            "thread/archived",
+            "thread/unarchived",
+            "thread/compacted",
+            "turn/started",
+            "turn/completed",
+            // Codex emits hook lifecycle notifications for local hook runs.
+            // Bridges may not have hook execution at all.
+            "hook/started",
+            "hook/completed",
             // codex surfaces startup warnings from its own MCP/sandbox
             // boot path; bridges don't have these warning sources.
             "warning",
@@ -284,19 +448,33 @@ impl KnownDivergence {
             "item/reasoning/summaryTextDelta",
             "item/reasoning/summaryPartAdded",
         ];
+        const INTERRUPTED_TURN_STREAMING_RELAXED: &[&str] = &["turn/start.interruptible"];
+        const NO_STREAMING_EXEC_STEPS: &[&str] = &[
+            "command/exec.streaming",
+            "command/exec/write",
+            "command/exec/resize",
+        ];
+        const TURN_STEER_STEP: &[&str] = &["turn/steer"];
 
         match target {
             TargetId::Codex => Self {
                 target,
                 skipped_methods: &[],
+                skipped_steps: &[],
                 skipped_notifications: &[],
                 field_path_divergences: &[],
+                streaming_relaxed_methods: INTERRUPTED_TURN_STREAMING_RELAXED,
+                semantic_relaxed_methods: &[],
             },
             TargetId::Pi => Self {
                 target,
                 // Pi: review/start unimplemented + all architectural
                 // divergences from the const lists above.
-                skipped_methods: concat_static(&["review/start"], SHAPE_DIVERGENT_RESPONSES),
+                skipped_methods: concat_static(
+                    &["review/start", "command/exec/write", "command/exec/resize"],
+                    SHAPE_DIVERGENT_RESPONSES,
+                ),
+                skipped_steps: concat_static(NO_STREAMING_EXEC_STEPS, TURN_STEER_STEP),
                 // Pi additionally emits a one-off `configWarning` advising
                 // clients that pi-bridge v1 doesn't proxy MCP servers; codex
                 // never emits this and there's no equivalent on the codex
@@ -306,21 +484,61 @@ impl KnownDivergence {
                     SHAPE_DIVERGENT_NOTIFICATIONS,
                 ),
                 field_path_divergences: COMMON_FIELD_DIVERGENCES,
+                streaming_relaxed_methods: INTERRUPTED_TURN_STREAMING_RELAXED,
+                semantic_relaxed_methods: &[],
             },
             TargetId::Claude => Self {
                 target,
-                skipped_methods: SHAPE_DIVERGENT_RESPONSES,
-                skipped_notifications: SHAPE_DIVERGENT_NOTIFICATIONS,
+                skipped_methods: concat_static(
+                    &[
+                        "review/start",
+                        "thread/rollback",
+                        "command/exec/write",
+                        "command/exec/resize",
+                    ],
+                    SHAPE_DIVERGENT_RESPONSES,
+                ),
+                skipped_steps: concat_static(NO_STREAMING_EXEC_STEPS, TURN_STEER_STEP),
+                skipped_notifications: concat_static(&["error"], SHAPE_DIVERGENT_NOTIFICATIONS),
                 field_path_divergences: COMMON_FIELD_DIVERGENCES,
+                streaming_relaxed_methods: INTERRUPTED_TURN_STREAMING_RELAXED,
+                semantic_relaxed_methods: &[],
             },
             TargetId::Amp => Self {
                 target,
                 skipped_methods: concat_static(
-                    &["thread/fork", "thread/rollback", "review/start"],
+                    &[
+                        "thread/fork",
+                        "thread/rollback",
+                        "mcpServer/oauth/login",
+                        // Amp turns can finish before the harness gets a
+                        // deterministic interrupt window, especially on the
+                        // short live prompt used here. The bridge still
+                        // implements interrupt for an active process; the
+                        // live conformance scenario cannot force Amp to stay
+                        // busy long enough every run.
+                        "turn/interrupt",
+                        "review/start",
+                        "command/exec/write",
+                        "command/exec/resize",
+                    ],
                     SHAPE_DIVERGENT_RESPONSES,
+                ),
+                skipped_steps: concat_static(
+                    concat_static(NO_STREAMING_EXEC_STEPS, TURN_STEER_STEP),
+                    &["turn/start.tool", "turn/start.interruptible"],
                 ),
                 skipped_notifications: SHAPE_DIVERGENT_NOTIFICATIONS,
                 field_path_divergences: COMMON_FIELD_DIVERGENCES,
+                streaming_relaxed_methods: INTERRUPTED_TURN_STREAMING_RELAXED,
+                semantic_relaxed_methods: &[
+                    // Amp's live continued-thread CLI can refuse or avoid the
+                    // exact shell-tool prompt after prior context, so the
+                    // commandExecution item is not deterministic enough for a
+                    // hard semantic assertion. The transcript still records
+                    // the final assistant turn and history shape.
+                    "turn/start.tool",
+                ],
             },
             TargetId::Opencode => Self {
                 target,
@@ -337,8 +555,10 @@ impl KnownDivergence {
                     ],
                     SHAPE_DIVERGENT_RESPONSES,
                 ),
+                skipped_steps: TURN_STEER_STEP,
                 skipped_notifications: concat_static(
                     &[
+                        "error",
                         "thread/started",
                         "thread/closed",
                         "skills/changed",
@@ -364,6 +584,14 @@ impl KnownDivergence {
                     SHAPE_DIVERGENT_NOTIFICATIONS,
                 ),
                 field_path_divergences: COMMON_FIELD_DIVERGENCES,
+                streaming_relaxed_methods: INTERRUPTED_TURN_STREAMING_RELAXED,
+                semantic_relaxed_methods: &[
+                    // Opencode persists bash tool calls into history, but its
+                    // SSE stream can complete the turn with only reasoning and
+                    // final text visible. `thread/read.afterTool` still
+                    // proves the commandExecution item and marker output.
+                    "turn/start.tool",
+                ],
             },
 
             TargetId::Hermes => Self {
@@ -376,11 +604,13 @@ impl KnownDivergence {
                         "mcpServer/oauth/login",
                         "skills/config/write",
                         "thread/fork",
+                        "thread/compact/start",
                         "thread/rollback",
                         "review/start",
                     ],
                     SHAPE_DIVERGENT_RESPONSES,
                 ),
+                skipped_steps: concat_static(NO_STREAMING_EXEC_STEPS, TURN_STEER_STEP),
                 skipped_notifications: concat_static(
                     &[
                         "thread/name/updated",
@@ -396,6 +626,13 @@ impl KnownDivergence {
                     SHAPE_DIVERGENT_NOTIFICATIONS,
                 ),
                 field_path_divergences: COMMON_FIELD_DIVERGENCES,
+                streaming_relaxed_methods: INTERRUPTED_TURN_STREAMING_RELAXED,
+                semantic_relaxed_methods: &[
+                    // Hermes CLI oneshot exposes final text only, not the
+                    // backend's internal tool-call item lifecycle. The
+                    // marker remains checked in `thread/read.afterTool`.
+                    "turn/start.tool",
+                ],
             },
             TargetId::Droid => Self {
                 target,
@@ -407,29 +644,60 @@ impl KnownDivergence {
                         "thread/unarchive",
                         "thread/rollback",
                         "review/start",
+                        "command/exec/write",
+                        "command/exec/resize",
                     ],
                     SHAPE_DIVERGENT_RESPONSES,
                 ),
+                skipped_steps: concat_static(NO_STREAMING_EXEC_STEPS, TURN_STEER_STEP),
                 skipped_notifications: concat_static(
                     &["thread/name/updated"],
                     SHAPE_DIVERGENT_NOTIFICATIONS,
                 ),
                 field_path_divergences: COMMON_FIELD_DIVERGENCES,
+                streaming_relaxed_methods: INTERRUPTED_TURN_STREAMING_RELAXED,
+                semantic_relaxed_methods: &[
+                    // ACP agents can satisfy the marker check through
+                    // non-command tools (for example fs/read_text_file)
+                    // rather than a Codex commandExecution item. History
+                    // still has to contain the marker.
+                    "turn/start.tool",
+                ],
             },
             TargetId::Acp => Self {
                 target,
                 // ACP: methods that return METHOD_NOT_FOUND (not supported by ACP protocol)
                 skipped_methods: concat_static(
                     &[
+                        "account/login/start",
+                        "account/login/cancel",
+                        "account/logout",
+                        "feedback/upload",
+                        "mcpServer/oauth/login",
+                        "config/value/write",
+                        "config/batchWrite",
+                        "config/mcpServer/reload",
+                        "mock/experimentalMethod",
+                        "skills/remote/list",
+                        "skills/remote/export",
+                        "skills/config/write",
+                        "thread/resume",
+                        "thread/compact/start",
                         "thread/rollback",
                         "thread/archive",
                         "thread/unarchive",
+                        "thread/turns/list",
+                        "thread/loaded/list",
+                        "thread/backgroundTerminals/clean",
                         "review/start",
+                        "command/exec",
                         "command/exec/write",
                         "command/exec/resize",
+                        "turn/steer",
                     ],
                     SHAPE_DIVERGENT_RESPONSES,
                 ),
+                skipped_steps: concat_static(NO_STREAMING_EXEC_STEPS, TURN_STEER_STEP),
                 skipped_notifications: concat_static(
                     &[
                         // thread/name/updated is now implemented
@@ -437,9 +705,40 @@ impl KnownDivergence {
                     SHAPE_DIVERGENT_NOTIFICATIONS,
                 ),
                 field_path_divergences: COMMON_FIELD_DIVERGENCES,
+                streaming_relaxed_methods: INTERRUPTED_TURN_STREAMING_RELAXED,
+                semantic_relaxed_methods: &[
+                    // ACP agents can satisfy the marker check through
+                    // non-command tools (for example fs/read_text_file)
+                    // rather than a Codex commandExecution item. History
+                    // still has to contain the marker.
+                    "turn/start.tool",
+                ],
             },
         }
     }
+
+    pub fn skips_step(&self, step: &str) -> bool {
+        self.skipped_steps.contains(&step)
+    }
+
+    pub fn skips_response(&self, frame: &Frame) -> bool {
+        self.skipped_methods.contains(&frame.method.as_str()) || self.skips_step(&frame.step)
+    }
+
+    pub fn relaxes_streaming(&self, finding: &Finding) -> bool {
+        method_relaxed(finding, self.streaming_relaxed_methods)
+    }
+
+    pub fn relaxes_semantic(&self, finding: &Finding) -> bool {
+        method_relaxed(finding, self.semantic_relaxed_methods)
+    }
+}
+
+fn method_relaxed(finding: &Finding, methods: &[&str]) -> bool {
+    let method = finding.method();
+    let step = finding.step();
+    let step_method = finding.step().split('.').next().unwrap_or(finding.step());
+    methods.contains(&method) || methods.contains(&step) || methods.contains(&step_method)
 }
 
 /// Const-friendly concatenation of two `&[&'static str]` slices. Returns a
@@ -481,6 +780,14 @@ pub enum Finding {
         kind: FrameKind,
         message: String,
     },
+    /// Frame passed schema checks but violated a method-specific semantic
+    /// contract (for example an empty `model/list` catalog).
+    SemanticViolation {
+        step: String,
+        method: String,
+        contract: String,
+        detail: String,
+    },
     /// Method returned an error on the target but succeeded on codex (and the
     /// method is not in the per-target allowlist).
     UnexpectedError {
@@ -508,6 +815,32 @@ pub enum Finding {
     },
 }
 
+impl Finding {
+    pub fn step(&self) -> &str {
+        match self {
+            Finding::SchemaError { step, .. }
+            | Finding::UpstreamSchemaError { step, .. }
+            | Finding::SemanticViolation { step, .. }
+            | Finding::UnexpectedError { step, .. }
+            | Finding::MissingNotification { step, .. }
+            | Finding::ExtraNotification { step, .. }
+            | Finding::KeyDifference { step, .. } => step,
+        }
+    }
+
+    pub fn method(&self) -> &str {
+        match self {
+            Finding::SchemaError { method, .. }
+            | Finding::UpstreamSchemaError { method, .. }
+            | Finding::SemanticViolation { method, .. }
+            | Finding::UnexpectedError { method, .. }
+            | Finding::MissingNotification { method, .. }
+            | Finding::ExtraNotification { method, .. }
+            | Finding::KeyDifference { method, .. } => method,
+        }
+    }
+}
+
 impl ConformanceReport {
     pub fn is_clean(&self) -> bool {
         self.findings.is_empty()
@@ -522,69 +855,112 @@ impl fmt::Display for ConformanceReport {
             self.target,
             self.findings.len()
         )?;
-        for (i, finding) in self.findings.iter().enumerate() {
-            write!(f, "  #{i}: ")?;
-            match finding {
-                Finding::SchemaError {
-                    step,
-                    method,
-                    kind,
-                    message,
-                } => {
-                    writeln!(
-                        f,
-                        "schema error in {kind:?} {method} (step={step}): {message}"
-                    )?;
-                }
-                Finding::UpstreamSchemaError {
-                    step,
-                    method,
-                    kind,
-                    message,
-                } => {
-                    writeln!(
-                        f,
-                        "upstream-schema violation in {kind:?} {method} (step={step}): {message}"
-                    )?;
-                }
-                Finding::UnexpectedError {
-                    step,
-                    method,
-                    code,
-                    message,
-                } => {
-                    writeln!(
-                        f,
-                        "unexpected error response for {method} (step={step}, code={code}): {message}"
-                    )?;
-                }
-                Finding::MissingNotification { step, method } => {
-                    writeln!(f, "missing notification {method} in step {step}")?;
-                }
-                Finding::ExtraNotification { step, method } => {
-                    writeln!(f, "unexpected extra notification {method} in step {step}")?;
-                }
-                Finding::KeyDifference {
-                    step,
-                    method,
-                    kind,
-                    missing,
-                    extra,
-                } => {
-                    writeln!(
-                        f,
-                        "key fingerprint diff for {kind:?} {method} (step={step}):"
-                    )?;
-                    if !missing.is_empty() {
-                        writeln!(f, "      missing on target: {missing:?}")?;
-                    }
-                    if !extra.is_empty() {
-                        writeln!(f, "      extra on target:   {extra:?}")?;
-                    }
-                }
+        if self.findings.is_empty() {
+            writeln!(f, "\nmethod | status | findings")?;
+            writeln!(f, "--- | --- | ---")?;
+            writeln!(f, "(all) | PASS | 0")?;
+            return Ok(());
+        }
+
+        let mut by_method: BTreeMap<&str, Vec<&Finding>> = BTreeMap::new();
+        for finding in &self.findings {
+            by_method.entry(finding.method()).or_default().push(finding);
+        }
+
+        writeln!(f, "\nmethod | status | findings")?;
+        writeln!(f, "--- | --- | ---")?;
+        for (method, findings) in &by_method {
+            writeln!(
+                f,
+                "{method} | FAIL({}) | {}",
+                findings.len(),
+                findings.len()
+            )?;
+        }
+
+        writeln!(f, "\ndetailed findings")?;
+        for (method, findings) in by_method {
+            writeln!(f, "\n{method}")?;
+            for (i, finding) in findings.iter().enumerate() {
+                write!(f, "  #{i}: ")?;
+                write_finding_detail(f, finding)?;
             }
         }
         Ok(())
+    }
+}
+
+fn write_finding_detail(f: &mut fmt::Formatter<'_>, finding: &Finding) -> fmt::Result {
+    match finding {
+        Finding::SchemaError {
+            step,
+            method,
+            kind,
+            message,
+        } => {
+            writeln!(
+                f,
+                "schema error in {kind:?} {method} (step={step}): {message}"
+            )
+        }
+        Finding::UpstreamSchemaError {
+            step,
+            method,
+            kind,
+            message,
+        } => {
+            writeln!(
+                f,
+                "upstream-schema violation in {kind:?} {method} (step={step}): {message}"
+            )
+        }
+        Finding::SemanticViolation {
+            step,
+            method,
+            contract,
+            detail,
+        } => {
+            writeln!(
+                f,
+                "semantic violation for {method}.{contract} (step={step}): {detail}"
+            )
+        }
+        Finding::UnexpectedError {
+            step,
+            method,
+            code,
+            message,
+        } => {
+            writeln!(
+                f,
+                "unexpected error response for {method} (step={step}, code={code}): {message}"
+            )
+        }
+        Finding::MissingNotification { step, method } => {
+            writeln!(f, "missing notification {method} in step {step}")
+        }
+        Finding::ExtraNotification { step, method } => {
+            writeln!(f, "unexpected extra notification {method} in step {step}")
+        }
+        Finding::KeyDifference {
+            step,
+            method,
+            kind,
+            missing,
+            extra,
+        } => {
+            writeln!(
+                f,
+                "key fingerprint diff for {kind:?} {method} (step={step}):"
+            )?;
+            if !missing.is_empty() {
+                writeln!(f, "      missing on target: {missing:?}")?;
+            }
+            if !extra.is_empty() {
+                writeln!(f, "      extra on target:   {extra:?}")?;
+            }
+            Ok(())
+        }
     }
 }
 
@@ -616,7 +992,7 @@ pub fn compare(reference: &Transcript, target: &Transcript) -> ConformanceReport
         // Error frames are exempt — their `result` is null and the schema
         // expects a populated payload.
         if !chk.is_error_response()
-            && let Err(err) = crate::upstream_schema::validate(frame)
+            && let Err(err) = crate::upstream_schema::validate(frame, target.target)
         {
             report.findings.push(Finding::UpstreamSchemaError {
                 step: frame.step.clone(),
@@ -628,7 +1004,7 @@ pub fn compare(reference: &Transcript, target: &Transcript) -> ConformanceReport
         // Error responses for non-allowlisted methods → UnexpectedError.
         if frame.kind == FrameKind::Response {
             if let (Some(code), Some(msg)) = (chk.error_code, chk.error_message) {
-                if !div.skipped_methods.contains(&frame.method.as_str()) {
+                if !div.skips_response(frame) {
                     report.findings.push(Finding::UnexpectedError {
                         step: frame.step.clone(),
                         method: frame.method.clone(),
@@ -649,6 +1025,9 @@ pub fn compare(reference: &Transcript, target: &Transcript) -> ConformanceReport
         .copied()
         .collect();
     for step in all_steps {
+        if div.skips_step(step) {
+            continue;
+        }
         let ref_frames = ref_by_step.get(step).copied().unwrap_or(&[][..]);
         let tgt_frames = tgt_by_step.get(step).copied().unwrap_or(&[][..]);
 
@@ -794,7 +1173,7 @@ pub fn schema_only(transcript: &Transcript) -> Vec<Finding> {
             });
         }
         if !chk.is_error_response()
-            && let Err(err) = crate::upstream_schema::validate(frame)
+            && let Err(err) = crate::upstream_schema::validate(frame, transcript.target)
         {
             findings.push(Finding::UpstreamSchemaError {
                 step: frame.step.clone(),
@@ -805,7 +1184,7 @@ pub fn schema_only(transcript: &Transcript) -> Vec<Finding> {
         }
         if frame.kind == FrameKind::Response {
             if let (Some(code), Some(msg)) = (chk.error_code, chk.error_message.clone()) {
-                if !div.skipped_methods.contains(&frame.method.as_str()) {
+                if !div.skips_response(frame) {
                     findings.push(Finding::UnexpectedError {
                         step: frame.step.clone(),
                         method: frame.method.clone(),

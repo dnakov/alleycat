@@ -25,9 +25,9 @@ pub struct JsonRpcClient {
     writer: FrameWriter,
     reader: FrameReader,
     next_id: AtomicI64,
-    /// Notifications we read while waiting for a response are buffered here
-    /// so the next `await_*` call sees them in wire order.
-    pending: Vec<Value>,
+    /// Responses for another in-flight request that arrived while we were
+    /// waiting for a different id.
+    pending_responses: Vec<Value>,
 }
 
 impl JsonRpcClient {
@@ -36,7 +36,7 @@ impl JsonRpcClient {
             reader,
             writer,
             next_id: AtomicI64::new(1),
-            pending: Vec::new(),
+            pending_responses: Vec::new(),
         }
     }
 
@@ -48,6 +48,14 @@ impl JsonRpcClient {
         params: Value,
         deadline: Duration,
     ) -> Result<RequestOutcome> {
+        let id = self.send_request(method, params).await?;
+        self.wait_for_response(method, id, deadline).await
+    }
+
+    /// Send a JSON-RPC request and return its id without waiting for the
+    /// response. Used by scenario steps that intentionally keep one request
+    /// active while driving a companion control method.
+    pub async fn send_request(&mut self, method: &str, params: Value) -> Result<i64> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let frame = json!({
             "jsonrpc": "2.0",
@@ -56,29 +64,40 @@ impl JsonRpcClient {
             "params": params,
         });
         write_frame(&mut self.writer, &frame).await?;
+        Ok(id)
+    }
 
+    /// Wait until the response for a previously sent request arrives,
+    /// returning every notification seen while waiting.
+    pub async fn wait_for_response(
+        &mut self,
+        method: &str,
+        id: i64,
+        deadline: Duration,
+    ) -> Result<RequestOutcome> {
         let mut notifications = Vec::new();
         let started = std::time::Instant::now();
         loop {
+            if let Some(value) = self.take_pending_response(id) {
+                return Ok(RequestOutcome {
+                    response: value,
+                    notifications,
+                });
+            }
             let remaining = deadline.checked_sub(started.elapsed()).unwrap_or_default();
             if remaining.is_zero() {
                 bail!("timed out waiting for response id={id} method={method}");
             }
-            let value = self.read_one(remaining).await?;
+            let value = self.read_wire_one(remaining).await?;
             if value.get("id").and_then(Value::as_i64) == Some(id) {
                 return Ok(RequestOutcome {
                     response: value,
                     notifications,
                 });
             }
-            // Other-id responses are invariants we don't expect from a single
-            // sequential client; surface as an error instead of silently
-            // discarding.
             if value.get("id").is_some() && value.get("method").is_none() {
-                bail!(
-                    "unexpected response id={:?} (waiting for {id}): {value}",
-                    value.get("id")
-                );
+                self.pending_responses.push(value);
+                continue;
             }
             // It's a notification or a server-initiated request. We don't
             // currently respond to server-initiated requests; record both
@@ -115,7 +134,7 @@ impl JsonRpcClient {
                     terminated_by: None,
                 });
             }
-            let value = match self.read_one(remaining).await {
+            let value = match self.read_wire_one(remaining).await {
                 Ok(v) => v,
                 Err(err) => {
                     // Timeout or EOF — return what we have.
@@ -139,15 +158,20 @@ impl JsonRpcClient {
             } else {
                 // Stray response with no matching outstanding request — keep
                 // it in the buffer so a future `request()` can correlate.
-                self.pending.push(value);
+                self.pending_responses.push(value);
             }
         }
     }
 
-    async fn read_one(&mut self, deadline: Duration) -> Result<Value> {
-        if let Some(buffered) = self.pending.pop() {
-            return Ok(buffered);
-        }
+    fn take_pending_response(&mut self, id: i64) -> Option<Value> {
+        let pos = self
+            .pending_responses
+            .iter()
+            .position(|value| value.get("id").and_then(Value::as_i64) == Some(id))?;
+        Some(self.pending_responses.remove(pos))
+    }
+
+    async fn read_wire_one(&mut self, deadline: Duration) -> Result<Value> {
         let mut line = String::new();
         let n = timeout(deadline, self.reader.read_line(&mut line))
             .await
@@ -160,7 +184,7 @@ impl JsonRpcClient {
         if trimmed.is_empty() {
             // Empty keepalive line; recurse via Box::pin to avoid async fn
             // recursion concerns on stable.
-            return Box::pin(self.read_one(deadline)).await;
+            return Box::pin(self.read_wire_one(deadline)).await;
         }
         serde_json::from_str(trimmed).with_context(|| format!("parsing frame: {trimmed}"))
     }
@@ -173,13 +197,13 @@ impl JsonRpcClient {
     pub async fn drain_idle(&mut self, quiet_window: Duration) -> Vec<Value> {
         let mut collected = Vec::new();
         loop {
-            match self.read_one(quiet_window).await {
+            match self.read_wire_one(quiet_window).await {
                 Ok(value) => {
                     if value.get("method").is_some() {
                         collected.push(value);
                     } else {
                         // Stray response — buffer for next request().
-                        self.pending.push(value);
+                        self.pending_responses.push(value);
                     }
                 }
                 Err(_) => return collected, // timeout = idle

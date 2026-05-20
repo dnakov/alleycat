@@ -228,6 +228,15 @@ impl OpencodeBridge {
         Ok(json!({ "turn": turn }))
     }
 
+    async fn handle_turn_steer(&self, ctx: &Conn, params: Value) -> Result<Value, JsonRpcError> {
+        let response = self.handle_turn_start(ctx, params).await?;
+        let turn_id = response
+            .pointer("/turn/id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| JsonRpcError::internal("turn/start response missing turn id"))?;
+        Ok(json!({ "turnId": turn_id }))
+    }
+
     async fn handle_thread_compact_start(&self, params: Value) -> Result<Value, JsonRpcError> {
         let binding = binding_from_params(&self.index, &params)?;
         let (provider_id, model_id) = self
@@ -283,7 +292,8 @@ impl OpencodeBridge {
         let target_id = user_ids
             .get(target_index)
             .ok_or_else(|| JsonRpcError::internal("rollback anchor out of range"))?;
-        self.client
+        let reverted_session = self
+            .client
             .revert_session(&binding.session_id, target_id)
             .await
             .map_err(|err| JsonRpcError::internal(format!("{err:#}")))?;
@@ -292,8 +302,15 @@ impl OpencodeBridge {
             .list_messages(&binding.session_id)
             .await
             .unwrap_or(Value::Array(Vec::new()));
+        let raw_messages = match reverted_session.get("revert") {
+            Some(revert) => apply_revert_to_messages(
+                messages_after.as_array().cloned().unwrap_or_default(),
+                revert,
+            ),
+            None => messages_after.as_array().cloned().unwrap_or_default(),
+        };
         let turns = collapse_messages_to_turns(
-            messages_after.as_array().cloned().unwrap_or_default(),
+            raw_messages,
             Some(&binding.directory),
             Some(&binding.thread_id),
         );
@@ -448,21 +465,12 @@ impl OpencodeBridge {
         // rollout to scan-and-repair from. Read it just to silence linters.
         let _ = params.get("useStateDbOnly");
 
-        // Fetch from upstream. When the caller supplies a single-cwd filter
-        // we forward it as `directory=` so opencode does the narrowing
-        // server-side; for multi-cwd or no-cwd we fetch the whole list and
-        // apply the filter locally. `searchTerm` is similarly forwarded as
-        // `search=` when present (opencode does substring matching on the
-        // session title, which is roughly what the codex schema describes).
-        let upstream_directory = match cwd_filter.as_deref() {
-            Some([single]) => Some(single.clone()),
-            _ => None,
-        };
+        // Fetch from upstream, then apply cwd filtering against the bridge's
+        // local binding. `thread/start` can receive a Codex cwd override that
+        // opencode itself does not store on the session, so forwarding
+        // `directory=` would make a valid Codex thread disappear.
         let mut upstream_path = "/session".to_string();
         let mut query = Vec::new();
-        if let Some(dir) = upstream_directory.as_deref() {
-            query.push(format!("directory={}", encode_query(dir)));
-        }
         if let Some(term) = search_term.as_deref() {
             query.push(format!("search={}", encode_query(term)));
         }
@@ -685,7 +693,7 @@ impl OpencodeBridge {
     }
 
     async fn handle_thread_archive(&self, params: Value) -> Result<Value, JsonRpcError> {
-        let binding = binding_from_params(&self.index, &params)?;
+        let mut binding = binding_from_params(&self.index, &params)?;
         self.client
             .patch(
                 &format!("/session/{}", binding.session_id),
@@ -693,16 +701,25 @@ impl OpencodeBridge {
             )
             .await
             .map_err(|err| JsonRpcError::internal(format!("{err:#}")))?;
+        binding.archived = true;
+        binding.updated_at = now_secs();
+        self.index
+            .insert(binding)
+            .await
+            .map_err(|err| JsonRpcError::internal(format!("{err:#}")))?;
         Ok(json!({}))
     }
 
     async fn handle_thread_unarchive(&self, params: Value) -> Result<Value, JsonRpcError> {
-        let binding = binding_from_params(&self.index, &params)?;
-        self.client
-            .patch(
-                &format!("/session/{}", binding.session_id),
-                json!({"time":{"archived":null}}),
-            )
+        let mut binding = binding_from_params(&self.index, &params)?;
+        // Opencode's current HTTP update schema accepts an archive timestamp
+        // but has no way to clear it back to null. Preserve the Codex-visible
+        // state in the bridge index so clients that unarchive through this
+        // protocol see the expected thread state.
+        binding.archived = false;
+        binding.updated_at = now_secs();
+        self.index
+            .insert(binding.clone())
             .await
             .map_err(|err| JsonRpcError::internal(format!("{err:#}")))?;
         Ok(json!({"thread":binding_to_thread(&binding)}))
@@ -795,7 +812,7 @@ impl Bridge for OpencodeBridge {
             "thread/name/set" => self.handle_thread_name_set(params).await,
             "turn/start" => self.handle_turn_start(ctx, params).await,
             "turn/interrupt" => self.handle_turn_interrupt(params).await,
-            "turn/steer" => self.handle_turn_start(ctx, params).await,
+            "turn/steer" => self.handle_turn_steer(ctx, params).await,
             "model/list" => self.handle_model_list().await,
             "config/read" => self.handle_config_read().await,
             "config/value/write" | "config/batchWrite" => self.handle_config_write(params).await,
@@ -1092,6 +1109,29 @@ fn binding_from_params(
     index
         .by_thread(thread_id)
         .ok_or_else(|| JsonRpcError::invalid_params("unknown thread"))
+}
+
+fn apply_revert_to_messages(mut messages: Vec<Value>, revert: &Value) -> Vec<Value> {
+    let Some(message_id) = revert.get("messageID").and_then(Value::as_str) else {
+        return messages;
+    };
+    if let Some(idx) = messages
+        .iter()
+        .position(|message| message.pointer("/info/id").and_then(Value::as_str) == Some(message_id))
+    {
+        messages.truncate(idx);
+        return messages;
+    }
+    messages
+        .into_iter()
+        .filter(|message| {
+            message
+                .pointer("/info/id")
+                .and_then(Value::as_str)
+                .map(|id| id < message_id)
+                .unwrap_or(true)
+        })
+        .collect()
 }
 
 fn binding_to_thread(binding: &OpencodeBinding) -> Value {

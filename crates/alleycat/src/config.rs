@@ -65,6 +65,7 @@ pub struct AgentsConfig {
     pub hermes: HermesAgentConfig,
     pub devin: DevinAgentConfig,
     pub grok: GrokAgentConfig,
+    pub shell: ShellAgentConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -259,6 +260,35 @@ impl Default for GrokAgentConfig {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct ShellAgentConfig {
+    pub enabled: bool,
+    pub shell_bin: String,
+    pub default_cwd: Option<String>,
+    pub allow_env_passthrough: bool,
+}
+
+impl Default for ShellAgentConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            shell_bin: std::env::var("SHELL")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| {
+                    if cfg!(windows) {
+                        "powershell.exe".to_string()
+                    } else {
+                        "/bin/zsh".to_string()
+                    }
+                }),
+            default_cwd: None,
+            allow_env_passthrough: false,
+        }
+    }
+}
+
 pub async fn load_or_init() -> anyhow::Result<HostConfig> {
     let path = paths::host_config_file()?;
     match fs::read_to_string(&path).await {
@@ -364,6 +394,10 @@ mod tests {
         assert!(config.agents.droid.enabled);
         assert!(config.agents.grok.enabled);
         assert!(config.agents.grok.no_leader);
-        assert_eq!(config.agents.grok.reasoning_effort.as_deref(), Some("medium"));
+        assert_eq!(
+            config.agents.grok.reasoning_effort.as_deref(),
+            Some("medium")
+        );
+        assert!(config.agents.shell.enabled);
     }
 }

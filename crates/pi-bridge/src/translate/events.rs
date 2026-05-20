@@ -59,6 +59,8 @@ pub struct EventTranslatorState {
 #[derive(Debug, Clone)]
 struct OpenItem {
     item_id: String,
+    started: bool,
+    saw_delta: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -194,15 +196,23 @@ impl EventTranslatorState {
 
     fn translate_message_start(&mut self, message: AssistantMessage) -> Vec<ServerNotification> {
         let item_id = assistant_item_id(self.turn_index, message.timestamp);
+        let text = extract_assistant_text(&message);
+        let started = !text.is_empty();
         self.open_message_item = Some(OpenItem {
             item_id: item_id.clone(),
+            started,
+            saw_delta: false,
         });
-        vec![self.item_started(ThreadItem::AgentMessage {
-            id: item_id,
-            text: extract_assistant_text(&message),
-            phase: Some(serde_json::Value::String("final_answer".into())),
-            memory_citation: None,
-        })]
+        if started {
+            vec![self.item_started(ThreadItem::AgentMessage {
+                id: item_id,
+                text,
+                phase: Some(serde_json::Value::String("final_answer".into())),
+                memory_citation: None,
+            })]
+        } else {
+            Vec::new()
+        }
     }
 
     fn translate_message_update(
@@ -212,38 +222,69 @@ impl EventTranslatorState {
         match event {
             AssistantMessageEvent::TextStart { .. } => Vec::new(),
             AssistantMessageEvent::TextDelta { delta, partial, .. } => {
-                if let Some(item) = self.open_message_item.as_ref() {
-                    vec![ServerNotification::AgentMessageDelta(
-                        AgentMessageDeltaNotification {
-                            thread_id: self.thread_id.clone(),
-                            turn_id: self.turn_id.clone(),
-                            item_id: item.item_id.clone(),
-                            delta,
-                            parent_item_id: None,
-                        },
-                    )]
-                } else {
-                    let mut out = self.translate_message_start(partial);
-                    if let Some(item) = self.open_message_item.as_ref() {
-                        out.push(ServerNotification::AgentMessageDelta(
-                            AgentMessageDeltaNotification {
-                                thread_id: self.thread_id.clone(),
-                                turn_id: self.turn_id.clone(),
-                                item_id: item.item_id.clone(),
-                                delta,
-                                parent_item_id: None,
-                            },
-                        ));
-                    }
-                    out
+                if self.open_message_item.is_none() {
+                    let item_id = assistant_item_id(self.turn_index, partial.timestamp);
+                    self.open_message_item = Some(OpenItem {
+                        item_id,
+                        started: false,
+                        saw_delta: false,
+                    });
                 }
+
+                let mut started_item = None;
+                let item_id = {
+                    let item = self
+                        .open_message_item
+                        .as_mut()
+                        .expect("open_message_item was just initialized");
+                    if !item.started {
+                        item.started = true;
+                        started_item = Some(ThreadItem::AgentMessage {
+                            id: item.item_id.clone(),
+                            text: String::new(),
+                            phase: Some(serde_json::Value::String("final_answer".into())),
+                            memory_citation: None,
+                        });
+                    }
+                    item.saw_delta = true;
+                    item.item_id.clone()
+                };
+
+                let mut out = Vec::new();
+                if let Some(item) = started_item {
+                    out.push(self.item_started(item));
+                }
+                out.push(ServerNotification::AgentMessageDelta(
+                    AgentMessageDeltaNotification {
+                        thread_id: self.thread_id.clone(),
+                        turn_id: self.turn_id.clone(),
+                        item_id,
+                        delta,
+                        parent_item_id: None,
+                    },
+                ));
+                out
             }
-            AssistantMessageEvent::TextEnd { .. } => Vec::new(),
+            AssistantMessageEvent::TextEnd {
+                content, partial, ..
+            } => {
+                if self.open_message_item.is_none() && !content.is_empty() {
+                    let item_id = assistant_item_id(self.turn_index, partial.timestamp);
+                    self.open_message_item = Some(OpenItem {
+                        item_id,
+                        started: false,
+                        saw_delta: false,
+                    });
+                }
+                self.ensure_agent_message_delta(content)
+            }
 
             AssistantMessageEvent::ThinkingStart { partial, .. } => {
                 let item_id = reasoning_item_id(self.turn_index, partial.timestamp);
                 self.open_reasoning_item = Some(OpenItem {
                     item_id: item_id.clone(),
+                    started: true,
+                    saw_delta: false,
                 });
                 vec![self.item_started(ThreadItem::Reasoning {
                     id: item_id,
@@ -252,9 +293,10 @@ impl EventTranslatorState {
                 })]
             }
             AssistantMessageEvent::ThinkingDelta { delta, .. } => {
-                let Some(item) = self.open_reasoning_item.as_ref() else {
+                let Some(item) = self.open_reasoning_item.as_mut() else {
                     return Vec::new();
                 };
+                item.saw_delta = true;
                 vec![ServerNotification::ReasoningTextDelta(
                     ReasoningTextDeltaNotification {
                         thread_id: self.thread_id.clone(),
@@ -299,12 +341,38 @@ impl EventTranslatorState {
         let Some(item) = self.open_message_item.take() else {
             return Vec::new();
         };
-        vec![self.item_completed(ThreadItem::AgentMessage {
+        let text = extract_assistant_text(&message);
+        if !item.started && text.is_empty() {
+            return Vec::new();
+        }
+
+        let mut out = Vec::new();
+        if !item.started {
+            out.push(self.item_started(ThreadItem::AgentMessage {
+                id: item.item_id.clone(),
+                text: String::new(),
+                phase: Some(serde_json::Value::String("final_answer".into())),
+                memory_citation: None,
+            }));
+        }
+        if !item.saw_delta && !text.is_empty() {
+            out.push(ServerNotification::AgentMessageDelta(
+                AgentMessageDeltaNotification {
+                    thread_id: self.thread_id.clone(),
+                    turn_id: self.turn_id.clone(),
+                    item_id: item.item_id.clone(),
+                    delta: text.clone(),
+                    parent_item_id: None,
+                },
+            ));
+        }
+        out.push(self.item_completed(ThreadItem::AgentMessage {
             id: item.item_id,
-            text: extract_assistant_text(&message),
+            text,
             phase: Some(serde_json::Value::String("final_answer".into())),
             memory_citation: None,
-        })]
+        }));
+        out
     }
 
     // ---- tool execution ----------------------------------------------------
@@ -580,12 +648,14 @@ impl EventTranslatorState {
     fn translate_agent_end(&mut self) -> Vec<ServerNotification> {
         let mut out = Vec::new();
         if let Some(item) = self.open_message_item.take() {
-            out.push(self.item_completed(ThreadItem::AgentMessage {
-                id: item.item_id,
-                text: String::new(),
-                phase: None,
-                memory_citation: None,
-            }));
+            if item.started {
+                out.push(self.item_completed(ThreadItem::AgentMessage {
+                    id: item.item_id,
+                    text: String::new(),
+                    phase: None,
+                    memory_citation: None,
+                }));
+            }
         }
         if let Some(item) = self.open_reasoning_item.take() {
             out.push(self.item_completed(ThreadItem::Reasoning {
@@ -594,6 +664,46 @@ impl EventTranslatorState {
                 content: Vec::new(),
             }));
         }
+        out
+    }
+
+    fn ensure_agent_message_delta(&mut self, text: String) -> Vec<ServerNotification> {
+        if text.is_empty() {
+            return Vec::new();
+        }
+        let Some(item) = self.open_message_item.as_mut() else {
+            return Vec::new();
+        };
+        if item.saw_delta {
+            return Vec::new();
+        }
+
+        let mut started_item = None;
+        if !item.started {
+            item.started = true;
+            started_item = Some(ThreadItem::AgentMessage {
+                id: item.item_id.clone(),
+                text: String::new(),
+                phase: Some(serde_json::Value::String("final_answer".into())),
+                memory_citation: None,
+            });
+        }
+        item.saw_delta = true;
+        let item_id = item.item_id.clone();
+
+        let mut out = Vec::new();
+        if let Some(item) = started_item {
+            out.push(self.item_started(item));
+        }
+        out.push(ServerNotification::AgentMessageDelta(
+            AgentMessageDeltaNotification {
+                thread_id: self.thread_id.clone(),
+                turn_id: self.turn_id.clone(),
+                item_id,
+                delta: text,
+                parent_item_id: None,
+            },
+        ));
         out
     }
 
@@ -1046,17 +1156,27 @@ mod tests {
     }
 
     #[test]
-    fn message_start_emits_item_started_agent_message() {
+    fn message_start_delays_empty_agent_message_until_text() {
         let mut s = state();
         let out = s.translate(PiEvent::MessageStart {
             message: agent_msg(""),
+        });
+        assert!(out.is_empty());
+        assert!(s.open_message_item.is_some());
+    }
+
+    #[test]
+    fn message_start_emits_non_empty_item_started_agent_message() {
+        let mut s = state();
+        let out = s.translate(PiEvent::MessageStart {
+            message: agent_msg("hi"),
         });
         assert_eq!(out.len(), 1);
         match &out[0] {
             ServerNotification::ItemStarted(n) => match &n.item {
                 ThreadItem::AgentMessage { id, text, .. } => {
                     assert_eq!(id, "assistant_7_0");
-                    assert_eq!(text, "");
+                    assert_eq!(text, "hi");
                 }
                 other => panic!("expected AgentMessage, got {other:?}"),
             },
@@ -1081,8 +1201,9 @@ mod tests {
                 partial: assistant_message(""),
             },
         });
-        assert_eq!(out.len(), 1);
-        match &out[0] {
+        assert_eq!(out.len(), 2);
+        assert!(matches!(out[0], ServerNotification::ItemStarted(_)));
+        match &out[1] {
             ServerNotification::AgentMessageDelta(n) => {
                 assert_eq!(n.thread_id, "th_1");
                 assert_eq!(n.turn_id, "tu_1");
@@ -1702,6 +1823,14 @@ mod tests {
         let mut s = state();
         s.translate(PiEvent::MessageStart {
             message: agent_msg(""),
+        });
+        let out = s.translate(PiEvent::AgentEnd {
+            messages: Vec::new(),
+        });
+        assert!(out.is_empty());
+
+        s.translate(PiEvent::MessageStart {
+            message: agent_msg("hi"),
         });
         let out = s.translate(PiEvent::AgentEnd {
             messages: Vec::new(),

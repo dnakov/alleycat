@@ -696,7 +696,9 @@ fn acp_content_to_codex_items(content: &[Value]) -> Vec<Value> {
         let block_type = block.get("type").and_then(|v| v.as_str()).unwrap_or("");
         match block_type {
             "content" => {
-                let Some(inner) = block.get("content") else { continue };
+                let Some(inner) = block.get("content") else {
+                    continue;
+                };
                 let inner_type = inner.get("type").and_then(|v| v.as_str()).unwrap_or("");
                 match inner_type {
                     "text" => {
@@ -719,8 +721,10 @@ fn acp_content_to_codex_items(content: &[Value]) -> Vec<Value> {
                         }
                     }
                     "resource" => {
-                        if let Some(text) =
-                            inner.get("resource").and_then(|r| r.get("text")).and_then(|v| v.as_str())
+                        if let Some(text) = inner
+                            .get("resource")
+                            .and_then(|r| r.get("text"))
+                            .and_then(|v| v.as_str())
                         {
                             out.push(json!({"type": "inputText", "text": text}));
                         }

@@ -20,7 +20,7 @@ use std::collections::HashMap;
 
 use serde_json::Value;
 
-use crate::diff::Finding;
+use crate::diff::{Finding, KnownDivergence};
 use crate::{Frame, FrameKind, Transcript};
 
 /// Run the streaming-lifecycle check on every notification in `transcript`.
@@ -69,14 +69,17 @@ pub fn check(transcript: &Transcript) -> Vec<Finding> {
         }
     }
 
+    let div = KnownDivergence::for_target(transcript.target);
     findings
+        .into_iter()
+        .filter(|finding| !div.relaxes_streaming(finding))
+        .collect()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ItemKind {
     AgentMessage,
     Reasoning,
-    Other,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -105,7 +108,7 @@ fn on_started(state: &mut HashMap<String, ItemState>, frame: &Frame) {
     let kind = match item.get("type").and_then(Value::as_str) {
         Some("agentMessage") => ItemKind::AgentMessage,
         Some("reasoning") => ItemKind::Reasoning,
-        _ => ItemKind::Other,
+        _ => return,
     };
     state.insert(
         id,
@@ -138,20 +141,34 @@ fn on_completed(
             .collect::<Vec<_>>()
             .join("")
     });
+    let completed_kind = match item.get("type").and_then(Value::as_str) {
+        Some("agentMessage") => Some(ItemKind::AgentMessage),
+        Some("reasoning") => Some(ItemKind::Reasoning),
+        _ => None,
+    };
 
     match state.get_mut(&id) {
-        None => findings.push(Finding::SchemaError {
+        None if completed_kind.is_some() => findings.push(Finding::SchemaError {
             step: frame.step.clone(),
             method: "item/completed".into(),
             kind: FrameKind::Notification,
             message: format!("item/completed for id={id} with no matching item/started"),
         }),
+        None => {}
         Some(st) => {
             st.completed = true;
             // Verify "final message after deltas" contract.
             match (st.kind, final_text.as_deref(), final_content.as_deref()) {
                 (ItemKind::AgentMessage, Some(text), _) => {
-                    if !st.accumulated_text.is_empty() && text != st.accumulated_text {
+                    if st.accumulated_text.is_empty() {
+                        findings.push(Finding::SchemaError {
+                            step: frame.step.clone(),
+                            method: "item/completed".into(),
+                            kind: FrameKind::Notification,
+                            message: format!("agentMessage item={id} produced no deltas"),
+                        });
+                    }
+                    if text != st.accumulated_text {
                         findings.push(Finding::SchemaError {
                             step: frame.step.clone(),
                             method: "item/completed".into(),
@@ -316,6 +333,21 @@ mod tests {
             findings.iter().any(|f| matches!(
                 f, Finding::SchemaError { message, .. }
                 if message.contains("final text")
+            )),
+            "{findings:#?}"
+        );
+    }
+
+    #[test]
+    fn agent_message_without_delta_is_flagged() {
+        let mut t = Transcript::new(TargetId::Pi);
+        t.push(started("m1", "agentMessage"));
+        t.push(completed("m1", "agentMessage", json!({"text":"OK"})));
+        let findings = check(&t);
+        assert!(
+            findings.iter().any(|f| matches!(
+                f, Finding::SchemaError { message, .. }
+                if message.contains("produced no deltas")
             )),
             "{findings:#?}"
         );

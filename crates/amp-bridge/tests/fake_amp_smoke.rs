@@ -122,7 +122,7 @@ printf '{"type":"result","subtype":"success","duration_ms":42,"is_error":false,"
             .iter()
             .map(|option| option["reasoningEffort"].as_str().unwrap())
             .collect::<Vec<_>>(),
-        vec!["high", "xhigh", "max"]
+        vec!["high", "xhigh"]
     );
 
     send_request(

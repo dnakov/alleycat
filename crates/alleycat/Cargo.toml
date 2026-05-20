@@ -31,6 +31,7 @@ alleycat-droid-bridge = { workspace = true }
 alleycat-hermes-bridge = { workspace = true }
 alleycat-opencode-bridge = { workspace = true }
 alleycat-pi-bridge = { workspace = true }
+alleycat-shell-bridge = { workspace = true }
 anyhow.workspace = true
 arc-swap.workspace = true
 async-trait.workspace = true

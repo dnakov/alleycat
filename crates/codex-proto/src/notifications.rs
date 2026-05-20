@@ -53,6 +53,10 @@ pub enum ServerNotification {
     TurnDiffUpdated(TurnDiffUpdatedNotification),
     #[serde(rename = "turn/plan/updated")]
     TurnPlanUpdated(TurnPlanUpdatedNotification),
+    #[serde(rename = "hook/started")]
+    HookStarted(Value),
+    #[serde(rename = "hook/completed")]
+    HookCompleted(Value),
     #[serde(rename = "item/started")]
     ItemStarted(ItemStartedNotification),
     #[serde(rename = "item/completed")]

@@ -104,6 +104,10 @@ pub struct BridgeState {
     /// Set of part ids for which we've already emitted `item/started` (used
     /// for tool parts which appear via `message.part.updated`).
     started_parts: Mutex<HashSet<String>>,
+    /// Set of part ids for which we've already emitted `item/completed`.
+    /// This lets the session-idle history fallback fill gaps without
+    /// duplicating parts that arrived through live `message.part.updated`.
+    completed_parts: Mutex<HashSet<String>>,
     /// Cache of part kind keyed by part id, populated by `message.part.updated`
     /// and consumed by `message.part.delta` (T4) for routing.
     part_kind: Mutex<HashMap<String, PartKind>>,
@@ -217,6 +221,15 @@ impl BridgeState {
     pub fn forget_part(&self, part_id: &str) {
         self.started_parts.lock().unwrap().remove(part_id);
         self.part_kind.lock().unwrap().remove(part_id);
+    }
+
+    /// Mark a part as completed; returns `true` if this is the first
+    /// completion seen for the part.
+    pub fn mark_part_completed(&self, part_id: &str) -> bool {
+        self.completed_parts
+            .lock()
+            .unwrap()
+            .insert(part_id.to_string())
     }
 
     /// Cache the kind of `part_id` so deltas for it can be routed correctly.

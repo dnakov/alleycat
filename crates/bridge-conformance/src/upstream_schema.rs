@@ -9,9 +9,10 @@
 //! gap the bridge needs to fix.
 //!
 //! Skip-on-missing: the schema dir defaults to
-//! `~/dev/codex/codex-rs/app-server-protocol/schema/json/v2/`. If absent
-//! (CI, fresh checkout, stripped tarball) the validator silently no-ops so
-//! the rest of the conformance suite still runs.
+//! `~/dev/codex/codex-rs/app-server-protocol/schema/json/v2/`. If absent,
+//! validation panics unless `BRIDGE_CONFORMANCE_SKIP_UPSTREAM_SCHEMA=1` is
+//! set. Silent schema skips hide exactly the drift this harness is meant to
+//! catch.
 //!
 //! Method/notification → schema mapping is built from the upstream filename
 //! convention: response of `thread/read` lives in `ThreadReadResponse.json`,
@@ -24,38 +25,47 @@ use std::sync::OnceLock;
 use jsonschema::Validator;
 use serde_json::Value;
 
-use crate::{Frame, FrameKind};
+use crate::{Frame, FrameKind, TargetId};
 
 const ENV_OVERRIDE: &str = "BRIDGE_CONFORMANCE_CODEX_SCHEMA_DIR";
+const ENV_SKIP: &str = "BRIDGE_CONFORMANCE_SKIP_UPSTREAM_SCHEMA";
 const DEFAULT_REL: &str = "dev/codex/codex-rs/app-server-protocol/schema/json/v2";
 
-/// Directory holding the upstream v2 JSON schema files. `None` if both the
-/// env var is unset *and* the default relative path under `$HOME` is absent.
-pub fn schema_dir() -> Option<PathBuf> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SchemaSkipReason {
+    ExplicitSkip,
+}
+
+/// Directory holding the upstream v2 JSON schema files.
+pub fn schema_dir() -> Result<PathBuf, SchemaSkipReason> {
+    if std::env::var_os(ENV_SKIP).as_deref() == Some(std::ffi::OsStr::new("1")) {
+        warn_skip_once();
+        return Err(SchemaSkipReason::ExplicitSkip);
+    }
     if let Some(custom) = std::env::var_os(ENV_OVERRIDE) {
         let p = PathBuf::from(custom);
         if p.is_dir() {
-            return Some(p);
+            return Ok(p);
         }
-        // Explicit override that points at nothing — surface the choice
-        // rather than falling back to the implicit default.
-        tracing::warn!(
-            override_env = ENV_OVERRIDE,
-            path = %p.display(),
-            "schema dir override does not exist; upstream-schema validation skipped"
-        );
-        return None;
+        panic_missing(Some(p));
     }
-    let home = std::env::var_os("HOME")?;
-    let candidate = PathBuf::from(home).join(DEFAULT_REL);
-    candidate.is_dir().then_some(candidate)
+    let candidate = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .map(|home| home.join(DEFAULT_REL));
+    if let Some(candidate) = candidate {
+        if candidate.is_dir() {
+            return Ok(candidate);
+        }
+        panic_missing(Some(candidate));
+    }
+    panic_missing(None);
 }
 
 /// Validate a single captured frame against its upstream schema. Returns
-/// `Ok(())` when the schema is missing (skipped) or the frame validates;
-/// otherwise returns the validator's error list joined into one human-
-/// readable message.
-pub fn validate(frame: &Frame) -> Result<(), String> {
+/// `Ok(())` when validation is explicitly skipped or the frame validates;
+/// otherwise returns the validator's error list joined into one human-readable
+/// message.
+pub fn validate(frame: &Frame, target: TargetId) -> Result<(), String> {
     let Some(schema_path) = path_for_frame(frame) else {
         // No schema file mapped for this method/notification — silent skip
         // (e.g., bridge-only methods, or methods we haven't mapped yet).
@@ -79,20 +89,49 @@ pub fn validate(frame: &Frame) -> Result<(), String> {
         .iter_errors(&payload)
         .map(|e| format!("{}: {}", e.instance_path, e))
         .collect();
-    if errors.is_empty() || is_known_stale_schema_miss(frame, &errors) {
+    if errors.is_empty() || is_known_stale_schema_miss(frame, target, &errors) {
         Ok(())
     } else {
         Err(errors.join("; "))
     }
 }
 
-fn is_known_stale_schema_miss(frame: &Frame, errors: &[String]) -> bool {
+fn warn_skip_once() {
+    static WARNED: OnceLock<()> = OnceLock::new();
+    WARNED.get_or_init(|| {
+        tracing::warn!(
+            env = ENV_SKIP,
+            "upstream schema validation explicitly skipped"
+        );
+    });
+}
+
+fn panic_missing(candidate: Option<PathBuf>) -> ! {
+    let default = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .map(|home| home.join(DEFAULT_REL))
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| format!("$HOME/{DEFAULT_REL}"));
+    let checked = candidate
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| "(HOME is unset)".to_string());
+    panic!(
+        "upstream codex JSON schemas are required for bridge conformance\n\
+         checked: {checked}\n\
+         set {ENV_OVERRIDE}=<schema-dir> to point at app-server-protocol/schema/json/v2\n\
+         default path: {default}\n\
+         set {ENV_SKIP}=1 only when this validation is intentionally disabled"
+    );
+}
+
+fn is_known_stale_schema_miss(frame: &Frame, target: TargetId, errors: &[String]) -> bool {
     // The locally checked-out codex schema can lag the installed codex CLI
     // used as the live reference. Codex 0.130 emits serviceTier="priority",
     // while the older schema only accepted "fast" | "flex". Keep schema
     // validation useful for every other path without failing the live
     // reference on a known stale enum.
-    frame.kind == FrameKind::Response
+    target == TargetId::Codex
+        && frame.kind == FrameKind::Response
         && errors
             .iter()
             .all(|err| err.contains("/serviceTier:") && err.contains("\"priority\" is not valid"))
@@ -103,7 +142,10 @@ fn is_known_stale_schema_miss(frame: &Frame, errors: &[String]) -> bool {
 /// (`thread/read` → `ThreadReadResponse.json` for responses,
 /// `item/completed` → `ItemCompletedNotification.json` for notifications).
 fn path_for_frame(frame: &Frame) -> Option<PathBuf> {
-    let dir = schema_dir()?;
+    let dir = match schema_dir() {
+        Ok(dir) => dir,
+        Err(SchemaSkipReason::ExplicitSkip) => return None,
+    };
     let stem = match frame.kind {
         FrameKind::Response => format!("{}Response", method_to_pascal(&frame.method)),
         FrameKind::Notification => format!("{}Notification", method_to_pascal(&frame.method)),

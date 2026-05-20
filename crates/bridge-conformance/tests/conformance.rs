@@ -8,56 +8,71 @@
 //! Without prereqs (no codex, no pi/claude/opencode/droid CLIs, no API keys) the
 //! suite still passes — each test prints `skipped: <reason>` and exits.
 
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::process::Command as StdCommand;
+use std::sync::LazyLock;
+use std::time::Duration;
 
 use alleycat_bridge_conformance::{
     TargetId, Transcript, cache,
     diff::{self, ConformanceReport, Finding},
+    method_surface::{self, ProbeContext},
     prereq::{self, Prereq, SkipReason},
-    scenario, streaming,
+    scenario, semantics, streaming,
     targets::{self, TargetSpawn},
 };
+use serde_json::json;
+use tokio::sync::Mutex;
+
+static LIVE_TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 #[tokio::test]
 #[ignore = "live conformance — requires `codex` CLI on PATH"]
 async fn conformance_codex() {
+    let _guard = live_test_guard().await;
     run_target(TargetId::Codex).await;
 }
 
 #[tokio::test]
 #[ignore = "live conformance — requires pi-coding-agent on PATH"]
 async fn conformance_pi() {
+    let _guard = live_test_guard().await;
     run_target(TargetId::Pi).await;
 }
 
 #[tokio::test]
 #[ignore = "live conformance — requires `amp` CLI"]
 async fn conformance_amp() {
+    let _guard = live_test_guard().await;
     run_target(TargetId::Amp).await;
 }
 
 #[tokio::test]
 #[ignore = "live conformance — requires `claude` CLI on PATH"]
 async fn conformance_claude() {
+    let _guard = live_test_guard().await;
     run_target(TargetId::Claude).await;
 }
 
 #[tokio::test]
 #[ignore = "live conformance — requires `opencode` CLI"]
 async fn conformance_opencode() {
+    let _guard = live_test_guard().await;
     run_target(TargetId::Opencode).await;
 }
 
 #[tokio::test]
 #[ignore = "live conformance — requires `droid` CLI"]
 async fn conformance_droid() {
+    let _guard = live_test_guard().await;
     run_target(TargetId::Droid).await;
 }
 
 #[tokio::test]
 #[ignore = "live conformance — requires `hermes` CLI or gateway"]
 async fn conformance_hermes() {
+    let _guard = live_test_guard().await;
     run_target(TargetId::Hermes).await;
 }
 
@@ -65,6 +80,7 @@ async fn conformance_hermes() {
 // Temporarily un-ignored to test real Grok ACP
 // #[ignore = "live conformance — requires ACP agent (e.g. `devin` or `grok`) on PATH"]
 async fn conformance_acp() {
+    let _guard = live_test_guard().await;
     run_target(TargetId::Acp).await;
 }
 
@@ -75,6 +91,7 @@ async fn conformance_acp() {
 #[tokio::test]
 #[ignore = "live conformance — runs all targets and diffs them"]
 async fn conformance_diff_all_against_codex() {
+    let _guard = live_test_guard().await;
     let codex_transcript = match drive_fresh(TargetId::Codex).await {
         DriveOutcome::Ran(t) => t,
         DriveOutcome::Skipped(reason) => {
@@ -89,8 +106,21 @@ async fn conformance_diff_all_against_codex() {
         "conformance_diff: codex captured {} frames",
         codex_transcript.frames.len()
     );
+    let codex_findings = standalone_findings(&codex_transcript);
+    if !codex_findings.is_empty() {
+        let report = ConformanceReport {
+            target: TargetId::Codex,
+            findings: codex_findings,
+        };
+        panic!(
+            "{} method(s) failed: {}\n{report}",
+            failed_methods(&report).len(),
+            failed_methods_csv(&report)
+        );
+    }
 
     let mut had_findings = false;
+    let mut matrix: Vec<(TargetId, BTreeSet<String>)> = Vec::new();
     for target in [
         TargetId::Pi,
         TargetId::Amp,
@@ -106,11 +136,14 @@ async fn conformance_diff_all_against_codex() {
                     "conformance_diff: {target} captured {} frames",
                     t.frames.len()
                 );
-                let report = diff::compare(&codex_transcript, &t);
+                let mut report = diff::compare(&codex_transcript, &t);
+                report.findings.extend(runtime_findings(&t));
                 if !report.is_clean() {
                     had_findings = true;
+                    matrix.push((target, failed_methods(&report)));
                     eprintln!("{report}");
                 } else {
+                    matrix.push((target, BTreeSet::new()));
                     eprintln!("conformance_diff: {target} clean");
                 }
             }
@@ -119,14 +152,67 @@ async fn conformance_diff_all_against_codex() {
             }
             DriveOutcome::Failed(err) => {
                 eprintln!("conformance_diff: {target} target failed: {err:#}");
+                matrix.push((target, BTreeSet::from(["<target failed>".to_string()])));
                 had_findings = true;
             }
+        }
+    }
+    eprintln!("conformance_diff method matrix:");
+    for (target, methods) in matrix {
+        if methods.is_empty() {
+            eprintln!("  {target}: PASS");
+        } else {
+            eprintln!(
+                "  {target}: FAIL({}) {}",
+                methods.len(),
+                methods.into_iter().collect::<Vec<_>>().join(", ")
+            );
         }
     }
     assert!(
         !had_findings,
         "one or more bridges diverged from codex (see findings above)"
     );
+}
+
+#[tokio::test]
+#[ignore = "live conformance — probes every standard method on every bridge"]
+async fn method_surface_runtime() {
+    let _guard = live_test_guard().await;
+    let mut had_findings = false;
+    for target in [
+        TargetId::Pi,
+        TargetId::Amp,
+        TargetId::Claude,
+        TargetId::Opencode,
+        TargetId::Droid,
+        TargetId::Hermes,
+        TargetId::Acp,
+    ] {
+        match probe_method_surface(target).await {
+            DriveOutcome::Ran(t) => {
+                let findings: Vec<Finding> = t
+                    .responses()
+                    .filter_map(|frame| method_surface::assert_method_response(frame, target))
+                    .collect();
+                if findings.is_empty() {
+                    eprintln!("method_surface_runtime: {target} clean");
+                } else {
+                    had_findings = true;
+                    let report = ConformanceReport { target, findings };
+                    eprintln!("{report}");
+                }
+            }
+            DriveOutcome::Skipped(reason) => {
+                eprintln!("method_surface_runtime: {target} skipped: {reason}");
+            }
+            DriveOutcome::Failed(err) => {
+                had_findings = true;
+                eprintln!("method_surface_runtime: {target} failed: {err:#}");
+            }
+        }
+    }
+    assert!(!had_findings, "runtime method-surface findings above");
 }
 
 // ============================================================================
@@ -139,15 +225,22 @@ enum DriveOutcome {
     Failed(anyhow::Error),
 }
 
+async fn live_test_guard() -> tokio::sync::MutexGuard<'static, ()> {
+    LIVE_TEST_LOCK.lock().await
+}
+
 async fn run_target(target: TargetId) {
     match drive(target).await {
         DriveOutcome::Ran(t) => {
             eprintln!("conformance({target}): {} frames", t.frames.len());
-            let mut findings = diff::schema_only(&t);
-            findings.extend(streaming::check(&t));
+            let findings = standalone_findings(&t);
             if !findings.is_empty() {
                 let report = ConformanceReport { target, findings };
-                panic!("schema/streaming findings:\n{report}");
+                panic!(
+                    "{} method(s) failed: {}\n{report}",
+                    failed_methods(&report).len(),
+                    failed_methods_csv(&report)
+                );
             }
         }
         DriveOutcome::Skipped(reason) => {
@@ -192,12 +285,264 @@ async fn drive_with_options(
         Ok(t) => t,
         Err(err) => return DriveOutcome::Failed(err),
     };
+    if let Some(id) = transcript.disposable_thread_id.clone() {
+        scenario::cleanup_disposable_thread(
+            &mut handle.client,
+            &id,
+            cfg.default_deadline,
+            cfg.post_request_idle,
+        )
+        .await;
+    }
     if let Some(dir) = std::env::var_os("BRIDGE_CONFORMANCE_DUMP_DIR") {
         if let Err(err) = dump_transcript(std::path::Path::new(&dir), &transcript) {
             eprintln!("conformance({target}): dump failed: {err:#}");
         }
     }
     DriveOutcome::Ran(transcript)
+}
+
+fn standalone_findings(transcript: &Transcript) -> Vec<Finding> {
+    let mut findings = diff::schema_only(transcript);
+    findings.extend(runtime_findings(transcript));
+    findings
+}
+
+fn runtime_findings(transcript: &Transcript) -> Vec<Finding> {
+    let mut findings = streaming::check(transcript);
+    findings.extend(semantics::check_all(transcript));
+    findings
+}
+
+fn failed_methods(report: &ConformanceReport) -> BTreeSet<String> {
+    report
+        .findings
+        .iter()
+        .map(|finding| finding.method().to_string())
+        .collect()
+}
+
+fn failed_methods_csv(report: &ConformanceReport) -> String {
+    failed_methods(report)
+        .into_iter()
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+async fn probe_method_surface(target: TargetId) -> DriveOutcome {
+    let prereq = match prereq::check(target).await {
+        Ok(p) => p,
+        Err(SkipReason::Reason(s)) => return DriveOutcome::Skipped(s),
+    };
+    let spawn_opts = match build_spawn(target, &prereq, false) {
+        Ok(s) => s,
+        Err(err) => return DriveOutcome::Failed(err),
+    };
+    let mut handle = match targets::spawn(spawn_opts.clone()).await {
+        Ok(h) => h,
+        Err(err) => return DriveOutcome::Failed(err),
+    };
+    let cfg = scenario::ScenarioConfig::for_target(target, spawn_opts.cwd.clone());
+    let mut transcript = Transcript::new(target);
+
+    let init = match handle
+        .client
+        .request(
+            "initialize",
+            json!({
+                "clientInfo": {
+                    "name": format!("alleycat-bridge-conformance/method-surface/{}", target.label()),
+                    "version": env!("CARGO_PKG_VERSION"),
+                },
+                "capabilities": { "experimentalApi": true },
+            }),
+            cfg.default_deadline,
+        )
+        .await
+    {
+        Ok(out) => out,
+        Err(err) => return DriveOutcome::Failed(err),
+    };
+    transcript.push(method_surface::response_frame(
+        "initialize",
+        "initialize",
+        init.response,
+    ));
+    let _ = handle.client.notify("initialized", None).await;
+
+    let start = match handle
+        .client
+        .request(
+            "thread/start",
+            json!({
+                "cwd": spawn_opts.cwd.to_string_lossy(),
+                "approvalPolicy": "never",
+                "sandbox": "danger-full-access",
+            }),
+            cfg.default_deadline,
+        )
+        .await
+    {
+        Ok(out) => out,
+        Err(err) => return DriveOutcome::Failed(err),
+    };
+    let thread_id = start
+        .response
+        .pointer("/result/thread/id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
+    transcript.push(method_surface::response_frame(
+        "thread/start.probe",
+        "thread/start",
+        start.response,
+    ));
+
+    let mut ctx = ProbeContext {
+        thread_id,
+        turn_id: None,
+        cwd: Some(spawn_opts.cwd.to_string_lossy().to_string()),
+        process_id: None,
+    };
+    let probe_deadline = Duration::from_secs(5);
+    if let Some(thread_id) = ctx.thread_id.as_deref() {
+        if let Ok(seed) = handle
+            .client
+            .request(
+                "turn/start",
+                json!({
+                    "threadId": thread_id,
+                    "input": [{ "type": "text", "text": "Reply with exactly OK." }],
+                    "approvalPolicy": "never",
+                    "sandbox": "danger-full-access",
+                }),
+                cfg.turn_deadline,
+            )
+            .await
+        {
+            let _ = handle
+                .client
+                .drain_notifications_until(&["turn/completed"], cfg.turn_deadline)
+                .await;
+            ctx.turn_id = seed
+                .response
+                .pointer("/result/turn/id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string);
+        }
+    }
+
+    for method in method_surface::STANDARD_REQUEST_METHODS {
+        if *method == "thread/start" {
+            continue;
+        }
+        if matches!(
+            *method,
+            "command/exec/terminate" | "command/exec/write" | "command/exec/resize"
+        ) && let Err(err) = start_probe_process(&mut handle.client, &mut ctx).await
+        {
+            transcript.push(method_surface::response_frame(
+                method,
+                method,
+                json!({"error":{"code":0,"message":format!("failed to start probe process: {err:#}")}}),
+            ));
+            continue;
+        }
+
+        let params = method_surface::min_params_for_with(method, &ctx);
+        let deadline = if *method == "turn/start" {
+            cfg.turn_deadline
+        } else {
+            probe_deadline
+        };
+        let response = match handle.client.request(method, params, deadline).await {
+            Ok(out) => out.response,
+            Err(err) => json!({"error":{"code":0,"message":err.to_string()}}),
+        };
+        let frame = method_surface::response_frame(method, method, response.clone());
+        transcript.push(frame);
+
+        if *method == "turn/start" {
+            ctx.turn_id = response
+                .pointer("/result/turn/id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string);
+        }
+        if matches!(*method, "command/exec/write" | "command/exec/resize") {
+            cleanup_probe_process(&mut handle.client, &ctx).await;
+        }
+        if *method == "command/exec/terminate" {
+            wait_probe_process(&mut handle.client, &ctx).await;
+        }
+    }
+
+    if let Some(thread_id) = ctx.thread_id.as_deref() {
+        scenario::cleanup_disposable_thread(
+            &mut handle.client,
+            thread_id,
+            cfg.default_deadline,
+            cfg.post_request_idle,
+        )
+        .await;
+    }
+
+    DriveOutcome::Ran(transcript)
+}
+
+async fn start_probe_process(
+    client: &mut alleycat_bridge_conformance::transport::JsonRpcClient,
+    ctx: &mut ProbeContext,
+) -> anyhow::Result<()> {
+    let process_id = format!(
+        "method-surface-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    );
+    ctx.process_id = Some(process_id.clone());
+    client
+        .send_request(
+            "command/exec",
+            json!({
+                "command": ["sh", "-c", "sleep 5"],
+                "processId": process_id,
+                "streamStdin": true,
+                "streamStdoutStderr": true,
+            }),
+        )
+        .await?;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    Ok(())
+}
+
+async fn cleanup_probe_process(
+    client: &mut alleycat_bridge_conformance::transport::JsonRpcClient,
+    ctx: &ProbeContext,
+) {
+    if let Some(process_id) = ctx.process_id.as_deref() {
+        let _ = client
+            .request(
+                "command/exec/terminate",
+                json!({ "processId": process_id }),
+                Duration::from_secs(5),
+            )
+            .await;
+    }
+}
+
+async fn wait_probe_process(
+    client: &mut alleycat_bridge_conformance::transport::JsonRpcClient,
+    ctx: &ProbeContext,
+) {
+    if let Some(process_id) = ctx.process_id.as_deref() {
+        let _ = client
+            .request(
+                "command/exec/terminate",
+                json!({ "processId": process_id }),
+                Duration::from_millis(100),
+            )
+            .await;
+    }
 }
 
 fn dump_transcript(

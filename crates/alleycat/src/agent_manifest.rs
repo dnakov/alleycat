@@ -199,6 +199,22 @@ pub const MANIFESTS: &[AgentManifest] = &[
         supports_thread_permission_overrides: false,
         reports_effective_thread_permissions: false,
     },
+    AgentManifest {
+        name: "shell",
+        display_name: "Shell",
+        wire: AgentWire::Jsonl,
+        title: Some("Shell"),
+        is_beta: true,
+        sort_order: 9,
+        description: Some("PTY-backed host shell."),
+        aliases: &["terminal"],
+        locks_reasoning_effort_after_activity: false,
+        visible_modes: None,
+        supports_ssh_bridge: false,
+        uses_direct_codex_port: false,
+        supports_thread_permission_overrides: false,
+        reports_effective_thread_permissions: false,
+    },
 ];
 
 pub fn manifest_for(name: &str) -> Option<&'static AgentManifest> {

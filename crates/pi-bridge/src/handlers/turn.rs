@@ -615,6 +615,8 @@ fn state_should_emit(state: &Arc<ConnectionState>, notif: &p::ServerNotification
         p::ServerNotification::TurnCompleted(_) => "turn/completed",
         p::ServerNotification::TurnDiffUpdated(_) => "turn/diff/updated",
         p::ServerNotification::TurnPlanUpdated(_) => "turn/plan/updated",
+        p::ServerNotification::HookStarted(_) => "hook/started",
+        p::ServerNotification::HookCompleted(_) => "hook/completed",
         p::ServerNotification::ItemStarted(_) => "item/started",
         p::ServerNotification::ItemCompleted(_) => "item/completed",
         p::ServerNotification::AgentMessageDelta(_) => "item/agentMessage/delta",

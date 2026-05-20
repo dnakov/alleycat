@@ -16,9 +16,11 @@
 
 pub mod cache;
 pub mod diff;
+pub mod method_surface;
 pub mod prereq;
 pub mod scenario;
 pub mod schema;
+pub mod semantics;
 pub mod streaming;
 pub mod targets;
 pub mod transport;
@@ -111,6 +113,8 @@ pub enum FrameKind {
 pub struct Transcript {
     pub target: TargetId,
     pub frames: Vec<Frame>,
+    pub semantic_ctx: Option<semantics::SemanticContext>,
+    pub disposable_thread_id: Option<String>,
 }
 
 impl Transcript {
@@ -118,6 +122,8 @@ impl Transcript {
         Self {
             target,
             frames: Vec::new(),
+            semantic_ctx: None,
+            disposable_thread_id: None,
         }
     }
 

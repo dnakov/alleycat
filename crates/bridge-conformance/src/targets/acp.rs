@@ -19,8 +19,7 @@ pub async fn spawn(opts: TargetSpawn) -> Result<TargetHandle> {
         .ok_or_else(|| anyhow!("acp target requires backend_bin"))?;
 
     // Allow overriding the args for agents that don't use "acp" (e.g. grok uses "agent stdio").
-    let agent_args = std::env::var("ACP_BRIDGE_AGENT_ARGS")
-        .unwrap_or_else(|_| "acp".to_string());
+    let agent_args = std::env::var("ACP_BRIDGE_AGENT_ARGS").unwrap_or_else(|_| "acp".to_string());
 
     let mut child = Command::new(&bridge_bin)
         .env("ACP_BRIDGE_AGENT_BIN", &agent_bin)

@@ -1555,7 +1555,7 @@ impl AmpTurnTranslator {
                 } else {
                     p::DynamicToolCallStatus::Completed
                 },
-                Some(vec![json!({"type": "text", "text": content})]),
+                Some(vec![json!({"type": "inputText", "text": content})]),
                 Some(!is_error),
             );
             self.items.push(item.clone());
@@ -1592,7 +1592,7 @@ impl AmpTurnTranslator {
                 pending.input,
                 p::DynamicToolCallStatus::Failed,
                 Some(vec![
-                    json!({"type": "text", "text": "amp result arrived before tool result"}),
+                    json!({"type": "inputText", "text": "amp result arrived before tool result"}),
                 ]),
                 Some(false),
             );
@@ -2005,11 +2005,7 @@ fn amp_mode_description(mode: &str) -> &'static str {
 
 fn supported_amp_reasoning_efforts(mode: &str) -> impl Iterator<Item = p::ReasoningEffort> {
     match mode {
-        "smart" => vec![
-            p::ReasoningEffort::High,
-            p::ReasoningEffort::XHigh,
-            p::ReasoningEffort::Max,
-        ],
+        "smart" => vec![p::ReasoningEffort::High, p::ReasoningEffort::XHigh],
         "deep" => vec![
             p::ReasoningEffort::Low,
             p::ReasoningEffort::Medium,

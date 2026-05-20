@@ -436,19 +436,21 @@ fn handle_message_updated(rc: RouteContext<'_>, props: &Value, thread_id: &str, 
         // pi/claude/codex.
         for reasoning_part_id in rc.state.take_reasoning_parts(message_id) {
             let content = rc.state.take_reasoning_text(&reasoning_part_id);
-            let _ = rc.conn.notifier().send_notification(
-                "item/completed",
-                json!({
-                    "threadId": thread_id,
-                    "turnId": turn_id,
-                    "item": {
-                        "type": "reasoning",
-                        "id": reasoning_part_id,
-                        "summary": [],
-                        "content": if content.is_empty() { vec![] } else { vec![content] },
-                    },
-                }),
-            );
+            if rc.state.mark_part_completed(&reasoning_part_id) {
+                let _ = rc.conn.notifier().send_notification(
+                    "item/completed",
+                    json!({
+                        "threadId": thread_id,
+                        "turnId": turn_id,
+                        "item": {
+                            "type": "reasoning",
+                            "id": reasoning_part_id,
+                            "summary": [],
+                            "content": if content.is_empty() { vec![] } else { vec![content] },
+                        },
+                    }),
+                );
+            }
             rc.state.forget_part(&reasoning_part_id);
         }
         let text = rc.state.take_message_text(message_id);
@@ -484,34 +486,17 @@ async fn emit_idle_message_fallback(
     let Some(session_id) = active.session_id.as_deref() else {
         return;
     };
-    let Ok(messages) = rc
-        .client
-        .get(&format!("/session/{session_id}/message"))
-        .await
+    let Some(message) = latest_completed_assistant_message(rc.client, session_id).await else {
+        return;
+    };
+    let Some(message_id) = message
+        .pointer("/info/id")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
     else {
         return;
     };
-    let Some(messages) = messages.as_array() else {
-        return;
-    };
-    let Some(message) = messages.iter().rev().find(|message| {
-        message
-            .pointer("/info/role")
-            .and_then(Value::as_str)
-            .is_some_and(|role| role == "assistant")
-            && message
-                .pointer("/info/time/completed")
-                .and_then(Value::as_i64)
-                .is_some()
-    }) else {
-        return;
-    };
-    let Some(message_id) = message.pointer("/info/id").and_then(Value::as_str) else {
-        return;
-    };
-    if rc.state.message_completed(message_id) {
-        return;
-    }
+    let agent_message_completed = rc.state.message_completed(&message_id);
     let binding_cwd = rc
         .index
         .by_thread(thread_id)
@@ -521,15 +506,63 @@ async fn emit_idle_message_fallback(
         sender_thread_id: Some(thread_id),
         include_side_channel_items: false,
     };
-    for item in message_to_turn_items_with_context(message, tool_context) {
-        if item.get("type").and_then(Value::as_str) != Some("agentMessage") {
-            continue;
+    let mut items = message_to_turn_items_with_context(&message, tool_context);
+    if !fallback_items_ready(&items) {
+        for _ in 0..12 {
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            let Some(next_message) =
+                latest_completed_assistant_message(rc.client, session_id).await
+            else {
+                continue;
+            };
+            if next_message.pointer("/info/id").and_then(Value::as_str) != Some(message_id.as_str())
+            {
+                continue;
+            }
+            let next_items = message_to_turn_items_with_context(&next_message, tool_context);
+            let ready = fallback_items_ready(&next_items);
+            items = next_items;
+            if ready {
+                break;
+            }
         }
+    }
+
+    for item in items {
+        let item_type = item.get("type").and_then(Value::as_str);
         let item_id = item
             .get("id")
             .and_then(Value::as_str)
-            .unwrap_or(message_id)
+            .unwrap_or(message_id.as_str())
             .to_string();
+
+        if item_type != Some("agentMessage") {
+            if rc.state.mark_part_completed(&item_id) {
+                if rc.state.mark_part_started(&item_id) {
+                    let _ = rc.conn.notifier().send_notification(
+                        "item/started",
+                        json!({
+                            "threadId": thread_id,
+                            "turnId": turn_id,
+                            "item": item.clone(),
+                        }),
+                    );
+                }
+                let _ = rc.conn.notifier().send_notification(
+                    "item/completed",
+                    json!({
+                        "threadId": thread_id,
+                        "turnId": turn_id,
+                        "item": item,
+                    }),
+                );
+                rc.state.forget_part(&item_id);
+            }
+            continue;
+        }
+        if agent_message_completed {
+            continue;
+        }
         let text = item
             .get("text")
             .and_then(Value::as_str)
@@ -571,6 +604,65 @@ async fn emit_idle_message_fallback(
             }),
         );
         rc.state.mark_message_completed(&item_id);
+    }
+}
+
+async fn latest_completed_assistant_message(
+    client: &OpencodeClient,
+    session_id: &str,
+) -> Option<Value> {
+    let messages = client
+        .get(&format!("/session/{session_id}/message"))
+        .await
+        .ok()?;
+    messages.as_array()?.iter().rev().find_map(|message| {
+        let role = message.pointer("/info/role").and_then(Value::as_str)?;
+        if role != "assistant" {
+            return None;
+        }
+        message
+            .pointer("/info/time/completed")
+            .and_then(Value::as_i64)?;
+        Some(message.clone())
+    })
+}
+
+fn contains_live_tool_item(items: &[Value]) -> bool {
+    items.iter().any(|item| {
+        matches!(
+            item.get("type").and_then(Value::as_str),
+            Some(
+                "commandExecution"
+                    | "fileChange"
+                    | "mcpToolCall"
+                    | "dynamicToolCall"
+                    | "webSearch"
+                    | "collabAgentToolCall"
+            )
+        )
+    })
+}
+
+fn fallback_items_ready(items: &[Value]) -> bool {
+    let has_agent_message = items
+        .iter()
+        .any(|item| item.get("type").and_then(Value::as_str) == Some("agentMessage"));
+    has_agent_message && (!mentions_tool_activity(items) || contains_live_tool_item(items))
+}
+
+fn mentions_tool_activity(items: &[Value]) -> bool {
+    items.iter().any(value_mentions_tool_activity)
+}
+
+fn value_mentions_tool_activity(value: &Value) -> bool {
+    match value {
+        Value::String(text) => {
+            let text = text.to_ascii_lowercase();
+            text.contains("command") || text.contains("shell") || text.contains("tool")
+        }
+        Value::Array(items) => items.iter().any(value_mentions_tool_activity),
+        Value::Object(map) => map.values().any(value_mentions_tool_activity),
+        _ => false,
     }
 }
 
@@ -646,7 +738,8 @@ fn handle_message_part_updated(
     }
 
     if tool_part_status_is_terminal(part) {
-        if let Some(item) = tool_part_to_item_with_context(part, tool_context) {
+        let first_completion = rc.state.mark_part_completed(part_id);
+        if first_completion && let Some(item) = tool_part_to_item_with_context(part, tool_context) {
             let _ = rc.conn.notifier().send_notification(
                 "item/completed",
                 json!({
@@ -659,8 +752,10 @@ fn handle_message_part_updated(
         // Side-channel notifications (currently `turn/plan/updated` for
         // todowrite). Fires alongside the canonical item — or in place of
         // it for tools that return `None` from tool_part_to_item.
-        for (method, params) in tool_part_side_notifications(part, thread_id, turn_id) {
-            let _ = rc.conn.notifier().send_notification(method, params);
+        if first_completion {
+            for (method, params) in tool_part_side_notifications(part, thread_id, turn_id) {
+                let _ = rc.conn.notifier().send_notification(method, params);
+            }
         }
         rc.state.forget_part(part_id);
     }

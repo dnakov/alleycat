@@ -425,30 +425,34 @@ pub async fn handle_thread_list(
                 .iter()
                 .filter_map(|session| {
                     let session_id = session.get("sessionId").and_then(|v| v.as_str())?;
-                    let title = session
+                    let name = session
                         .get("title")
                         .and_then(|v| v.as_str())
                         .unwrap_or(&format!("Session {}", session_id))
                         .to_string();
-                    let created_at = session
-                        .get("createdAt")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or(&chrono::Utc::now().to_rfc3339())
-                        .to_string();
-                    let updated_at = session
-                        .get("updatedAt")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or(&chrono::Utc::now().to_rfc3339())
-                        .to_string();
+                    let created_at = timestamp_ms(session.get("createdAt"));
+                    let updated_at = timestamp_ms(session.get("updatedAt"));
 
                     Some(json!({
                         "id": session_id,
-                        "title": title,
+                        "sessionId": session_id,
+                        "forkedFromId": null,
+                        "preview": name,
+                        "ephemeral": false,
+                        "modelProvider": "acp",
                         "createdAt": created_at,
                         "updatedAt": updated_at,
-                        "archived": false,
+                        "status": { "type": "idle" },
+                        "path": "",
+                        "cwd": "",
+                        "cliVersion": "",
+                        "source": "appServer",
+                        "threadSource": null,
                         "agentNickname": null,
                         "agentRole": null,
+                        "gitInfo": null,
+                        "name": name,
+                        "turns": [],
                     }))
                 })
                 .collect();
@@ -468,6 +472,18 @@ pub async fn handle_thread_list(
             }))
         }
     }
+}
+
+fn timestamp_ms(value: Option<&Value>) -> i64 {
+    if let Some(ms) = value.and_then(Value::as_i64) {
+        return ms;
+    }
+    if let Some(text) = value.and_then(Value::as_str)
+        && let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(text)
+    {
+        return parsed.timestamp_millis();
+    }
+    chrono::Utc::now().timestamp_millis()
 }
 
 /// Handle thread/resume request.

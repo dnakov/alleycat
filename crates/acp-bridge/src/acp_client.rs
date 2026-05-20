@@ -4,8 +4,12 @@
 //!
 //! * One background reader task owns the agent's stdout for the
 //!   lifetime of the client and demuxes every line:
-//!   * Frames with an `id` are matched to the currently-outstanding
-//!     `send_request` and delivered through a `oneshot::Sender<Value>`.
+//!   * Frames with an `id` and no `method` are matched to the
+//!     currently-outstanding `send_request` and delivered through a
+//!     `oneshot::Sender<Value>`.
+//!   * Frames with both `id` and `method` are agent→client JSON-RPC
+//!     requests (permissions, filesystem, terminal) and are answered by
+//!     the reader task.
 //!   * Frames without an `id` (JSON-RPC notifications) fire the
 //!     currently-registered notification subscriber if any, and are
 //!     also pushed onto a fallback buffer so callers using
@@ -27,13 +31,15 @@
 
 use std::collections::HashMap;
 use std::ffi::OsString;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use alleycat_bridge_core::{ChildProcess, ProcessLauncher, ProcessRole, ProcessSpec, StdioMode};
 use anyhow::Result;
-use serde_json::Value;
+use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::process::Command;
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tracing::{debug, error, info, warn};
 
@@ -59,6 +65,7 @@ struct Inner {
     /// is registered. Callers that *only* want streaming should drain
     /// this once after their request to discard the duplicates.
     pending_notifications: Mutex<Vec<Value>>,
+    terminals: Mutex<HashMap<String, TerminalRecord>>,
 }
 
 impl Inner {
@@ -67,6 +74,7 @@ impl Inner {
             pending: Mutex::new(HashMap::new()),
             notification_tx: Mutex::new(None),
             pending_notifications: Mutex::new(Vec::new()),
+            terminals: Mutex::new(HashMap::new()),
         }
     }
 
@@ -153,14 +161,16 @@ impl AcpClient {
             .ok_or_else(|| anyhow::anyhow!("ACP agent has no stdout pipe"))?;
 
         let inner = Arc::new(Inner::new());
+        let stdin = Arc::new(Mutex::new(stdin));
         let reader_inner = Arc::clone(&inner);
+        let reader_stdin = Arc::clone(&stdin);
         let handle = tokio::spawn(async move {
-            reader_task(BufReader::new(stdout), reader_inner).await;
+            reader_task(BufReader::new(stdout), reader_inner, reader_stdin).await;
         });
 
         Ok(Self {
             process: Arc::new(Mutex::new(process)),
-            stdin: Arc::new(Mutex::new(stdin)),
+            stdin,
             inner,
             request_lock: Arc::new(Mutex::new(())),
             reader_handle: Arc::new(Mutex::new(Some(handle))),
@@ -330,7 +340,11 @@ impl AcpClient {
 
 /// Background loop: read newline-delimited JSON frames from the agent
 /// and dispatch each one through `Inner`.
-async fn reader_task(mut reader: BufReader<alleycat_bridge_core::ChildStdout>, inner: Arc<Inner>) {
+async fn reader_task(
+    mut reader: BufReader<alleycat_bridge_core::ChildStdout>,
+    inner: Arc<Inner>,
+    stdin: Arc<Mutex<alleycat_bridge_core::ChildStdin>>,
+) {
     loop {
         let mut line = String::new();
         let n = match reader.read_line(&mut line).await {
@@ -349,7 +363,13 @@ async fn reader_task(mut reader: BufReader<alleycat_bridge_core::ChildStdout>, i
             continue;
         }
         match serde_json::from_str::<Value>(trimmed) {
-            Ok(frame) => inner.dispatch(frame).await,
+            Ok(frame) => {
+                if frame.get("id").is_some() && frame.get("method").is_some() {
+                    respond_to_agent_request(&inner, &stdin, frame).await;
+                } else {
+                    inner.dispatch(frame).await;
+                }
+            }
             Err(err) => {
                 warn!(
                     ?err,
@@ -369,4 +389,348 @@ async fn reader_task(mut reader: BufReader<alleycat_bridge_core::ChildStdout>, i
             "error": {"code": -32000, "message": "ACP agent connection closed"},
         }));
     }
+}
+
+#[derive(Debug, Clone)]
+struct TerminalRecord {
+    output: String,
+    truncated: bool,
+    exit_code: Option<i64>,
+    signal: Option<String>,
+}
+
+async fn respond_to_agent_request(
+    inner: &Arc<Inner>,
+    stdin: &Arc<Mutex<alleycat_bridge_core::ChildStdin>>,
+    frame: Value,
+) {
+    let id = frame.get("id").cloned().unwrap_or(Value::Null);
+    let method = frame
+        .get("method")
+        .and_then(Value::as_str)
+        .unwrap_or("<missing>");
+    let params = frame.get("params").cloned().unwrap_or_else(|| json!({}));
+    let response = match handle_agent_request(inner, method, params).await {
+        Ok(result) => json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": result,
+        }),
+        Err(message) => json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "error": {
+                "code": -32603,
+                "message": message,
+            },
+        }),
+    };
+    let line = match serde_json::to_string(&response) {
+        Ok(line) => line,
+        Err(err) => {
+            warn!(?err, "failed to serialize ACP client response");
+            return;
+        }
+    };
+    let mut writer = stdin.lock().await;
+    if let Err(err) = writer.write_all(line.as_bytes()).await {
+        warn!(?err, method, "failed to write ACP client response");
+        return;
+    }
+    if let Err(err) = writer.write_all(b"\n").await {
+        warn!(?err, method, "failed to terminate ACP client response");
+        return;
+    }
+    if let Err(err) = writer.flush().await {
+        warn!(?err, method, "failed to flush ACP client response");
+    }
+}
+
+async fn handle_agent_request(
+    inner: &Arc<Inner>,
+    method: &str,
+    params: Value,
+) -> std::result::Result<Value, String> {
+    match method {
+        "session/request_permission" => Ok(handle_permission_request(&params)),
+        "fs/read_text_file" => handle_fs_read_text_file(&params).await,
+        "fs/write_text_file" => handle_fs_write_text_file(&params).await,
+        "fs/file_exists" => Ok(json!(
+            path_from_params(&params).is_some_and(|p| p.is_file())
+        )),
+        "fs/list_directory" => handle_fs_list_directory(&params).await,
+        "fs/create_directory" => {
+            let path = required_path(&params)?;
+            tokio::fs::create_dir_all(&path)
+                .await
+                .map_err(|err| format!("create_directory {}: {err}", path.display()))?;
+            Ok(Value::Null)
+        }
+        "fs/delete_file" => {
+            let path = required_path(&params)?;
+            match tokio::fs::remove_file(&path).await {
+                Ok(()) => Ok(Value::Null),
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(Value::Null),
+                Err(err) => Err(format!("delete_file {}: {err}", path.display())),
+            }
+        }
+        "terminal/create" => handle_terminal_create(inner, &params).await,
+        "terminal/output" => handle_terminal_output(inner, &params).await,
+        "terminal/wait_for_exit" => handle_terminal_wait(inner, &params).await,
+        "terminal/release" => handle_terminal_release(inner, &params).await,
+        "terminal/kill" => handle_terminal_kill(inner, &params).await,
+        _ => Err(format!("Unsupported ACP client request method: {method}")),
+    }
+}
+
+fn handle_permission_request(params: &Value) -> Value {
+    let option_id = params
+        .get("options")
+        .and_then(Value::as_array)
+        .and_then(|options| {
+            options
+                .iter()
+                .find(|option| {
+                    matches!(
+                        option.get("kind").and_then(Value::as_str),
+                        Some("allow_once" | "allow_always")
+                    )
+                })
+                .or_else(|| options.first())
+        })
+        .and_then(|option| option.get("optionId").and_then(Value::as_str));
+    match option_id {
+        Some(option_id) => json!({
+            "outcome": {
+                "outcome": "selected",
+                "optionId": option_id,
+            },
+        }),
+        None => json!({
+            "outcome": {
+                "outcome": "cancelled",
+            },
+        }),
+    }
+}
+
+async fn handle_fs_read_text_file(params: &Value) -> std::result::Result<Value, String> {
+    let path = required_path(params)?;
+    let text = tokio::fs::read_to_string(&path)
+        .await
+        .map_err(|err| format!("read_text_file {}: {err}", path.display()))?;
+    let line = params.get("line").and_then(Value::as_u64).unwrap_or(1);
+    let limit = params.get("limit").and_then(Value::as_u64);
+    let content = if line <= 1 && limit.is_none() {
+        text
+    } else {
+        let start = line.saturating_sub(1) as usize;
+        let lines = text.lines().skip(start);
+        let selected: Vec<&str> = match limit {
+            Some(limit) => lines.take(limit as usize).collect(),
+            None => lines.collect(),
+        };
+        if selected.is_empty() {
+            String::new()
+        } else {
+            let mut joined = selected.join("\n");
+            joined.push('\n');
+            joined
+        }
+    };
+    Ok(json!({ "content": content }))
+}
+
+async fn handle_fs_write_text_file(params: &Value) -> std::result::Result<Value, String> {
+    let path = required_path(params)?;
+    let content = params
+        .get("content")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "write_text_file missing content".to_string())?;
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(|err| format!("create parent {}: {err}", parent.display()))?;
+    }
+    tokio::fs::write(&path, content)
+        .await
+        .map_err(|err| format!("write_text_file {}: {err}", path.display()))?;
+    Ok(Value::Null)
+}
+
+async fn handle_fs_list_directory(params: &Value) -> std::result::Result<Value, String> {
+    let path = required_path(params)?;
+    let mut entries = tokio::fs::read_dir(&path)
+        .await
+        .map_err(|err| format!("list_directory {}: {err}", path.display()))?;
+    let mut out = Vec::new();
+    while let Some(entry) = entries
+        .next_entry()
+        .await
+        .map_err(|err| format!("list_directory {}: {err}", path.display()))?
+    {
+        let file_type = entry
+            .file_type()
+            .await
+            .map_err(|err| format!("file_type {}: {err}", entry.path().display()))?;
+        out.push(json!({
+            "name": entry.file_name().to_string_lossy(),
+            "path": entry.path(),
+            "isDirectory": file_type.is_dir(),
+        }));
+    }
+    Ok(Value::Array(out))
+}
+
+async fn handle_terminal_create(
+    inner: &Arc<Inner>,
+    params: &Value,
+) -> std::result::Result<Value, String> {
+    let command = params
+        .get("command")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "terminal/create missing command".to_string())?;
+    let terminal_id = format!("term_{}", REQUEST_ID_COUNTER.fetch_add(1, Ordering::SeqCst));
+    let mut cmd = Command::new(command);
+    if let Some(args) = params.get("args").and_then(Value::as_array) {
+        cmd.args(args.iter().filter_map(Value::as_str));
+    }
+    if let Some(cwd) = params.get("cwd").and_then(Value::as_str) {
+        cmd.current_dir(cwd);
+    }
+    if let Some(env) = params.get("env").and_then(Value::as_array) {
+        for entry in env {
+            if let Some(name) = entry.get("name").and_then(Value::as_str) {
+                let value = entry.get("value").and_then(Value::as_str).unwrap_or("");
+                cmd.env(name, value);
+            }
+        }
+    }
+    let limit = params
+        .get("outputByteLimit")
+        .and_then(Value::as_u64)
+        .unwrap_or(1_048_576) as usize;
+    let record = match cmd.output().await {
+        Ok(output) => {
+            let mut text = String::new();
+            text.push_str(&String::from_utf8_lossy(&output.stdout));
+            text.push_str(&String::from_utf8_lossy(&output.stderr));
+            let truncated = truncate_utf8_tail(&mut text, limit);
+            TerminalRecord {
+                output: text,
+                truncated,
+                exit_code: output.status.code().map(i64::from),
+                signal: None,
+            }
+        }
+        Err(err) => TerminalRecord {
+            output: format!("failed to spawn {command}: {err}"),
+            truncated: false,
+            exit_code: Some(-1),
+            signal: None,
+        },
+    };
+    inner
+        .terminals
+        .lock()
+        .await
+        .insert(terminal_id.clone(), record);
+    Ok(json!({ "terminalId": terminal_id }))
+}
+
+async fn handle_terminal_output(
+    inner: &Arc<Inner>,
+    params: &Value,
+) -> std::result::Result<Value, String> {
+    let record = terminal_record(inner, params).await?;
+    Ok(json!({
+        "output": record.output,
+        "truncated": record.truncated,
+        "exitStatus": {
+            "exitCode": record.exit_code,
+            "signal": record.signal,
+        },
+    }))
+}
+
+async fn handle_terminal_wait(
+    inner: &Arc<Inner>,
+    params: &Value,
+) -> std::result::Result<Value, String> {
+    let record = terminal_record(inner, params).await?;
+    Ok(json!({
+        "exitCode": record.exit_code,
+        "signal": record.signal,
+    }))
+}
+
+async fn handle_terminal_release(
+    inner: &Arc<Inner>,
+    params: &Value,
+) -> std::result::Result<Value, String> {
+    let id = required_terminal_id(params)?;
+    inner.terminals.lock().await.remove(id);
+    Ok(Value::Null)
+}
+
+async fn handle_terminal_kill(
+    inner: &Arc<Inner>,
+    params: &Value,
+) -> std::result::Result<Value, String> {
+    let id = required_terminal_id(params)?;
+    if let Some(record) = inner.terminals.lock().await.get_mut(id) {
+        if record.exit_code.is_none() {
+            record.exit_code = Some(-1);
+            record.signal = Some("killed".to_string());
+        }
+    }
+    Ok(Value::Null)
+}
+
+async fn terminal_record(
+    inner: &Arc<Inner>,
+    params: &Value,
+) -> std::result::Result<TerminalRecord, String> {
+    let id = required_terminal_id(params)?;
+    inner
+        .terminals
+        .lock()
+        .await
+        .get(id)
+        .cloned()
+        .ok_or_else(|| format!("unknown terminalId: {id}"))
+}
+
+fn required_terminal_id(params: &Value) -> std::result::Result<&str, String> {
+    params
+        .get("terminalId")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "missing terminalId".to_string())
+}
+
+fn required_path(params: &Value) -> std::result::Result<PathBuf, String> {
+    path_from_params(params).ok_or_else(|| "missing path".to_string())
+}
+
+fn path_from_params(params: &Value) -> Option<PathBuf> {
+    params
+        .get("path")
+        .and_then(Value::as_str)
+        .map(PathBuf::from)
+}
+
+fn truncate_utf8_tail(text: &mut String, limit: usize) -> bool {
+    if text.len() <= limit {
+        return false;
+    }
+    if limit == 0 {
+        text.clear();
+        return true;
+    }
+    let mut start = text.len() - limit;
+    while !text.is_char_boundary(start) {
+        start += 1;
+    }
+    *text = text[start..].to_string();
+    true
 }

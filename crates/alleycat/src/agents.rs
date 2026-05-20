@@ -20,6 +20,7 @@ use alleycat_grok_bridge::GrokBridge;
 use alleycat_hermes_bridge::{HermesBridge, HermesBridgeConfig};
 use alleycat_opencode_bridge::OpencodeBridge;
 use alleycat_pi_bridge::PiBridge;
+use alleycat_shell_bridge::ShellBridge;
 use anyhow::{Context, anyhow};
 use arc_swap::ArcSwap;
 use serde::Deserialize;
@@ -49,6 +50,7 @@ pub enum AgentKind {
     Hermes,
     Devin,
     Grok,
+    Shell,
 }
 
 /// How the daemon talks to `codex app-server`. Selected at startup by probing
@@ -229,6 +231,15 @@ impl AgentManager {
         .await
         .context("building grok bridge")?;
 
+        let shell_cfg = &snapshot.agents.shell;
+        let mut shell_builder = ShellBridge::builder()
+            .shell_bin(shell_cfg.shell_bin.clone())
+            .allow_env_passthrough(shell_cfg.allow_env_passthrough);
+        if let Some(default_cwd) = shell_cfg.default_cwd.as_ref() {
+            shell_builder = shell_builder.default_cwd(default_cwd);
+        }
+        let shell_bridge = shell_builder.build();
+
         let mut bridges: HashMap<AgentKind, Arc<dyn Bridge>> = HashMap::new();
         bridges.insert(AgentKind::Pi, pi_bridge as Arc<dyn Bridge>);
         bridges.insert(AgentKind::Amp, amp_bridge as Arc<dyn Bridge>);
@@ -236,6 +247,7 @@ impl AgentManager {
         bridges.insert(AgentKind::Droid, droid_bridge as Arc<dyn Bridge>);
         bridges.insert(AgentKind::Devin, devin_bridge);
         bridges.insert(AgentKind::Grok, grok_bridge);
+        bridges.insert(AgentKind::Shell, shell_bridge);
 
         let hermes_cfg = &snapshot.agents.hermes;
         let hermes_bridge_cfg = HermesBridgeConfig {
@@ -318,22 +330,21 @@ impl AgentManager {
     }
 
     pub async fn list_agents(&self) -> Vec<AgentInfo> {
-        // Availability is computed against the same terminal-like launch
-        // environment used for child processes, then each manifest is rendered
-        // to the wire `AgentInfo` shape.
-        let launch_env = self.daemon_launch_env().await;
+        // Availability is computed per-agent (some are async, some not),
+        // then each manifest is rendered to the wire `AgentInfo` shape.
         let mut out = Vec::with_capacity(MANIFESTS.len());
         for manifest in MANIFESTS {
             let available = match manifest.name {
                 "codex" => self.codex_available(),
-                "pi" => self.pi_available(&launch_env),
-                "amp" => self.amp_available(&launch_env),
-                "opencode" => self.opencode_available(&launch_env),
-                "claude" => self.claude_available(&launch_env),
-                "droid" => self.droid_available(&launch_env),
-                "hermes" => self.hermes_available(&launch_env).await,
-                "devin" => self.devin_available(&launch_env),
-                "grok" => self.grok_available(&launch_env),
+                "pi" => self.pi_available(),
+                "amp" => self.amp_available(),
+                "opencode" => self.opencode_available(),
+                "claude" => self.claude_available(),
+                "droid" => self.droid_available(),
+                "hermes" => self.hermes_available().await,
+                "devin" => self.devin_available(),
+                "grok" => self.grok_available(),
+                "shell" => self.shell_available(),
                 _ => false,
             };
             let wire = if manifest.name == "codex" {
@@ -437,6 +448,7 @@ impl AgentManager {
             "hermes" => Some("hermes"),
             "devin" => Some("devin"),
             "grok" => Some("grok"),
+            "shell" => Some("shell"),
             _ => None,
         }
     }
@@ -453,6 +465,7 @@ impl AgentManager {
             "hermes" => cfg.agents.hermes.enabled,
             "devin" => cfg.agents.devin.enabled,
             "grok" => cfg.agents.grok.enabled,
+            "shell" => cfg.agents.shell.enabled,
             _ => false,
         }
     }
@@ -926,48 +939,53 @@ impl AgentManager {
         self.launch_env.resolve(cwd.as_deref()).await
     }
 
-    fn pi_available(&self, env: &LaunchEnvironment) -> bool {
+    fn pi_available(&self) -> bool {
         let cfg = self.config.load();
-        cfg.agents.pi.enabled && resolve_pi_bin_with_env(&cfg.agents.pi.bin, env).is_some()
+        cfg.agents.pi.enabled && resolve_pi_bin(&cfg.agents.pi.bin).is_some()
     }
 
-    fn opencode_available(&self, env: &LaunchEnvironment) -> bool {
+    fn opencode_available(&self) -> bool {
         let cfg = self.config.load();
         cfg.agents.opencode.enabled
-            && (env.contains_key("OPENCODE_BRIDGE_BACKEND_URL")
-                || command_available_in_env(&cfg.agents.opencode.bin, env))
+            && (std::env::var_os("OPENCODE_BRIDGE_BACKEND_URL").is_some()
+                || which::which(&cfg.agents.opencode.bin).is_ok())
     }
 
-    fn amp_available(&self, env: &LaunchEnvironment) -> bool {
+    fn amp_available(&self) -> bool {
         let cfg = self.config.load();
         cfg.agents.amp.enabled
-            && command_available_in_env(&cfg.agents.amp.bin, env)
-            && has_amp_auth(&cfg.agents.amp.api_key_env, env)
+            && which::which(&cfg.agents.amp.bin).is_ok()
+            && has_amp_auth(&cfg.agents.amp.api_key_env)
     }
 
-    fn claude_available(&self, env: &LaunchEnvironment) -> bool {
+    fn claude_available(&self) -> bool {
         let cfg = self.config.load();
-        cfg.agents.claude.enabled && command_available_in_env(&cfg.agents.claude.bin, env)
+        cfg.agents.claude.enabled && which::which(&cfg.agents.claude.bin).is_ok()
     }
 
-    fn droid_available(&self, env: &LaunchEnvironment) -> bool {
+    fn droid_available(&self) -> bool {
         let cfg = self.config.load();
         cfg.agents.droid.enabled
-            && command_available_in_env(&cfg.agents.droid.bin, env)
-            && has_factory_auth(&cfg.agents.droid.api_key_env, env)
+            && which::which(&cfg.agents.droid.bin).is_ok()
+            && has_factory_auth(&cfg.agents.droid.api_key_env)
     }
 
-    fn devin_available(&self, env: &LaunchEnvironment) -> bool {
+    fn devin_available(&self) -> bool {
         let cfg = self.config.load();
-        cfg.agents.devin.enabled && command_available_in_env(&cfg.agents.devin.bin, env)
+        cfg.agents.devin.enabled && which::which(&cfg.agents.devin.bin).is_ok()
     }
 
-    fn grok_available(&self, env: &LaunchEnvironment) -> bool {
+    fn grok_available(&self) -> bool {
         let cfg = self.config.load();
-        cfg.agents.grok.enabled && command_available_in_env(&cfg.agents.grok.bin, env)
+        cfg.agents.grok.enabled && which::which(&cfg.agents.grok.bin).is_ok()
     }
 
-    async fn hermes_available(&self, env: &LaunchEnvironment) -> bool {
+    fn shell_available(&self) -> bool {
+        let cfg = self.config.load();
+        cfg.agents.shell.enabled && which::which(&cfg.agents.shell.shell_bin).is_ok()
+    }
+
+    async fn hermes_available(&self) -> bool {
         let (enabled, bin, api_base) = {
             let cfg = self.config.load();
             (
@@ -976,7 +994,7 @@ impl AgentManager {
                 cfg.agents.hermes.api_base.clone(),
             )
         };
-        enabled && (command_available_in_env(&bin, env) || hermes_api_available(&api_base).await)
+        enabled && (which::which(&bin).is_ok() || hermes_api_available(&api_base).await)
     }
 }
 
@@ -1034,7 +1052,7 @@ async fn detect_codex(bin: &str, env: &LaunchEnvironment) -> CodexDetection {
     let fallback_bin = PathBuf::from(bin);
     let candidates = {
         let mut resolved = Vec::new();
-        if let Some(path) = resolve_bin_with_env(bin, env) {
+        if let Some(path) = env.find_on_path(bin) {
             resolved.push(path);
         }
         resolved.extend(program_candidates(Path::new(bin)));
@@ -1316,49 +1334,23 @@ fn pi_program_aliases() -> [(OsString, Vec<OsString>); 2] {
     ]
 }
 
-/// Resolve the configured pi binary against the same launch environment used
-/// for child processes. If the configured name isn't on PATH, fall back to known
-/// aliases (`pi`, `pi-coding-agent`) so users with stale config or
-/// non-canonical install layouts still get the agent reported as available and
-/// spawn against a binary that actually exists.
-fn resolve_pi_bin_with_env(configured: &str, env: &LaunchEnvironment) -> Option<PathBuf> {
-    resolve_bin_with_env(configured, env).or_else(|| {
-        ["pi", "pi-coding-agent"]
-            .into_iter()
-            .filter(|alias| *alias != configured)
-            .find_map(|alias| resolve_bin_with_env(alias, env))
-    })
-}
-
-fn resolve_bin_with_env(configured: &str, env: &LaunchEnvironment) -> Option<PathBuf> {
-    let path = Path::new(configured);
-    if path.components().count() > 1 {
-        return is_executable_file(path).then(|| path.to_path_buf());
+/// Resolve the configured pi binary. If the configured name
+/// isn't on PATH, fall back to known aliases (`pi`, `pi-coding-agent`) so
+/// users with stale config or non-canonical install layouts still get the
+/// agent reported as available and spawn against a binary that actually
+/// exists. Returns the resolved name (the one that should be invoked).
+fn resolve_pi_bin(configured: &str) -> Option<PathBuf> {
+    if let Some(path) = which::which(configured).ok() {
+        return Some(path);
     }
-    env.find_on_path(configured)
-}
-
-fn command_available_in_env(configured: &str, env: &LaunchEnvironment) -> bool {
-    resolve_bin_with_env(configured, env).is_some()
-}
-
-fn is_executable_file(path: &Path) -> bool {
-    if !path.is_file() {
-        return false;
+    for alias in ["pi", "pi-coding-agent"] {
+        if alias != configured
+            && let Some(path) = which::which(alias).ok()
+        {
+            return Some(path);
+        }
     }
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        path.metadata()
-            .map(|metadata| metadata.permissions().mode() & 0o111 != 0)
-            .unwrap_or(false)
-    }
-
-    #[cfg(not(unix))]
-    {
-        true
-    }
+    None
 }
 
 fn agent_kind_from_str(name: &str) -> Option<AgentKind> {
@@ -1371,6 +1363,7 @@ fn agent_kind_from_str(name: &str) -> Option<AgentKind> {
         "hermes" => Some(AgentKind::Hermes),
         "devin" => Some(AgentKind::Devin),
         "grok" => Some(AgentKind::Grok),
+        "shell" => Some(AgentKind::Shell),
         _ => None,
     }
 }
@@ -1385,6 +1378,7 @@ fn agent_kind_str(kind: AgentKind) -> &'static str {
         AgentKind::Hermes => "hermes",
         AgentKind::Devin => "devin",
         AgentKind::Grok => "grok",
+        AgentKind::Shell => "shell",
     }
 }
 
@@ -1399,15 +1393,16 @@ impl crate::config::AgentsConfig {
             AgentKind::Hermes => self.hermes.enabled,
             AgentKind::Devin => self.devin.enabled,
             AgentKind::Grok => self.grok.enabled,
+            AgentKind::Shell => self.shell.enabled,
         }
     }
 }
 
-fn has_factory_auth(api_key_env: &str, env: &LaunchEnvironment) -> bool {
-    if env.contains_key(api_key_env) {
+fn has_factory_auth(api_key_env: &str) -> bool {
+    if std::env::var_os(api_key_env).is_some() {
         return true;
     }
-    let Some(home) = env.get("HOME") else {
+    let Some(home) = std::env::var_os("HOME") else {
         return false;
     };
     PathBuf::from(home)
@@ -1415,16 +1410,15 @@ fn has_factory_auth(api_key_env: &str, env: &LaunchEnvironment) -> bool {
         .is_file()
 }
 
-fn has_amp_auth(api_key_env: &str, env: &LaunchEnvironment) -> bool {
-    if env.contains_key(api_key_env) {
+fn has_amp_auth(api_key_env: &str) -> bool {
+    if std::env::var_os(api_key_env).is_some() {
         return true;
     }
-    let Some(home) = env.get("HOME") else {
+    let Some(home) = std::env::var_os("HOME") else {
         return false;
     };
     let home = PathBuf::from(home);
-    let data_home = env
-        .get("XDG_DATA_HOME")
+    let data_home = std::env::var_os("XDG_DATA_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| home.join(".local/share"));
     data_home.join("amp/secrets.json").is_file() || home.join(".amp/oauth").is_dir()

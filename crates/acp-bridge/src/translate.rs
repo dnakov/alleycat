@@ -29,20 +29,24 @@ pub fn codex_to_acp_initialize(codex_params: &Value) -> Result<Value, anyhow::Er
 
 /// Translate ACP InitializeResponse to Codex InitializeResult.
 pub fn acp_to_codex_initialize_result(acp_response: &Value) -> Result<Value, anyhow::Error> {
+    let agent_name = acp_response
+        .get("agentInfo")
+        .and_then(|v| v.get("name"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("ACP Agent");
+    let agent_version = acp_response
+        .get("agentInfo")
+        .and_then(|v| v.get("version"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("1.0.0");
+    let codex_home = std::env::var("HOME")
+        .map(|home| format!("{home}/.alleycat-acp-bridge"))
+        .unwrap_or_else(|_| "/tmp/alleycat-acp-bridge".to_string());
     let codex_result = serde_json::json!({
-        "capabilities": {
-            "experimentalApi": false,
-        },
-        "serverInfo": {
-            "name": acp_response.get("agentInfo")
-                .and_then(|v| v.get("name"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("ACP Agent"),
-            "version": acp_response.get("agentInfo")
-                .and_then(|v| v.get("version"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("1.0.0"),
-        },
+        "userAgent": format!("alleycat-acp-bridge/{} ({agent_name} {agent_version})", env!("CARGO_PKG_VERSION")),
+        "codexHome": codex_home,
+        "platformFamily": std::env::consts::FAMILY,
+        "platformOs": std::env::consts::OS,
     });
     Ok(codex_result)
 }

@@ -18,7 +18,8 @@ use anyhow::{Context, Result};
 use serde_json::{Value, json};
 
 use crate::cache;
-use crate::transport::JsonRpcClient;
+use crate::semantics::SemanticContext;
+use crate::transport::{DrainOutcome, JsonRpcClient};
 use crate::{Frame, FrameKind, TargetId, Transcript};
 
 /// Configuration knobs each runner can tune.
@@ -48,26 +49,48 @@ pub struct ScenarioConfig {
     pub client_name: String,
     /// Client-info version advertised on `initialize`.
     pub client_version: String,
+    /// Optional model override threaded into model-bearing methods for
+    /// backends whose configured default is not a reliable live target.
+    pub model: Option<String>,
     /// Whether the scenario should reuse the per-target cached conformance
     /// thread id. Aggregate shape diffs disable this so every target executes
     /// the same attach method (`thread/start`) instead of comparing a cached
     /// `thread/resume` on one implementation with a fresh start on another.
     pub reuse_thread_cache: bool,
+    /// Whether to exercise destructive/mutating APIs against a disposable
+    /// thread. Defaults on; set `BRIDGE_CONFORMANCE_SKIP_MUTATIONS=1` to
+    /// temporarily narrow a live run.
+    pub exercise_mutations: bool,
 }
 
 impl ScenarioConfig {
     pub fn for_target(target: TargetId, cwd: PathBuf) -> Self {
+        let turn_deadline = match target {
+            TargetId::Acp => Duration::from_secs(180),
+            _ => Duration::from_secs(60),
+        };
         Self {
             cwd,
             default_deadline: Duration::from_secs(20),
-            turn_deadline: Duration::from_secs(60),
+            turn_deadline,
             post_request_idle: Duration::from_millis(150),
             prompt: "Reply with exactly the word OK and nothing else.".to_string(),
             tool_prompt: String::new(), // populated per-run by `run` so the
             // marker token is unique each time.
             client_name: format!("alleycat-bridge-conformance/{}", target.label()),
             client_version: env!("CARGO_PKG_VERSION").to_string(),
-            reuse_thread_cache: true,
+            model: match target {
+                TargetId::Opencode => std::env::var("BRIDGE_CONFORMANCE_OPENCODE_MODEL")
+                    .ok()
+                    .filter(|value| !value.trim().is_empty())
+                    .or_else(|| Some("xai/grok-4.3".to_string())),
+                _ => None,
+            },
+            reuse_thread_cache: !matches!(target, TargetId::Acp),
+            exercise_mutations: std::env::var("BRIDGE_CONFORMANCE_SKIP_MUTATIONS")
+                .ok()
+                .as_deref()
+                != Some("1"),
         }
     }
 }
@@ -100,18 +123,20 @@ pub async fn run(
     // and skip the tool call entirely, which means we never get to compare
     // the CommandExecution wire shape across bridges.
     let marker_token = fresh_marker();
-    let marker_path = cfg.cwd.join("conformance-marker.txt");
+    let marker_path = cfg.cwd.join(format!("{marker_token}.txt"));
     if let Err(err) = std::fs::write(&marker_path, &marker_token) {
         tracing::warn!(?err, path = %marker_path.display(), "failed to write marker file");
     }
     let tool_prompt = if cfg.tool_prompt.is_empty() {
         format!(
-            "Use a shell command to read the file `conformance-marker.txt` in the current working directory and report the literal contents. The file exists; you must run the command (e.g. `cat conformance-marker.txt`). Do not guess or skip the tool — the contents are random and unguessable."
+            "Use a shell command to read the file `{}` and report the literal contents. The file exists; you must run the command (for example, `cat {}`). Do not guess or skip the tool; the contents are random and unguessable.",
+            marker_path.display(),
+            marker_path.display(),
         )
     } else {
         cfg.tool_prompt.clone()
     };
-    let _ = &marker_token; // returned via the file; not directly compared
+    let mut semantic_ctx = SemanticContext::new(marker_token.clone(), cfg.prompt.clone());
 
     // Step 1: initialize ----------------------------------------------------
     let init = client
@@ -180,11 +205,14 @@ pub async fn run(
     // approvalPolicy=never + sandbox=danger-full-access so the second turn's
     // shell tool call runs without bouncing a server→client permission
     // prompt the harness has no way to answer.
-    let thread_start_params = json!({
-        "cwd": cfg.cwd.to_string_lossy(),
-        "approvalPolicy": "never",
-        "sandbox": "danger-full-access",
-    });
+    let thread_start_params = with_model(
+        json!({
+            "cwd": cfg.cwd.to_string_lossy(),
+            "approvalPolicy": "never",
+            "sandbox": "danger-full-access",
+        }),
+        cfg,
+    );
 
     // Label the captured frame with the method we actually call, so the
     // diff layer compares "codex thread/resume" to "bridge thread/resume"
@@ -257,9 +285,11 @@ pub async fn run(
         Some(id) => id,
         None => {
             tracing::warn!(target = %target, "thread attach did not return thread.id; aborting scenario");
+            t.semantic_ctx = Some(semantic_ctx);
             return Ok(t);
         }
     };
+    semantic_ctx.thread_id = Some(thread_id.clone());
     if cfg.reuse_thread_cache && cached_id.as_deref() != Some(thread_id.as_str()) {
         if let Err(err) = cache::save_thread_id(target, &thread_id) {
             tracing::warn!(?err, "failed to persist conformance thread id");
@@ -270,23 +300,30 @@ pub async fn run(
     let turn = client
         .request(
             "turn/start",
-            json!({
-                "threadId": thread_id,
-                "input": [{ "type": "text", "text": cfg.prompt }],
-                "approvalPolicy": "never",
-                "sandbox": "danger-full-access",
-            }),
-            cfg.default_deadline,
+            with_model(
+                json!({
+                    "threadId": thread_id,
+                    "input": [{ "type": "text", "text": cfg.prompt }],
+                    "approvalPolicy": "never",
+                    "sandbox": "danger-full-access",
+                }),
+                cfg,
+            ),
+            cfg.turn_deadline,
         )
         .await
         .context("turn/start")?;
     push_response(&mut t, "turn/start", "turn/start", &turn.response);
     push_notifications(&mut t, "turn/start", &turn.notifications);
 
-    let drain = client
-        .drain_notifications_until(&["turn/completed"], cfg.turn_deadline)
-        .await
-        .context("draining turn/start")?;
+    let drain = drain_after_prior_notifications(
+        client,
+        &turn.notifications,
+        &["turn/completed"],
+        cfg.turn_deadline,
+    )
+    .await
+    .context("draining turn/start")?;
     push_notifications(&mut t, "turn/start", &drain.notifications);
 
     // Step 7: thread/read ---------------------------------------------------
@@ -314,25 +351,32 @@ pub async fn run(
     let tool_turn = client
         .request(
             "turn/start",
-            json!({
-                "threadId": thread_id,
-                "input": [{
-                    "type": "text",
-                    "text": tool_prompt,
-                }],
-                "approvalPolicy": "never",
-                "sandbox": "danger-full-access",
-            }),
-            cfg.default_deadline,
+            with_model(
+                json!({
+                    "threadId": thread_id,
+                    "input": [{
+                        "type": "text",
+                        "text": tool_prompt,
+                    }],
+                    "approvalPolicy": "never",
+                    "sandbox": "danger-full-access",
+                }),
+                cfg,
+            ),
+            cfg.turn_deadline,
         )
         .await
         .context("turn/start (tool)")?;
     push_response(&mut t, "turn/start.tool", "turn/start", &tool_turn.response);
     push_notifications(&mut t, "turn/start.tool", &tool_turn.notifications);
-    let drain = client
-        .drain_notifications_until(&["turn/completed"], cfg.turn_deadline)
-        .await
-        .context("draining turn/start (tool)")?;
+    let drain = drain_after_prior_notifications(
+        client,
+        &tool_turn.notifications,
+        &["turn/completed"],
+        cfg.turn_deadline,
+    )
+    .await
+    .context("draining turn/start (tool)")?;
     push_notifications(&mut t, "turn/start.tool", &drain.notifications);
 
     // Step 7b: thread/read after the tool-use turn -------------------------
@@ -393,11 +437,15 @@ pub async fn run(
     push_notifications(&mut t, "thread/name/set", &rename.notifications);
     push_notifications(&mut t, "thread/name/set", &trailing);
 
-    // (archive/unarchive steps intentionally omitted — those operations
-    // mutate the user's persisted thread index. Each conformance run would
-    // otherwise leave the test thread archived in the user's real opencode
-    // / claude / pi history. Wire shape for these methods is verified
-    // separately by the typed-decode unit tests in `codex-proto`.)
+    if cfg.exercise_mutations {
+        if let Err(err) = exercise_mutations(client, cfg, &mut t, &mut semantic_ctx).await {
+            if let Some(id) = t.disposable_thread_id.clone() {
+                cleanup_disposable_thread(client, &id, cfg.default_deadline, cfg.post_request_idle)
+                    .await;
+            }
+            return Err(err);
+        }
+    }
 
     // Step 9: command/exec -- a known-deterministic shell command. We
     // deliberately don't set streamStdoutStderr because pi-bridge requires
@@ -418,7 +466,464 @@ pub async fn run(
     push_notifications(&mut t, "command/exec", &exec.notifications);
     push_notifications(&mut t, "command/exec", &trailing);
 
+    t.semantic_ctx = Some(semantic_ctx);
     Ok(t)
+}
+
+async fn exercise_mutations(
+    client: &mut JsonRpcClient,
+    cfg: &ScenarioConfig,
+    t: &mut Transcript,
+    semantic_ctx: &mut SemanticContext,
+) -> Result<()> {
+    let start = request_record(
+        client,
+        t,
+        "thread/start.disposable",
+        "thread/start",
+        with_model(
+            json!({
+                "cwd": cfg.cwd.to_string_lossy(),
+                "approvalPolicy": "never",
+                "sandbox": "danger-full-access",
+            }),
+            cfg,
+        ),
+        cfg,
+    )
+    .await
+    .context("thread/start disposable")?;
+    let Some(disposable_id) = extract_thread_id(&start) else {
+        tracing::warn!("thread/start.disposable did not return thread.id; skipping mutation block");
+        return Ok(());
+    };
+    t.disposable_thread_id = Some(disposable_id.clone());
+    semantic_ctx.disposable_thread_id = Some(disposable_id.clone());
+
+    let seed_turn = client
+        .request(
+            "turn/start",
+            with_model(
+                json!({
+                    "threadId": disposable_id,
+                    "input": [{ "type": "text", "text": "Reply with exactly OK." }],
+                    "approvalPolicy": "never",
+                    "sandbox": "danger-full-access",
+                }),
+                cfg,
+            ),
+            cfg.turn_deadline,
+        )
+        .await
+        .context("turn/start disposable seed")?;
+    push_response(
+        t,
+        "turn/start.disposableSeed",
+        "turn/start",
+        &seed_turn.response,
+    );
+    push_notifications(t, "turn/start.disposableSeed", &seed_turn.notifications);
+    let seed_drain = drain_after_prior_notifications(
+        client,
+        &seed_turn.notifications,
+        &["turn/completed"],
+        cfg.turn_deadline,
+    )
+    .await
+    .context("draining turn/start disposable seed")?;
+    push_notifications(t, "turn/start.disposableSeed", &seed_drain.notifications);
+
+    request_record(
+        client,
+        t,
+        "thread/list.disposable",
+        "thread/list",
+        json!({
+            "archived": false,
+            "cwd": cfg.cwd.to_string_lossy(),
+        }),
+        cfg,
+    )
+    .await
+    .context("thread/list disposable")?;
+
+    let fork = request_record(
+        client,
+        t,
+        "thread/fork",
+        "thread/fork",
+        with_model(
+            json!({
+                "threadId": disposable_id,
+                "cwd": cfg.cwd.to_string_lossy(),
+                "approvalPolicy": "never",
+                "sandbox": "danger-full-access",
+            }),
+            cfg,
+        ),
+        cfg,
+    )
+    .await
+    .context("thread/fork")?;
+    semantic_ctx.forked_thread_id = extract_thread_id(&fork);
+
+    let turn = client
+        .request(
+            "turn/start",
+            with_model(json!({
+                "threadId": disposable_id,
+                "input": [{
+                    "type": "text",
+                    "text": "Count slowly from one to one hundred, one number per sentence. Keep going until interrupted.",
+                }],
+                "approvalPolicy": "never",
+                "sandbox": "danger-full-access",
+            }), cfg),
+            cfg.turn_deadline,
+        )
+        .await
+        .context("turn/start interruptible")?;
+    push_response(t, "turn/start.interruptible", "turn/start", &turn.response);
+    push_notifications(t, "turn/start.interruptible", &turn.notifications);
+    let interrupted_turn_id = extract_turn_id(&turn.response);
+    semantic_ctx.interrupted_turn_id = interrupted_turn_id.clone();
+    let first_delta_or_done = drain_after_prior_notifications(
+        client,
+        &turn.notifications,
+        &["item/agentMessage/delta", "turn/completed"],
+        cfg.turn_deadline,
+    )
+    .await
+    .context("draining interruptible turn until first delta")?;
+    push_notifications(
+        t,
+        "turn/start.interruptible",
+        &first_delta_or_done.notifications,
+    );
+    if first_delta_or_done.terminated_by.as_deref() == Some("item/agentMessage/delta") {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    if first_delta_or_done.terminated_by.as_deref() == Some("item/agentMessage/delta")
+        && let Some(turn_id) = interrupted_turn_id.as_deref()
+    {
+        request_record(
+            client,
+            t,
+            "turn/steer",
+            "turn/steer",
+            with_model(
+                json!({
+                    "threadId": disposable_id,
+                    "expectedTurnId": turn_id,
+                    "input": [{ "type": "text", "text": "continue" }],
+                }),
+                cfg,
+            ),
+            cfg,
+        )
+        .await
+        .context("turn/steer")?;
+
+        let interrupt = client
+            .request(
+                "turn/interrupt",
+                json!({ "threadId": disposable_id, "turnId": turn_id }),
+                cfg.default_deadline,
+            )
+            .await
+            .context("turn/interrupt")?;
+        push_response(t, "turn/interrupt", "turn/interrupt", &interrupt.response);
+        push_notifications(t, "turn/interrupt", &interrupt.notifications);
+        let drain = drain_after_prior_notifications(
+            client,
+            &interrupt.notifications,
+            &["turn/completed"],
+            cfg.turn_deadline,
+        )
+        .await
+        .context("draining turn/interrupt")?;
+        push_notifications(t, "turn/interrupt", &drain.notifications);
+    }
+
+    request_record(
+        client,
+        t,
+        "thread/turns/list",
+        "thread/turns/list",
+        json!({ "threadId": disposable_id, "limit": 10 }),
+        cfg,
+    )
+    .await
+    .context("thread/turns/list")?;
+
+    request_record(
+        client,
+        t,
+        "thread/loaded/list",
+        "thread/loaded/list",
+        json!({}),
+        cfg,
+    )
+    .await
+    .context("thread/loaded/list")?;
+
+    let read_before_rollback = request_record(
+        client,
+        t,
+        "thread/read.beforeRollback",
+        "thread/read",
+        json!({ "threadId": disposable_id, "includeTurns": true }),
+        cfg,
+    )
+    .await
+    .context("thread/read before rollback")?;
+    semantic_ctx.rollback_before_turns = count_thread_turns(&read_before_rollback);
+
+    request_record(
+        client,
+        t,
+        "thread/rollback",
+        "thread/rollback",
+        json!({ "threadId": disposable_id, "numTurns": 1 }),
+        cfg,
+    )
+    .await
+    .context("thread/rollback")?;
+
+    request_record(
+        client,
+        t,
+        "thread/compact/start",
+        "thread/compact/start",
+        with_model(json!({ "threadId": disposable_id }), cfg),
+        cfg,
+    )
+    .await
+    .context("thread/compact/start")?;
+
+    exercise_streaming_exec(client, cfg, t, semantic_ctx).await?;
+
+    request_record(
+        client,
+        t,
+        "thread/archive",
+        "thread/archive",
+        json!({ "threadId": disposable_id }),
+        cfg,
+    )
+    .await
+    .context("thread/archive")?;
+    request_record(
+        client,
+        t,
+        "thread/list.archived",
+        "thread/list",
+        json!({
+            "archived": true,
+            "cwd": cfg.cwd.to_string_lossy(),
+        }),
+        cfg,
+    )
+    .await
+    .context("thread/list archived")?;
+
+    request_record(
+        client,
+        t,
+        "thread/unarchive",
+        "thread/unarchive",
+        json!({ "threadId": disposable_id }),
+        cfg,
+    )
+    .await
+    .context("thread/unarchive")?;
+    request_record(
+        client,
+        t,
+        "thread/list.unarchived",
+        "thread/list",
+        json!({
+            "archived": false,
+            "cwd": cfg.cwd.to_string_lossy(),
+        }),
+        cfg,
+    )
+    .await
+    .context("thread/list unarchived")?;
+
+    cleanup_disposable_thread(
+        client,
+        &disposable_id,
+        cfg.default_deadline,
+        cfg.post_request_idle,
+    )
+    .await;
+
+    Ok(())
+}
+
+async fn exercise_streaming_exec(
+    client: &mut JsonRpcClient,
+    cfg: &ScenarioConfig,
+    t: &mut Transcript,
+    semantic_ctx: &mut SemanticContext,
+) -> Result<()> {
+    let process_id = format!("bridge-conformance-{}", fresh_marker());
+    semantic_ctx.streaming_process_id = Some(process_id.clone());
+    let exec_id = client
+        .send_request(
+            "command/exec",
+            json!({
+                "command": ["sh", "-c", "printf ready; sleep 5"],
+                "processId": process_id,
+                "tty": true,
+                "streamStdin": true,
+                "streamStdoutStderr": true,
+            }),
+        )
+        .await
+        .context("command/exec streaming send")?;
+    let startup = client
+        .drain_notifications_until(&["command/exec/outputDelta"], Duration::from_secs(2))
+        .await
+        .context("draining command/exec streaming startup")?;
+    push_notifications(t, "command/exec.streaming", &startup.notifications);
+
+    request_record(
+        client,
+        t,
+        "command/exec/write",
+        "command/exec/write",
+        json!({
+            "processId": process_id,
+            "deltaBase64": "Cg==",
+            "closeStdin": false,
+        }),
+        cfg,
+    )
+    .await
+    .context("command/exec/write")?;
+    request_record(
+        client,
+        t,
+        "command/exec/resize",
+        "command/exec/resize",
+        json!({
+            "processId": process_id,
+            "size": { "rows": 24, "cols": 80 },
+        }),
+        cfg,
+    )
+    .await
+    .context("command/exec/resize")?;
+    request_record(
+        client,
+        t,
+        "command/exec/terminate",
+        "command/exec/terminate",
+        json!({ "processId": process_id }),
+        cfg,
+    )
+    .await
+    .context("command/exec/terminate")?;
+
+    let exec = client
+        .wait_for_response("command/exec", exec_id, cfg.default_deadline)
+        .await
+        .context("command/exec streaming response")?;
+    push_response(t, "command/exec.streaming", "command/exec", &exec.response);
+    let trailing = client.drain_idle(cfg.post_request_idle).await;
+    push_notifications(t, "command/exec.streaming", &exec.notifications);
+    push_notifications(t, "command/exec.streaming", &trailing);
+
+    Ok(())
+}
+
+pub async fn cleanup_disposable_thread(
+    client: &mut JsonRpcClient,
+    thread_id: &str,
+    deadline: Duration,
+    post_request_idle: Duration,
+) {
+    match client
+        .request("thread/archive", json!({ "threadId": thread_id }), deadline)
+        .await
+    {
+        Ok(_) => {
+            let _ = client.drain_idle(post_request_idle).await;
+        }
+        Err(err) => {
+            tracing::warn!(
+                ?err,
+                thread_id,
+                "failed to cleanup disposable conformance thread"
+            );
+        }
+    }
+}
+
+async fn request_record(
+    client: &mut JsonRpcClient,
+    t: &mut Transcript,
+    step: &str,
+    method: &str,
+    params: Value,
+    cfg: &ScenarioConfig,
+) -> Result<Value> {
+    let out = client
+        .request(method, params, cfg.default_deadline)
+        .await
+        .with_context(|| method.to_string())?;
+    push_response(t, step, method, &out.response);
+    let trailing = client.drain_idle(cfg.post_request_idle).await;
+    push_notifications(t, step, &out.notifications);
+    push_notifications(t, step, &trailing);
+    Ok(out.response)
+}
+
+async fn drain_after_prior_notifications(
+    client: &mut JsonRpcClient,
+    prior: &[Value],
+    stop_methods: &[&str],
+    deadline: Duration,
+) -> Result<DrainOutcome> {
+    if let Some(method) = prior_terminal_method(prior, stop_methods) {
+        return Ok(DrainOutcome {
+            notifications: Vec::new(),
+            terminated_by: Some(method),
+        });
+    }
+    client
+        .drain_notifications_until(stop_methods, deadline)
+        .await
+}
+
+fn prior_terminal_method(prior: &[Value], stop_methods: &[&str]) -> Option<String> {
+    // Synchronous bridges may emit the full turn lifecycle before the
+    // `turn/start` response. Prefer the terminal event when present so the
+    // scenario does not wait for a second completion notification.
+    if stop_methods.contains(&"turn/completed")
+        && prior
+            .iter()
+            .any(|frame| frame.get("method").and_then(Value::as_str) == Some("turn/completed"))
+    {
+        return Some("turn/completed".to_string());
+    }
+    prior
+        .iter()
+        .filter_map(|frame| frame.get("method").and_then(Value::as_str))
+        .find(|method| stop_methods.contains(method))
+        .map(str::to_string)
+}
+
+fn with_model(mut params: Value, cfg: &ScenarioConfig) -> Value {
+    if let Some(model) = cfg.model.as_deref()
+        && let Some(obj) = params.as_object_mut()
+    {
+        obj.insert("model".to_string(), json!(model));
+    }
+    params
 }
 
 type ParamsBuilder = fn() -> Value;
@@ -470,6 +975,24 @@ fn extract_thread_id(response: &Value) -> Option<String> {
         .get("id")?
         .as_str()
         .map(str::to_string)
+}
+
+fn extract_turn_id(response: &Value) -> Option<String> {
+    response
+        .get("result")?
+        .get("turn")?
+        .get("id")?
+        .as_str()
+        .map(str::to_string)
+}
+
+fn count_thread_turns(response: &Value) -> Option<usize> {
+    response
+        .get("result")?
+        .get("thread")?
+        .get("turns")?
+        .as_array()
+        .map(Vec::len)
 }
 
 /// `(code, message)` if the response is a JSON-RPC error envelope.

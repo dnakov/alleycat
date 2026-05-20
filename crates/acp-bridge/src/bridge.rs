@@ -350,7 +350,7 @@ impl AcpBridge {
     pub fn emit_thread_name_updated(&self, ctx: &Conn, thread_id: &str, name: &str) {
         let notification = json!({
             "threadId": thread_id,
-            "name": name,
+            "threadName": name,
         });
         let _ = ctx
             .notifier()
